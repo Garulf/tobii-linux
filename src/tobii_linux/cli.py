@@ -1,11 +1,12 @@
 """Command-line entry point: descriptor probe and the experimental head-pose session."""
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from .usb import USBContext, USBError
 
-DEFAULT_MODELS = Path(__file__).resolve().parents[2]/'models/tobii-et5'
+DEFAULT_MODELS = Path(os.environ.get('TOBII_LINUX_MODELS', Path(__file__).resolve().parents[2]/'models/tobii-et5'))
 
 
 def probe(_):

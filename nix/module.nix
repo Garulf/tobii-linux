@@ -2,7 +2,7 @@ self: { config, lib, pkgs, ... }:
 let cfg = config.hardware.tobii-eye-tracker-5;
 in {
   options.hardware.tobii-eye-tracker-5.enable = lib.mkEnableOption
-    "Eye Tracker 5 USB access and descriptor probe (tracking is not implemented)";
+    "Eye Tracker 5 USB access and the experimental head-pose command";
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
     # Runs before 73-seat-late.rules; logind grants the active local seat user
