@@ -47,7 +47,7 @@ def main():
                          metavar=('TLX', 'TLY', 'TLZ', 'TRX', 'TRY', 'TRZ', 'BLX', 'BLY', 'BLZ'),
                          help='Display area corners in millimetres: top-left, top-right, bottom-left')
     session.add_argument('--models', type=Path, default=DEFAULT_MODELS)
-    session.add_argument('--channel', type=int, default=0, help='USB channel carrying TTP (unverified)')
+    session.add_argument('--channel', type=int, default=0, help='USB channel carrying TTP')
     session.add_argument('--index', type=int, default=0, help='Device index from probe')
     args = parser.parse_args()
     try:

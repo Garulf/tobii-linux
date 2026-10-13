@@ -10,9 +10,13 @@ next steps; detailed evidence is linked below.
 - **Live hardware (WSL2 on the reference host, usbipd-win):** channel 0
   carries TTP; protocol upgrade, unlock, realm `0x2712` challenge, camera
   hardware info, image subscription and unsubscribe all succeed on the real
-  tracker. Image frames are 280x280 at about 33 Hz. No person was present, so
-  no live head pose has been produced yet. See
+  tracker. Image frames are 280x280 at about 33 Hz. See
   [USB streams, live observations](usb-streams.md#live-observations-wsl2-on-the-windows-reference).
+- **Live head pose:** 150 frames recorded on Linux with a person in front of
+  the tracker give a valid sample on every frame; mean position
+  (-42.8, -9.8, 690.8) mm against (-27.9, -8.3, 694.5) mm from the Windows
+  runtime recorded just before. `tools/replay_frames.py` replays saved
+  frames offline.
 - **Pipeline, all native and mostly checked against the original by
   emulation:** face finder ([face detection](face-detection.md)), tracking
   loop and working view ([face tracking](face-tracking.md)), D1 and gate,
@@ -25,9 +29,11 @@ next steps; detailed evidence is linked below.
   discover a service: `FindFirstFileA("\\.\pipe\*")` fails with error 66
   (tested on the reference host's WSL2). Chosen route: a native PRP bridge
   plus a Wine patch for pipe enumeration (both in progress).
-- **Open:** fitted translation is relative to the 96-pixel working view;
-  whether the original rescales it to camera depth is unresolved and needs a
-  live comparison with a person in front of the tracker.
+- **Fitting coordinates:** the live comparison only matches when the fit uses
+  full-frame landmarks, so the tracker now does that; the static path that
+  maps working-view records to the frame is still unidentified, and lateral
+  and angular differences of up to 15 mm and 3 degrees remain
+  ([face tracking](face-tracking.md#fitting-coordinates-live-comparison)).
 
 ### Head-pose output path traced
 

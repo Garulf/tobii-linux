@@ -5,8 +5,9 @@
 
 {% block usage %}
 The goal is a native Linux driver for the Tobii Eye Tracker 5 that gives
-Star Citizen head tracking under Wine. **It has not yet run against a tracker
-on Linux, and the game-side connection under Wine is unsolved.**
+Star Citizen head tracking under Wine. **The Linux session has produced head
+pose from a real tracker (through WSL2 and usbipd); the game-side connection
+under Wine is still unsolved.**
 
 Everything here is rebuilt from Tobii's installed binaries and the tracker on
 the Windows reference host `albedo`. No other ET5 driver project was used. Most
@@ -17,20 +18,22 @@ synthetic inputs; those checks are listed in the linked documents.
 
 | Stage | Module | Status |
 | --- | --- | --- |
-| USB transport, channel framing | `usb.py`, `usb_framing.py`, `usb_channel.py` | Descriptor probe tested; channel index for TTP unverified |
+| USB transport, channel framing | `usb.py`, `usb_framing.py`, `usb_channel.py` | Works on a real tracker; TTP runs on channel 0 |
 | TTP requests and replies | `ttp.py`, `ttp_commands.py`, `ttp_fields.py` | Startup, unlock, realm, hardware info and stream commands match the original encoders and parsers |
-| Camera calibration reply | `camera_info.py` | Parser matches the original; no device reply seen yet |
-| Image frames | `frames.py` | Stream 0x501 layout recovered; frame route unverified |
+| Camera calibration reply | `camera_info.py` | Parser matches the original and reads the live reply |
+| Image frames | `frames.py` | 280x280 frames at about 33 Hz from a real tracker |
 | Face finder | `face_detect.py` | Matches the original detector end to end, network input included |
 | Tracking loop and working view | `face_tracking.py` | Working view matches the original; LBF eye refinement not yet run |
 | D1 landmarks, confidence gate | `d1.py`, `d1_quality.py` | Crop and gate match the original |
-| Face-model fit | `pose_*.py` | Updates, bounds and staged caller match the original; temporal caller in progress |
+| Face-model fit | `pose_*.py` | Updates, bounds, staged and temporal callers match the original |
 | Output conversion, geometry, smoothing | `pose_output.py`, `pose_geometry.py`, `head_pose_pipeline.py` | Euler conversion, geometry stage and One Euro filters match the original |
-| Device session and CLI | `driver.py`, `cli.py` | Tested only against a scripted fake device |
+| Device session and CLI | `driver.py`, `cli.py` | Runs against a real tracker; head pose within about 1% of the Windows depth |
 | Game client protocol (PRP) | `prp.py`, `prp_session.py` | Codecs and handshake match the game DLL; Wine delivery unsolved |
 
-A public-domain portrait run through detection, landmarks and fitting gives a
-frontal, stable pose, which is a sanity check, not a tracking result.
+On recorded live frames the Linux pipeline puts the head at 691 mm against
+694 mm from the Windows runtime moments earlier; lateral position and angles
+differ by up to 15 mm and 3 degrees, which is not yet explained
+([tracking loop](docs/face-tracking.md#fitting-coordinates-live-comparison)).
 
 ## Use
 
@@ -49,8 +52,9 @@ PYTHONPATH=src python3 -m tobii_linux.cli headpose \
   --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
 ```
 
-It prints one JSON line per camera frame. The session sends commands to the
-device; it has not been tried on real hardware.
+It prints one JSON line per camera frame. Frames saved by
+`tools/linux_session_probe.py --until frames` can be replayed offline with
+`tools/replay_frames.py <log> <frames-dir>`.
 
 ## Tests
 

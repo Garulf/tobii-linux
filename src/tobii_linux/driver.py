@@ -1,8 +1,8 @@
 """Linux device session for head pose: TTP startup, camera calibration and image frames.
 
-Built from the runtime's tracker_lib_usb sequence (docs/usb-streams.md). It has
-not been run against a device: the TTP channel index, device acceptance of each
-request and the frame route are unverified.
+Built from the runtime's tracker_lib_usb sequence (docs/usb-streams.md) and
+run against a real tracker: TTP on channel 0, startup, calibration and image
+frames as documented in its "Live observations" section.
 """
 from dataclasses import dataclass
 import time
