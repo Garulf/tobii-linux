@@ -4,7 +4,9 @@ Built from the runtime's tracker_lib_usb sequence (docs/usb-streams.md) and
 run against a real tracker: TTP on channel 0, startup, calibration and image
 frames as documented in its "Live observations" section.
 """
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
+import threading
 import time
 from .camera_info import parse_hardware_info
 from .frames import image_frame
@@ -100,21 +102,83 @@ such as usb_channel.USBChannel.
         self.call(lambda rid: subscribe_stream(rid, Stream.IMAGE))
 
     def frames(self, timeout_s=1.0):
-        """Image frames from stream 0x501 until the device stays silent for timeout_s."""
+        """Image frames from stream 0x501 as they arrive, until the device stays silent for timeout_s."""
         image_stream = wire_stream_id(Stream.IMAGE)
+        pending, self.pending_streams = self.pending_streams, []
+        deadline = time.monotonic() + timeout_s
         while True:
-            pending, self.pending_streams = self.pending_streams, []
-            received = False
-            for message in pending + list(self._receive(timeout_s)):
-                received = True
+            for message in pending:
                 if message.kind == STREAM_DATA_KIND and message.command == image_stream:
                     yield image_frame(message)
-            if not received:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return
+            data = self.channel.read(timeout_ms=max(1, int(remaining * 1000)))
+            pending = self.decoder.feed(data) if data else []
+            if data:
+                deadline = time.monotonic() + timeout_s
 
 
-def head_pose_samples(session, model_directory, display_area, camera=0):
-    """Frames from a started session through tracking, fitting and the output stages."""
+def newest_frames(frames, on_receive=None):
+    """Read a blocking frame iterator on its own thread and yield only the newest frame.
+
+Frames that arrive while the consumer is busy are dropped, so a slow pipeline
+never lets the device's stream back up. `on_receive` runs on the reader thread
+for every frame as it arrives.
+"""
+    condition = threading.Condition()
+    state = {'frame': None, 'done': False, 'error': None}
+
+    def read():
+        try:
+            for frame in frames:
+                if on_receive is not None:
+                    on_receive(frame)
+                with condition:
+                    state['frame'] = frame
+                    condition.notify()
+        except Exception as error:
+            state['error'] = error
+        finally:
+            with condition:
+                state['done'] = True
+                condition.notify()
+
+    threading.Thread(target=read, name='tracker-frames', daemon=True).start()
+    while True:
+        with condition:
+            condition.wait_for(lambda: state['frame'] is not None or state['done'])
+            frame, state['frame'] = state['frame'], None
+        if frame is None:
+            if state['error'] is not None:
+                raise state['error']
+            return
+        yield frame
+
+
+class ClockMapper:
+    """Maps device timestamps onto a host clock using the smallest recent receipt delay."""
+    def __init__(self, clock, window=64):
+        self.clock = clock
+        self.offsets = deque(maxlen=window)
+        self.offset = None
+
+    def observe(self, device_us):
+        self.offsets.append(self.clock() - device_us)
+        self.offset = min(self.offsets)
+
+    def __call__(self, device_us):
+        """Host time of a device timestamp, never later than the host clock's current time."""
+        return min(device_us + self.offset, self.clock())
+
+
+def head_pose_samples(session, model_directory, display_area, camera=0, host_clock=None):
+    """Frames from a started session through tracking, fitting and the output stages.
+
+With `host_clock` (a function returning microseconds), frames are read on a
+separate thread, frames that arrive during processing are skipped, and sample
+timestamps are moved onto that clock.
+"""
     import numpy as np
     from .face_tracking import FaceTracker
     from .head_pose_pipeline import HeadPoseOutput
@@ -122,8 +186,14 @@ def head_pose_samples(session, model_directory, display_area, camera=0):
     output = HeadPoseOutput(calibration.translation, calibration.angles, display_area)
     tracker = FaceTracker(model_directory)
     session.subscribe_images()
-    for frame in session.frames():
+    frames = session.frames()
+    to_host = None
+    if host_clock is not None:
+        to_host = ClockMapper(host_clock)
+        frames = newest_frames(frames, on_receive=lambda frame: to_host.observe(frame.timestamp))
+    for frame in frames:
         pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
         result = tracker.process(pixels)
         fit = result.fit['rigid_state'] if result.fit is not None else None
-        yield output(fit, frame.timestamp)
+        sample = output(fit, frame.timestamp)
+        yield sample if to_host is None else replace(sample, timestamp_us=to_host(sample.timestamp_us))

@@ -1,5 +1,6 @@
 import hmac
 import sys
+import threading
 from pathlib import Path
 import unittest
 
@@ -71,12 +72,82 @@ class TrackerSessionTests(unittest.TestCase):
         self.assertEqual(calibration.angles, (0.0, 1.0, 2.0))
         self.assertEqual([(f.width, f.height) for f in frames], [(4, 3), (4, 3)])
 
+    def test_frames_are_yielded_as_they_arrive(self):
+        class Streaming:
+            def __init__(self):
+                self.outgoing = [stream_message(tc.Stream.IMAGE, image_columns()).encode() for _ in range(2)]
+                self.reads = 0
+
+            def read(self, timeout_ms):
+                self.reads += 1
+                return self.outgoing.pop(0) if self.outgoing else b''
+
+        device = Streaming()
+        frames = driver.TrackerSession(device).frames(timeout_s=0.05)
+        next(frames)
+        self.assertEqual(device.reads, 1)
+        self.assertEqual(len(list(frames)), 1)
+
     def test_failed_command_raises(self):
         class Refusing(FakeDevice):
             def reply(self, request, items=()):
                 self.outgoing.append(Message(tc.RESPONSE_KIND, request.request_id, 0, request.command, 3, b'').encode())
         with self.assertRaises(driver.DeviceError):
             driver.TrackerSession(Refusing()).initialize()
+
+
+class NewestFramesTests(unittest.TestCase):
+    def test_frames_arriving_while_busy_are_dropped(self):
+        produced, consumed = threading.Event(), threading.Event()
+
+        def source():
+            yield 1
+            consumed.wait(1)
+            yield 2
+            yield 3
+            produced.set()
+
+        frames = driver.newest_frames(source())
+        self.assertEqual(next(frames), 1)
+        consumed.set()
+        produced.wait(1)
+        self.assertEqual(list(frames), [3])
+
+    def test_reader_errors_reach_the_consumer(self):
+        def source():
+            yield 1
+            raise driver.DeviceError('unplugged')
+
+        frames = driver.newest_frames(source())
+        with self.assertRaises(driver.DeviceError):
+            list(frames)
+
+    def test_on_receive_sees_every_frame(self):
+        seen = []
+        list(driver.newest_frames(iter([1, 2, 3]), on_receive=seen.append))
+        self.assertEqual(seen, [1, 2, 3])
+
+
+class ClockMapperTests(unittest.TestCase):
+    def test_uses_the_smallest_receipt_delay(self):
+        now = iter([1_000_600, 1_031_000, 1_060_550, 2_000_000])
+        mapper = driver.ClockMapper(lambda: next(now))
+        for device_us in (500, 30_500, 60_500):
+            mapper.observe(device_us)
+        self.assertEqual(mapper(90_500), 1_090_550)
+
+    def test_never_maps_into_the_future(self):
+        now = iter([1_000, 1_010])
+        mapper = driver.ClockMapper(lambda: next(now))
+        mapper.observe(0)
+        self.assertEqual(mapper(500), 1_010)
+
+    def test_window_forgets_old_offsets(self):
+        now = iter([100, 1_000, 2_000, 5_000])
+        mapper = driver.ClockMapper(lambda: next(now), window=2)
+        for device_us in (0, 0, 0):
+            mapper.observe(device_us)
+        self.assertEqual(mapper(0), 1_000)
 
 
 if __name__ == '__main__':
