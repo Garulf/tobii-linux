@@ -115,6 +115,19 @@ Deformation-state columns and observation gating are not included here.
     return result.reshape(-1,6)
 
 
+_BASIS_TANH = {}
+
+
+def _basis_tanh(basis):
+    """Per-element libm tanh of a constant model basis, rounded to float32 and cached."""
+    import numpy as np
+    key = (basis.shape, basis.tobytes())
+    if key not in _BASIS_TANH:
+        _BASIS_TANH[key] = np.asarray([math.tanh(float(x)) for x in basis.flat],
+                                      dtype=np.float32).reshape(basis.shape)
+    return _BASIS_TANH[key]
+
+
 def model_jacobian(vertices, rotation, translation, focal_factor, model_scale,
                    first_basis, first_latent, first_ranges,
                    second_basis, second_latent, second_ranges,
@@ -149,7 +162,7 @@ replaced with the usual derivative with respect to the current latent state.
         enabled=np.ones(basis.shape[2],dtype=bool) if mask is None else np.asarray(mask,dtype=bool)
         if enabled.shape!=(basis.shape[2],):raise ValueError('Deformation mask extent mismatch')
         half=(ranges[:,1]-ranges[:,0])*np.float32(.5)
-        t=np.asarray([math.tanh(float(x)) for x in basis.flat],dtype=np.float32).reshape(basis.shape)
+        t=_basis_tanh(basis)
         derivative=((np.float32(1)-t*t)*t)*half
         derivative[:,:,~enabled]=0
         x,y,z=derivative[:,0,:],derivative[:,1,:],derivative[:,2,:]

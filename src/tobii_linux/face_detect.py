@@ -1,5 +1,6 @@
 """Recovered face finder (VisionSDK detector 0x14007be00) for grayscale frames."""
 from dataclasses import dataclass
+import functools
 import math
 
 INPUT_WIDTH = 256
@@ -51,6 +52,7 @@ def _round_even(value):
     return int(round(float(value)))
 
 
+@functools.lru_cache(maxsize=64)
 def _resize_taps(source, target):
     import numpy as np
     scale = 1.0 / (target / source)

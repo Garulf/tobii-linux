@@ -24,14 +24,11 @@ The runtime's small closed-form inverse paths are not implemented here.
             b[[i, pivot]] = b[[pivot, i]]
         reciprocal = np.float32(1) / a[i, i]
         negative_reciprocal = np.float32(-1) / a[i, i]
-        for row in range(i + 1, count):
-            alpha = negative_reciprocal * a[row, i]
-            a[row, i+1:] = a[row, i+1:] + alpha * a[i, i+1:]
-            b[row] = b[row] + alpha * b[i]
+        alpha = negative_reciprocal * a[i+1:, i, None]
+        a[i+1:, i+1:] = a[i+1:, i+1:] + alpha * a[i, i+1:]
+        b[i+1:] = b[i+1:] + alpha * b[i]
         a[i, i] = reciprocal
     for i in range(count - 1, -1, -1):
-        value = b[i].copy()
-        for j in range(i + 1, count):
-            value = value - a[i, j] * b[j]
-        b[i] = value * a[i, i]
+        terms = np.concatenate((b[i, None], a[i, i+1:, None] * b[i+1:]))
+        b[i] = np.subtract.reduce(terms, axis=0) * a[i, i]
     return b
