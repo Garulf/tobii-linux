@@ -79,6 +79,25 @@ models. A public-domain portrait (NASA astronaut photo from scikit-image's
 sample data) runs through detection, D1, the gate and the temporal fit and
 holds a stable frontal pose over repeated frames; this is a sanity check only.
 
-Open: the fitted translation is relative to the working view, which always
-scales the face to 96 pixels. Nothing found so far rescales it to the camera
-frame, so depth may not follow real distance; a live comparison should settle it.
+## Fitting coordinates (live comparison)
+
+Static reading of `0x140049450` suggests the fit receives working-image
+coordinates and dimensions. A live comparison contradicts that. Frames
+captured by the Linux session with a person in front of the tracker
+(`evidence/private/live-compare/`), with the Windows runtime recorded
+immediately before at the same head position:
+
+| Variant | Position (mm) | Rotation (deg) |
+| --- | --- | --- |
+| Windows runtime | (-27.9, -8.3, 694.5) | (8.3, -0.2, 1.8) |
+| Working view, focal 2.6 | (-5.9, -8.6, 400.4) | (4.0, 3.4, 3.4) |
+| Working view, focal 3.0 | (-6.0, 14.3, 463.4) | (3.9, 3.5, 3.3) |
+| Full frame, focal 2.6 | (-42.8, -9.5, 690.8) | (11.6, 1.0, 4.3) |
+| Full frame, focal 3.0 | (-42.8, 26.7, 790.4) | (10.5, 1.4, 4.2) |
+
+Only full-frame landmarks with the `Head Tracker.cfg` focal 2.6 reproduce the
+Windows depth (0.5% apart) and height, so `FaceTracker` fits full-frame
+points. The static path that maps working-view records to the frame before
+the fit has not been found. Remaining differences of about 15 mm in x and 3 to
+4 degrees in rotation are open; the comparison is not simultaneous (the
+device serves one host at a time), so some of it may be head movement.

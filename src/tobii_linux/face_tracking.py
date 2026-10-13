@@ -215,13 +215,16 @@ so it is omitted.
         self.roll = temporal_roll(landmarks.normalized_points, ids, work_w, work_h)
         score = d1_quality_score(landmarks.quality, ids)
         accepted = passes_d1_quality(score, state)
+        frame_points = to_frame_points(landmarks.normalized_points, view, width, height)
         fit = None
         if accepted:
-            fit = self.fitter.process(landmarks.normalized_points, work_w, work_h)
+            # Live comparison with the Windows runtime: fitting full-frame points
+            # matches its depth within 0.5%, working-view points do not
+            # (docs/face-tracking.md, "Fitting coordinates").
+            fit = self.fitter.process(frame_points, width, height)
             if not fit['valid']:
                 self.reset()
                 return self._empty()
-        frame_points = to_frame_points(landmarks.normalized_points, view, width, height)
         if accepted:
             self.state, self.face = TRACKING, landmark_box(frame_points, width, height)
         elif state == TRACKING:
