@@ -76,10 +76,10 @@ Three pieces are needed:
      --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
    ```
 
-   Pass `--wine-clock raw` when the game's Wine is 10.16 or older. If the
-   game tracks its window rather than the tracker, also pass `--display-id`
-   with the monitor's device instance id inside the prefix
-   ([game integration layer](docs/game-integration-layer.md)).
+   Pass `--wine-clock raw` when the game's Wine is 10.16 or older. The
+   bridge tells the service which monitor is primary inside the prefix; if
+   the game runs on another monitor, pass that monitor's id with
+   `--display-id` ([game integration layer](docs/game-integration-layer.md)).
 3. The bridge, started in the game's Wine prefix before the game:
    `wine tools/prp_bridge/prp_bridge.exe 127.0.0.1 7760` (build it with
    `make -C tools/prp_bridge`, which needs MinGW-w64).

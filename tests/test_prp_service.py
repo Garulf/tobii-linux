@@ -12,7 +12,7 @@ import unittest
 from tobii_linux.head_pose_pipeline import HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, decode_envelope, decode_head_body, encode_envelope
 from tobii_linux.prp_service import (
-    FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_REPLY_PIPE,
+    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_REPLY_PIPE,
     DisplayArea, HeadPoseHub, PrpService, parse_display_area, decode_names, encode_frame, encode_pipe_open,
     error_response, property_error, read_frame, request_header, stream_package)
 from tobii_linux.prp_session import (
@@ -319,6 +319,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             image_name="StarCitizen".encode("utf-16-le"))))
         packet = await command.packet()
         return command, subscription, info, tags, tag, packet
+
+    async def test_bridge_reported_display_id_is_used_unless_configured(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(encode_frame(FRAME_BRIDGE_HELLO, struct.pack("<I", 1)))
+        await read_frame(reader)
+        writer.write(encode_frame(FRAME_DISPLAY_ID, "DISPLAY\\DEFAULT_MONITOR\\0000&0000".encode()))
+        await writer.drain()
+        for _ in range(100):
+            if self.service.reported_display_id:
+                break
+            await asyncio.sleep(0.01)
+        writer.close()
+        reply = self.service.answer_property(3, PROPERTY_DISPLAY_ID)
+        self.assertEqual(decode_string_value(reply), "DISPLAY\\DEFAULT_MONITOR\\0000&0000")
+        configured = PrpService(HeadPoseHub(), "ET5-TEST", display_id=REAL_DISPLAY_ID)
+        configured.reported_display_id = "DISPLAY\\DEFAULT_MONITOR\\0000&0000"
+        self.assertEqual(decode_string_value(configured.answer_property(3, PROPERTY_DISPLAY_ID)),
+                         REAL_DISPLAY_ID)
 
     async def test_bridge_learns_pipe_names(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)

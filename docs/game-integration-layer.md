@@ -190,8 +190,8 @@ subscribing (live (Windows)).
 bytes):
 
 - property 1 from `--display-area x,y,z,x,y,z,x,y,z` (top-left, top-right,
-  bottom-left, mm), property 0x12 from `--display-id`, both refused when not
-  given;
+  bottom-left, mm), property 0x12 from `--display-id` or else the id the
+  bridge reports, both refused when not available;
 - property 8 with `IS5_Large_Eyetracker_5`; the real reply differs only in an
   uninitialised padding byte;
 - properties 2 and 4 with 0;
@@ -201,14 +201,24 @@ bytes):
 - everything else with the refusal above.
 
 `PrpService(hub, name, display_area=DisplayArea(...), display_id=...)` takes the
-same values for `tobii_linux.cli serve`, which does not pass them yet.
+same values; `tobii_linux.cli serve` passes its `--display` area and an optional
+`--display-id`.
+
+The bridge reads the primary monitor's device instance id inside the prefix
+(`EnumDisplayDevicesW` with `EDD_GET_DEVICE_INTERFACE_NAME`, then
+`CM_Get_Device_Interface_PropertyW` with `DEVPKEY_Device_InstanceId`, as the
+layer does) and sends it as relay frame 6. It skips this on Wine before 10.0
+(`wine_get_version`), where that call aborts the process. With only
+`--display-area` on the service, `TrackRectangle` under Wine 11.0 received the
+reported `DISPLAY\DEFAULT_MONITOR\0000&0000` and 329 head poses in 10 s
+(live (Wine)); under Wine 9.0 the bridge logged the skip and the Stream
+Engine client still received 91 samples in 3 s.
 
 ## Open
 
-- Which tracking call Star Citizen makes. If it is `TrackWindow`, the service
-  needs a display id equal to the monitor instance id inside the game's prefix,
-  which depends on the Wine display driver. The bridge runs in that prefix and
-  could report it to the service instead of a command-line option.
+- Which tracking call Star Citizen makes. `TrackWindow` matches the window's
+  monitor against the display id; the bridge reports the primary monitor, so a
+  game on another monitor still needs `--display-id`.
 - `TrackWindow` itself was not run under Wine: the patched Wine 11.0 build has no
   display driver (`--without-x`), so no window can be created.
 - Property notifications: the service never pushes operation 2, so presence and

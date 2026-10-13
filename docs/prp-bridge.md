@@ -74,6 +74,7 @@ little-endian, payload at most 1 MiB.
 | 3 | `PIPE_OPEN` | bridge to service, first frame of a pipe connection | u32 relay version, u32 client process id (0 if unknown), pipe name, NUL |
 | 4 | `REPLY_PIPE` | service to bridge | reply pipe name, NUL; the bridge opens it before handling later frames |
 | 5 | `MESSAGE` | both | one pipe message |
+| 6 | `DISPLAY_ID` | bridge to service, on the control connection after `PIPES` | UTF-8 device instance id of the primary monitor inside the prefix, no NUL; skipped on Wine 9 and older |
 
 Connections:
 

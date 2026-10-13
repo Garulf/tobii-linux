@@ -11,6 +11,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <devpropdef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #define FRAME_PIPE_OPEN 3
 #define FRAME_REPLY_PIPE 4
 #define FRAME_MESSAGE 5
+#define FRAME_DISPLAY_ID 6
 #define MAX_FRAME (1u << 20)
 #define MAX_PIPES 16
 #define PIPE_NAME_LIMIT 256
@@ -344,6 +346,61 @@ static DWORD WINAPI listen_pipe(void *context)
     return 0;
 }
 
+typedef DWORD (WINAPI *GetInterfaceProperty)(const WCHAR *, const DEVPROPKEY *, DEVPROPTYPE *,
+                                             BYTE *, ULONG *, ULONG);
+
+static const DEVPROPKEY device_instance_id = {
+    {0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256};
+
+/* Wine before 10.0 aborts the process in CM_Get_Device_Interface_PropertyW. */
+static int has_device_interface_properties(void)
+{
+    typedef const char *(CDECL *WineGetVersion)(void);
+    FARPROC function = GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version");
+    WineGetVersion wine_get_version;
+    if (!function)
+        return 1;
+    memcpy(&wine_get_version, &function, sizeof wine_get_version);
+    return atoi(wine_get_version()) >= 10;
+}
+
+static int primary_monitor_instance_id(WCHAR *instance_id, ULONG size)
+{
+    DISPLAY_DEVICEW adapter, monitor;
+    HMODULE cfgmgr = LoadLibraryA("cfgmgr32.dll");
+    FARPROC function = cfgmgr ? GetProcAddress(cfgmgr, "CM_Get_Device_Interface_PropertyW") : NULL;
+    GetInterfaceProperty get_property;
+    DEVPROPTYPE type;
+    DWORD index;
+    if (!function || !has_device_interface_properties())
+        return 0;
+    adapter.cb = sizeof adapter;
+    monitor.cb = sizeof monitor;
+    memcpy(&get_property, &function, sizeof get_property);
+    for (index = 0; EnumDisplayDevicesW(NULL, index, &adapter, 0); index++) {
+        if ((adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)
+            && EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, EDD_GET_DEVICE_INTERFACE_NAME))
+            return get_property(monitor.DeviceID, &device_instance_id, &type,
+                                (BYTE *)instance_id, &size, 0) == 0;
+        adapter.cb = sizeof adapter;
+    }
+    return 0;
+}
+
+static void report_display_id(SOCKET control)
+{
+    WCHAR instance_id[256];
+    char utf8[512];
+    int length;
+    if (!primary_monitor_instance_id(instance_id, sizeof instance_id)) {
+        say("primary monitor id unavailable; the service needs --display-id for window tracking");
+        return;
+    }
+    length = WideCharToMultiByte(CP_UTF8, 0, instance_id, -1, utf8, sizeof utf8, NULL, NULL);
+    if (length > 1 && send_frame(control, FRAME_DISPLAY_ID, utf8, (UINT32)length - 1))
+        say("reported primary monitor %s", utf8);
+}
+
 static SOCKET attach_to_service(char **names_out, UINT32 *size_out)
 {
     int attempt;
@@ -388,6 +445,7 @@ int main(int argc, char **argv)
         say("no PRP service at %s:%s", service_host, service_port);
         return 1;
     }
+    report_display_id(control);
     for (cursor = names; cursor < names + size && *cursor && count < MAX_PIPES;
          cursor += strlen(cursor) + 1, count++) {
         say("serving \\\\.\\pipe\\%s", cursor);

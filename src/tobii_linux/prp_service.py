@@ -41,6 +41,7 @@ FRAME_PIPES = 2
 FRAME_PIPE_OPEN = 3
 FRAME_REPLY_PIPE = 4
 FRAME_MESSAGE = 5
+FRAME_DISPLAY_ID = 6
 MAX_FRAME = 1 << 20
 DEFAULT_PORT = 7760
 DEFAULT_NAME = "ET5-LINUX"
@@ -420,6 +421,7 @@ class PrpService:
         self.hub, self.name, self.clock = hub, name, clock
         self.serial = serial or name
         self.display_area, self.display_id = display_area, display_id
+        self.reported_display_id: str | None = None
         self.subscription_pipe = str(uuid.uuid4())
         self.timesync_pipe = str(uuid.uuid4())
         self.subscriptions: dict[int, Subscription] = {}
@@ -493,8 +495,8 @@ class PrpService:
         if property_id == PROPERTY_DISPLAY_AREA and self.display_area:
             area = self.display_area
             return display_area_value(area.top_left, area.top_right, area.bottom_left)
-        if property_id == PROPERTY_DISPLAY_ID and self.display_id:
-            return string_value(self.display_id)
+        if property_id == PROPERTY_DISPLAY_ID and (self.display_id or self.reported_display_id):
+            return string_value(self.display_id or self.reported_display_id)
         if property_id == PROPERTY_MODEL:
             return string_value(MODEL_NAME)
         if property_id in PROPERTY_ZERO_WORDS:
@@ -523,7 +525,11 @@ class PrpService:
                 writer.write(encode_frame(FRAME_PIPES, encode_names(self.pipe_names)))
                 await writer.drain()
                 log.info("bridge %s attached", peer)
-                await reader.read()
+                while True:
+                    kind, payload = await read_frame(reader)
+                    if kind == FRAME_DISPLAY_ID:
+                        self.reported_display_id = payload.decode("utf-8", "replace")
+                        log.info("bridge reports primary monitor %s", self.reported_display_id)
             elif kind == FRAME_PIPE_OPEN:
                 client_pid, pipe = decode_pipe_open(payload)
                 await PipeConnection(self, reader, writer, client_pid, pipe).run()
