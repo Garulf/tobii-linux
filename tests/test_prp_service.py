@@ -287,5 +287,22 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await command.receive()
 
 
+class WineClockTests(unittest.TestCase):
+    def test_clock_follows_the_wine_counter_source(self):
+        import time
+        from tobii_linux.prp_service import wine_clock
+        for name, clock_id in (("boottime", time.CLOCK_BOOTTIME), ("raw", time.CLOCK_MONOTONIC_RAW)):
+            before = time.clock_gettime_ns(clock_id) // 1000
+            value = wine_clock(name)()
+            after = time.clock_gettime_ns(clock_id) // 1000
+            self.assertLessEqual(before, value)
+            self.assertLessEqual(value, after)
+
+    def test_unknown_clock_is_rejected(self):
+        from tobii_linux.prp_service import wine_clock
+        with self.assertRaises(ValueError):
+            wine_clock("realtime")
+
+
 if __name__ == "__main__":
     unittest.main()

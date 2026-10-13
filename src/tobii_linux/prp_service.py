@@ -54,16 +54,24 @@ REAL_SERVICE_PERIOD_S = 0.030207
 MAX_PENDING_STREAM_BYTES = 64 * 1024
 
 
-def service_clock_us() -> int:
-    """Service time base for timesync replies and stream timestamps, in microseconds.
+WINE_CLOCKS = ("boottime", "raw")
 
-    CLOCK_MONOTONIC_RAW is the source of Wine's QueryPerformanceCounter, so this
-    clock also equals the game DLL's QPC-microsecond client clock under Wine.
+
+def wine_clock(name: str = "boottime"):
+    """Microsecond clock that runs at the rate of Wine's QueryPerformanceCounter.
+
+    The game DLL converts stream timestamps with an offset measured by timesync,
+    so the service clock must tick at the same rate as the client's counter.
+    Wine 10.17 and later read CLOCK_BOOTTIME ("boottime"); 10.16 and earlier read
+    CLOCK_MONOTONIC_RAW ("raw"). The two can drift apart by percent under WSL2.
     """
-    clock = getattr(time, "CLOCK_MONOTONIC_RAW", None)
-    if clock is None:
-        return time.monotonic_ns() // 1000
-    return time.clock_gettime_ns(clock) // 1000
+    if name not in WINE_CLOCKS:
+        raise ValueError(f"Unknown Wine clock {name!r}; expected one of {WINE_CLOCKS}")
+    clock_id = time.CLOCK_BOOTTIME if name == "boottime" else time.CLOCK_MONOTONIC_RAW
+    return lambda: time.clock_gettime_ns(clock_id) // 1000
+
+
+service_clock_us = wine_clock()
 
 
 def device_connect_response(serial: str, license_count: int) -> ConnectResponse:
@@ -426,10 +434,11 @@ class PrpService:
 
 async def _main(args) -> None:
     hub = HeadPoseHub()
-    service = PrpService(hub, args.name)
+    clock = wine_clock(args.wine_clock)
+    service = PrpService(hub, args.name, clock=clock)
     server = await service.serve(args.host, args.port)
     log.info("PRP service on %s, pipes %s", server.sockets[0].getsockname()[:2], service.pipe_names)
-    producer = asyncio.create_task(publish_synthetic(hub)) if args.synthetic else None
+    producer = asyncio.create_task(publish_synthetic(hub, clock=clock)) if args.synthetic else None
     async with server:
         await server.serve_forever()
     if producer:
@@ -444,6 +453,9 @@ def main(argv=None) -> None:
     parser.add_argument("--synthetic", action="store_true",
                         help="publish a synthetic head sweep instead of tracker output")
     parser.add_argument("--debug", action="store_true", help="log every relayed pipe message")
+    parser.add_argument("--wine-clock", choices=WINE_CLOCKS, default="boottime",
+                        help="clock behind the game's Wine QueryPerformanceCounter: "
+                             "boottime for Wine 10.17 and later, raw for older")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(message)s")
