@@ -56,9 +56,10 @@ The pipeline constructor `0x14028e2f0` wires:
   `0x14046edf8`. Members: `+8` adapter, `+0x10` geometry stage, `+0x18` filter
   stage, `+0x20` validation, `+0x38` settings.
 
-`0x140293fe0` builds a 4x4 matrix with `0x140294230` (adapter head pose plus the
-display corners from `0x1400e30d0`), gathers image size/binning and the display
-plane block, then calls `0x140293ca0`. That function caches the adapter's
+`0x140293fe0` builds the display matrix with `0x140294230` from the configured
+display-area object at settings `+0xf0`, copies the per-device camera
+extrinsic at settings `+0x50`, gathers image size/binning, then calls
+`0x140293ca0`. See [pose geometry](pose-geometry.md) for both matrices. That function caches the adapter's
 matrix and position (no smoothing in the cache), converts the matrix to
 angles with `0x1402b0d30` (order 3 -> `0x1402b1020`), runs the geometry stage
 and then the filter stage, and returns valid + 4 rotation floats + 3 position
@@ -98,6 +99,9 @@ PYTHONPATH=.local/python:.local/inference:src python3 tools/pose_euler_oracle.py
 matrix; its emulated comparison is still pending.
 
 ### Geometry stage (`+0x10`, vtable `0x14046ee08`, process `0x140294670`)
+
+Superseded in detail by [pose geometry](pose-geometry.md), which has the
+verified operand roles; the summary below is the first static reading.
 
 Configured from a 0x60-byte settings block (pipeline settings getter `+0x10`)
 holding a 3x3 at `+8..+0x28` and a 4x4 at `+0x2c..+0x68`.
@@ -190,8 +194,8 @@ These values are user configuration on one machine, not device constants.
 
 ## Not yet established
 
-- How the constant pi rotations combine with the `0x140294230` matrix and the
-  display-plane block (the geometry stage is not yet implemented or emulated).
+- The device's camera extrinsic (hardware info) needed by the geometry stage;
+  see [pose geometry](pose-geometry.md).
 - The validation object at producer `+0x20`.
 - An end-to-end native chain from fitted pose to public sample, compared
   against live Windows samples.
