@@ -77,6 +77,7 @@ exclude private binaries, captures and research tools.
 - [Native Linux model inference and next pipeline steps](docs/linux-inference.md)
 - [Face assets and LBF coefficient decoding](docs/face-assets.md)
 - [Pose projection and iterative fitting reconstruction](docs/pose-fitting.md)
+- [Head-pose output path from fitted pose to public sample](docs/head-pose-output.md)
 - [USB protocol findings](docs/usb-protocol.md)
 - [USB transport framing and control requests](docs/usb-transport-static.md)
 - [USB capture topology and limitations](docs/usb-capture-topology.md)

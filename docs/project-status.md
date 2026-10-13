@@ -5,6 +5,17 @@ next steps; detailed evidence is linked below.
 
 ## Latest continuation checkpoint
 
+### Head-pose output path traced
+
+The fitted pose reaches the public sample through `platmod_algo`: a face
+adapter scales translation to millimetres and builds an order-3 rotation
+matrix from (rx, ry - pi, rz); a producer converts it back to angles, applies a
+configured geometry stage (camera/display matrices plus a 180 degree Y
+rotation), then One Euro filters for each angle and for position. The public
+48-byte record takes those values unchanged in x, y, z order. Static evidence
+only; matrices, filter parameters and an emulated check remain. See
+[head-pose output](head-pose-output.md).
+
 ### Native supplied-face-box pose component checkpoint
 
 The installed 57-landmark model now fits all 69 state values natively: six rigid,

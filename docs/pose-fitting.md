@@ -523,3 +523,8 @@ Final verification for this checkpoint: **65 unit tests pass**; isolated minimal
 package tests pass with optional/private-asset tests skipped (see retained log).
 The previous rigid/deformation Jacobian and update oracles also pass after the
 float32 arithmetic/inversion changes. Nix has not been built in this workspace.
+
+### Output conversion
+
+The path after `0x140055470` to the public head-pose sample is documented in
+[head-pose output](head-pose-output.md).
