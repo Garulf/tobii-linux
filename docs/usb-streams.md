@@ -305,3 +305,36 @@ schemas; all builder and digest cases match. Its stubs are those of
 - Meaning of image column 2 values other than 8, of primary camera column 2,
   of notification types, and of `unlock_ppu` reply items.
 - Settings types 1..5 of `0x1400e7040`.
+
+## Live observations (WSL2 on the Windows reference)
+
+First run of the Linux session against the real tracker on 2026-10-13, with
+the device passed to the reference host's WSL2 Ubuntu through usbipd-win
+(Tobii services stopped, then restored and checked afterwards). Logs and frames
+are in `evidence/private/live-wsl/`; `tools/linux_session_probe.py` reproduces
+the steps.
+
+- Channel 0 carries TTP. Protocol upgrade 1000 is answered with response kind
+  `0x52`, word 2 = 1, status 0 and uint32 `0x10008`.
+- `unlock_ppu` 1600 returns three uint32 zeros, so no unlock realm is opened.
+- Realm `0x2712`: the salt reply is uint32 `0x2712`, uint32 0 and a 256-byte
+  blob. Command 1911 with the HMAC-MD5 digest and the 4 extra bytes is accepted;
+  hardware info 2120 then returns a 0x40f-byte reply and close 1915 succeeds.
+- Hardware info, camera 0: 2240x2240 pixels, two values of 1.75e-3 (pixel
+  pitch in mm, inferred), 5.22 (focal length in mm, inferred), translation
+  (0, 0, 4.14), zero angles, header values 16 and 100. Camera 1 is empty apart
+  from header values 62 and 100. Points: (0, 0, 0) and (+-130, 0.76, 1.62)
+  (illuminators, inferred). 5.22 / (2240 * 0.00175 / 2) = 2.66, close to the
+  configured `camera_focus 2.6`.
+- Subscribe 1220 to `0x501` is accepted and stream messages `0x53` follow:
+  280x280 8-bit frames (the sensor binned by 8, inferred) every 30.2 ms
+  (about 33 Hz), microsecond timestamps. Unsubscribe 1230 is accepted.
+- With nobody in front of the tracker the frames show the room at levels 8 to
+  20, with or without a gaze subscription. Illumination commands 2010/2030 and
+  output-frequency commands 1610/1630 are refused (unsupported or unknown
+  operation). The Windows runtime reported no valid head pose at the same time.
+- The device enumerates streams gaze `0x500`, image `0x501`, presence `0x504`,
+  image collection `0x508`, primary camera image `0x50e` and others.
+
+Not yet observed: frames with a person present, and therefore any live head
+pose from the Linux pipeline.

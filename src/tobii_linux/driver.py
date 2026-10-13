@@ -11,7 +11,7 @@ from .frames import image_frame
 from .ttp import Decoder, fields, hardware_info_request, protocol_upgrade
 from .ttp_commands import (Command, STREAM_DATA_KIND, RESPONSE_KIND, Stream, close_realm,
                            header_only_request, open_realm_response, open_realm_salt,
-                           realm_digest, subscribe_stream, wire_stream_id)
+                           realm_digest, subscribe_stream, unsubscribe_stream, wire_stream_id)
 from .ttp_fields import response_status, status_name, value
 
 UNLOCK_REALM_KEY = b'aaaaaaaabbbbbbbbccccccccdddddddd'

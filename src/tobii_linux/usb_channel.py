@@ -6,7 +6,10 @@ No timestamp negotiation, metadata updates, resets or firmware writes occur.
 """
 import math
 import time
+from .usb import USBError
 from .usb_framing import CHANNEL_COUNT, IncomingFrames, outgoing_frames
+
+LIBUSB_ERROR_TIMEOUT = -7
 
 
 class ShortWriteError(RuntimeError):
@@ -79,16 +82,20 @@ class USBChannel:
     def read(self, *, timeout_ms=1000):
         """Read once and return completed payloads addressed to this channel.
 
-        Empty bytes can mean a partial frame or data addressed elsewhere. The
-        caller owns its overall deadline and the higher-level message parser.
+        Empty bytes can mean a timeout, a partial frame or data addressed
+        elsewhere. Bytes received before a timeout are kept in the frame parser.
         """
         self._check_open()
         try:
             data = self.transport.read(16384, timeout_ms=timeout_ms)
+        except USBError as error:
+            if error.code != LIBUSB_ERROR_TIMEOUT:
+                self.failed = True
+                raise
+            data = error.partial_data
+        try:
             frames = self.frames.feed(data)
-            return b''.join(frame.payload for frame in frames if frame.for_channel(self.channel))
         except Exception:
-            # A timeout with partial bytes must not silently lose stream state.
-            # The experimental session fails closed rather than retrying.
             self.failed = True
             raise
+        return b''.join(frame.payload for frame in frames if frame.for_channel(self.channel))
