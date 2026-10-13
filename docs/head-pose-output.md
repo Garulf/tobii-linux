@@ -119,8 +119,29 @@ One Euro filters keyed on microsecond timestamps (rate = 1e6 / dt):
 - Position filter (`0x1402955d0`, 0x50-byte object): same form using the
   Euclidean norm of the 3D derivative.
 
-Filter parameters come from pipeline settings getters `+0x20`/`+0x28` and a
-third 0x30-byte object; their values are not yet recovered.
+### Installed settings
+
+The pipeline's settings provider (stack object, vtable `0x14046e938`, created in
+`0x1400e6ed0`) returns constants, not user configuration:
+
+| Getter | Function | Value |
+| --- | --- | --- |
+| `+0x10` geometry config | `0x14028fc30` | 3x3 = `0x1402b10a0(pi)` (X rotation, diag(1,-1,-1) up to float32 sin(pi)); 4x4 = `0x1402b11a0(pi)` (Z rotation, diag(-1,-1,1)) with zero translation |
+| `+0x18` | `0x14028ff50` | 65.0, passed to the face adapter, which scales by 0.001 (the 0.065 face-model reference distance) |
+| `+0x20/+0x28/+0x30` rotation filters | `0x140290070` | `[fallback 120 Hz, min_cutoff 1.0, beta 2.5, d_cutoff 2.5]` via `0x14028fba0` |
+| `+0x38` position filter | `0x1402900e0` | `[120 Hz, 0.04, 0.04, 0.04]` |
+
+`pose_output.OneEuroFilter`, `OneEuroVectorFilter` and `HeadPoseFilter`
+implement the stage with float32 arithmetic in the original order, including
+the unsigned timestamp difference and the fallback rate for repeated
+timestamps. `tools/pose_filter_oracle.py` runs the original `0x140295790` with
+these configurations on four sequences (steady, moving, irregular/repeated
+timestamps, reversed time; 60 samples): **all byte-exact**. Report:
+`evidence/private/pose-filter-oracle.json`.
+
+```sh
+PYTHONPATH=.local/python:.local/inference:src python3 tools/pose_filter_oracle.py
+```
 
 ## Camera hardware info
 
@@ -169,7 +190,8 @@ These values are user configuration on one machine, not device constants.
 
 ## Not yet established
 
-- Contents of the configured 3x3/4x4 (likely camera-to-tracker extrinsics from
-  the device hardware info) and the `0x140294230` / display-plane matrices.
-- One Euro parameter values and the validation object at producer `+0x20`.
-- A native implementation and an emulated comparison of this chain.
+- How the constant pi rotations combine with the `0x140294230` matrix and the
+  display-plane block (the geometry stage is not yet implemented or emulated).
+- The validation object at producer `+0x20`.
+- An end-to-end native chain from fitted pose to public sample, compared
+  against live Windows samples.

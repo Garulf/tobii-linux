@@ -38,6 +38,33 @@ class PoseOutputTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter_head_pose((0, 0, 0), (1, 2))
 
+    def test_filter_passes_first_sample_and_holds_steady_input(self):
+        import numpy as np
+        from tobii_linux.pose_output import HeadPoseFilter
+        stage = HeadPoseFilter()
+        for step in range(5):
+            rotation, position = stage((0.1, -0.2, 0.3), (-50, -15, 530), 1_000_000 + 8333 * step)
+            np.testing.assert_allclose(rotation, [0.1, -0.2, 0.3], rtol=1e-6)
+            np.testing.assert_allclose(position, [-50, -15, 530], rtol=1e-6)
+
+    def test_filter_lags_a_position_step(self):
+        from tobii_linux.pose_output import OneEuroVectorFilter
+        smoother = OneEuroVectorFilter()
+        smoother((0, 0, 500), 1_000_000)
+        moved = smoother((0, 0, 600), 1_008_333)
+        self.assertTrue(500 < float(moved[2]) < 600)
+
+    def test_repeated_timestamp_uses_fallback_rate(self):
+        from tobii_linux.pose_output import OneEuroFilter
+        smoother = OneEuroFilter()
+        smoother(0.0, 5)
+        self.assertTrue(0 < float(smoother(1.0, 5)) < 1)
+
+    def test_vector_filter_rejects_wrong_shape(self):
+        from tobii_linux.pose_output import OneEuroVectorFilter
+        with self.assertRaises(ValueError):
+            OneEuroVectorFilter()((1, 2), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
