@@ -75,9 +75,27 @@ B(b) = [[cb,0,-sb],[0,1,0],[sb,0,cb]]
 C(c) = [[cc,sc,0],[-sc,cc,0],[0,0,1]]
 ```
 
-and multiplies them in the written order (exact product order and its float32
-evaluation still need an emulator check). Orders 1 and 2 are `0x1402b1210`
-and `0x1402b1700`.
+The stored matrix is `(Ry(b) @ Rx(a) @ Rz(c)).T` in the conventional
+column-vector form: the same Y, X, Z composition as the fitter's projection,
+laid out for row vectors. Orders 1 and 2 are `0x1402b1210` and `0x1402b1700`.
+
+The order-3 inverse `0x1402b1020` reads the row-major matrix `m` as
+`b = atan2(m[6], m[8])`, `a = asin(-m[7])`, `c = atan2(m[1], m[4])`, stores
+order 3 in the fourth float, then `0x1402b0dc0` wraps c, a, b by adding or
+subtracting float32 2*pi until each lies in [-pi, pi] (NaN passes through).
+
+`pose_output.euler_matrix`, `matrix_euler` and `wrap_angle` implement these.
+`tools/pose_euler_oracle.py` runs both original functions on nine angle sets
+(single axes, the Windows sample's angles, near-pi yaw, steep pitch): all pass,
+seven byte-exact, maximum matrix error 2.98e-8 and angle error 1.19e-7.
+Report: `evidence/private/pose-euler-oracle.json`.
+
+```sh
+PYTHONPATH=.local/python:.local/inference:src python3 tools/pose_euler_oracle.py
+```
+
+`pose_output.adapter_head_pose` reproduces slot 5's millimetre scaling and
+matrix; its emulated comparison is still pending.
 
 ### Geometry stage (`+0x10`, vtable `0x14046ee08`, process `0x140294670`)
 
@@ -109,6 +127,4 @@ third 0x30-byte object; their values are not yet recovered.
 - Contents of the configured 3x3/4x4 (likely camera-to-tracker extrinsics from
   the device hardware info) and the `0x140294230` / display-plane matrices.
 - One Euro parameter values and the validation object at producer `+0x20`.
-- Exact Euler product order, the order-3 inverse `0x1402b1020`, and whether the
-  round trip is exact in float32.
 - A native implementation and an emulated comparison of this chain.
