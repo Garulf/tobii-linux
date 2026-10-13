@@ -122,6 +122,28 @@ One Euro filters keyed on microsecond timestamps (rate = 1e6 / dt):
 Filter parameters come from pipeline settings getters `+0x20`/`+0x28` and a
 third 0x30-byte object; their values are not yet recovered.
 
+## Configured geometry on the Windows reference
+
+`tools/windows_geometry_probe.py` calls only getters (`tobii_get_display_area`,
+`tobii_get_geometry_mounting`, `tobii_get_track_box`) and then captures head
+pose for two seconds in the same session. Output:
+`evidence/private/windows-geometry-probe.jsonl` (66 samples, e.g. position
+(-54.1, -15.8, 541.5) mm, rotation (0.160, -0.126, 0.012) rad).
+
+| Item | Value |
+| --- | --- |
+| Display top-left (mm) | (-296.62, 326.00, 111.82) |
+| Display top-right (mm) | (300.38, 326.00, 111.82) |
+| Display bottom-left (mm) | (-296.62, 10.27, -3.10) |
+| Geometry mounting, raw words | int 2, then floats 184.0, 20.0, 0.0, -0.16, 13.85, 0.0, 5.38, 9.86 |
+| Track box | `TOBII_ERROR_NOT_SUPPORTED` (3) |
+
+The panel is 597 x 336 mm and tilted 20 degrees, matching the mounting's
+second float. The mounting buffer was oversized and only the first nine words
+were nonzero; a plausible reading is guides, width_mm, angle_deg, then two
+offset vectors, but that field naming is not yet confirmed from code.
+These values are user configuration on one machine, not device constants.
+
 ## Not yet established
 
 - Contents of the configured 3x3/4x4 (likely camera-to-tracker extrinsics from
