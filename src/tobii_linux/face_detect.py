@@ -52,17 +52,18 @@ def _round_even(value):
 
 
 def _resize_taps(source, target):
-    scale = source / target
+    import numpy as np
+    scale = 1.0 / (target / source)
     indices, weights = [], []
     for position in range(target):
-        exact = (position + 0.5) * scale - 0.5
+        exact = np.float32((position + 0.5) * scale - 0.5)
         index = math.floor(exact)
-        fraction = exact - index
+        fraction = np.float32(exact - np.float32(index))
         if index < 0:
-            index, fraction = 0, 0.0
+            index, fraction = 0, np.float32(0)
         if index >= source - 1:
-            index, fraction = source - 1, 0.0
-        first = int(round((1 - fraction) * (1 << RESIZE_COEFFICIENT_BITS)))
+            index, fraction = source - 1, np.float32(0)
+        first = int(np.rint((np.float32(1) - fraction) * np.float32(1 << RESIZE_COEFFICIENT_BITS)))
         indices.append(index)
         weights.append((first, (1 << RESIZE_COEFFICIENT_BITS) - first))
     return indices, weights

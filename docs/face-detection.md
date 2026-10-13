@@ -23,7 +23,11 @@ whether it overrides the 0.75 default at runtime is not established.
    horizontally with width `round(192 / (height/width))`; otherwise scale =
    width/256 and it is centred vertically. Rounding is round-half-even.
 2. Resize with `0x1400b4940` mode 1: bilinear with 11-bit fixed-point taps,
-   pixel-centre alignment, edge clamping and `(sum + 2^21) >> 22`.
+   pixel-centre alignment, edge clamping and `(sum + 2^21) >> 22`. The scale is
+   `1 / (dst / src)` in double, the source position is rounded to float32
+   before splitting into index and fraction, and the first tap is
+   `rint((1 - fraction) * 2048)` in float32. Using `src / dst` or double
+   fractions gives sparse off-by-one pixels.
 3. Run `ff` (input 1x1x192x256, the runner's 1/255 scaling, output 25,380
    floats = 2,820 anchors x 9).
 4. Anchors (`0x14007b260`): strides 8, 16, 32, 64 with sizes (10, 16, 24),
