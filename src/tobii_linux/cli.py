@@ -17,12 +17,16 @@ def probe(_):
     return 0
 
 
+def display_area(args):
+    from .head_pose_pipeline import DisplayArea
+    return DisplayArea(*(tuple(args.display[i:i + 3]) for i in (0, 3, 6)))
+
+
 def tracker_samples(args, host_clock=None):
     """Head-pose samples from the first matching tracker until it stops sending frames."""
     from .driver import TrackerSession, head_pose_samples
-    from .head_pose_pipeline import DisplayArea
     from .usb_channel import USBChannel
-    area = DisplayArea(*(tuple(args.display[i:i + 3]) for i in (0, 3, 6)))
+    area = display_area(args)
     with USBContext() as context:
         devices = context.probe()
         if not devices:
@@ -52,7 +56,8 @@ def serve(args):
 
     async def run():
         hub = HeadPoseHub()
-        service = PrpService(hub, args.name, clock=clock)
+        service = PrpService(hub, args.name, clock=clock, display_area=display_area(args),
+                             display_id=args.display_id)
         server = await service.serve(args.host, args.port)
         logging.info('PRP service on %s:%d, pipes %s', args.host, args.port, service.pipe_names)
         async with server:
@@ -81,6 +86,9 @@ def main():
     serve_parser.add_argument('--host', default='127.0.0.1')
     serve_parser.add_argument('--port', type=int, default=DEFAULT_PORT, help='TCP port the bridge connects to')
     serve_parser.add_argument('--name', default=DEFAULT_NAME, help='Device name in tobii-prp://<name>')
+    serve_parser.add_argument('--display-id',
+                              help="Monitor device instance id the game's window tracking matches "
+                                   "(the part before '##'); needed only when the game tracks a window")
     serve_parser.add_argument('--wine-clock', choices=WINE_CLOCKS, default='boottime',
                               help="Clock behind the game's Wine QueryPerformanceCounter: "
                                    'boottime for Wine 10.17 and later, raw for older')

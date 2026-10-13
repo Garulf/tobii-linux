@@ -66,7 +66,8 @@ Three pieces are needed:
 1. A Wine build with the named-pipe listing patch, so the game's Tobii DLL can
    discover the service: `patches/wine/apply.sh <wine-source>` for Wine 10.0
    or later, then build Wine as usual
-   ([details](docs/wine-pipe-enumeration.md)).
+   ([details](docs/wine-pipe-enumeration.md)). The game's integration layer
+   only tracks discovered trackers, so this is not optional.
 2. The service on Linux, with the same display area as above:
 
    ```sh
@@ -74,13 +75,17 @@ Three pieces are needed:
      --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
    ```
 
-   Pass `--wine-clock raw` when the game's Wine is 10.16 or older.
+   Pass `--wine-clock raw` when the game's Wine is 10.16 or older. If the
+   game tracks its window rather than the tracker, also pass `--display-id`
+   with the monitor's device instance id inside the prefix
+   ([game integration layer](docs/game-integration-layer.md)).
 3. The bridge, started in the game's Wine prefix before the game:
    `wine tools/prp_bridge/prp_bridge.exe 127.0.0.1 7760` (build it with
    `make -C tools/prp_bridge`, which needs MinGW-w64).
 
 See [the bridge document](docs/prp-bridge.md) for the protocol and test
-results.
+results. Under a patched Wine 11.0, the game DLL's integration layer
+receives every sample from the service; Star Citizen itself has not been run.
 
 ## Tests
 
@@ -120,7 +125,7 @@ evaluation), but no NixOS machine has run them yet.
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)
-- [Game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
+- [Game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [game integration layer](docs/game-integration-layer.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
 - [models](models/README.md)
 - [Managed API](docs/managed-api.md), [Linux inference](docs/linux-inference.md)
 

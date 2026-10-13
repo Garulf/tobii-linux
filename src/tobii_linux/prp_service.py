@@ -3,8 +3,9 @@
 A Windows bridge inside the Wine prefix (tools/prp_bridge) owns the named pipes
 and forwards each pipe connection over its own loopback TCP connection. This
 module speaks the service side of the PRP handshake and the head-pose subset of
-the session: connect, stream start/stop for stream 2, timesync, and stream
-packages. Relay framing and real-service comparison: docs/prp-bridge.md.
+the session: connect, stream start/stop for stream 2, timesync, stream packages,
+and the property requests of the game integration layer (display area, display
+id, user presence). Relay framing and real-service comparison: docs/prp-bridge.md.
 """
 
 import argparse
@@ -17,16 +18,19 @@ import struct
 import time
 import uuid
 
-from tobii_linux.head_pose_pipeline import HeadPoseSample
+from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, decode_envelope, encode_envelope
 from tobii_linux.prp import encode_stream_packet
 from tobii_linux.prp_session import (
-    COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
-    COMMAND_TIMESYNC, OPERATION_COMMAND_REQUEST, OPERATION_COMMAND_RESPONSE, SERVER_PIPE_PREFIX,
+    COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE,
+    COMMAND_STREAM_START, COMMAND_STREAM_STOP, COMMAND_TIMESYNC, OPERATION_COMMAND_REQUEST,
+    OPERATION_COMMAND_RESPONSE, OPERATION_PROPERTY_GET, PROPERTY_DISPLAY_AREA,
+    PROPERTY_DISPLAY_ID, SERVER_PIPE_PREFIX,
     STATUS_NOT_SUPPORTED, STATUS_OK, SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL, CommandResponse,
-    ConnectResponse, HandshakeInfo, decode_client_hello, decode_client_pid,
-    decode_command_request, encode_command_response, encode_handshake_ack,
-    encode_handshake_info, split_packets)
+    ConnectResponse, HandshakeInfo, PropertyResponse, decode_client_hello, decode_client_pid,
+    decode_command_request, decode_property_request, decode_property_subscribe_request,
+    display_area_value, encode_command_response, encode_handshake_ack, encode_handshake_info,
+    encode_property_response, encode_property_subscribe_response, split_packets, string_value)
 
 log = logging.getLogger("tobii_linux.prp_service")
 
@@ -52,6 +56,20 @@ ERROR_BODY_WORDS = 4
 REAL_SERVICE_PERIOD_S = 0.030207
 # Unsent bytes above which stream packages are dropped for a slow client.
 MAX_PENDING_STREAM_BYTES = 64 * 1024
+PROPERTY_MODEL = 8
+PROPERTY_ZERO_WORDS = (2, 4)
+PROPERTY_USER_PRESENCE = 0xB
+MODEL_NAME = "IS5_Large_Eyetracker_5"
+# User presence on the wire: the client maps 2 to away and 3 to present (0x180030098); the
+# real service sent 2 with nobody in front of the tracker.
+PRESENCE_AWAY = 2
+PRESENCE_PRESENT = 3
+# Smallest value block the client decoder accepts per property id (0x180055780, operation 6);
+# ids not listed need 8 bytes. Error replies carry a zero block of this size, as the real
+# service did for the properties it refused.
+PROPERTY_BLOCK_SIZES = {0: 4, 1: 0x28, 0xA: 0x1C, 0xB: 0x10, 0xC: 0x18, 0xD: 0xC, 0xF: 0x64,
+                        0x13: 0x488, 0x14: 0x10, 0x17: 0x34, 0x18: 0x10}
+DEFAULT_PROPERTY_BLOCK_SIZE = 8
 
 
 WINE_CLOCKS = ("boottime", "raw")
@@ -103,6 +121,36 @@ def _float_word(value: float) -> int:
     return struct.unpack("<i", struct.pack("<f", value))[0]
 
 
+def parse_display_area(text: str) -> DisplayArea:
+    """Nine comma-separated millimetre values: top-left, top-right, bottom-left corners."""
+    values = [float(value) for value in text.split(",")]
+    if len(values) != 9:
+        raise ValueError("display area needs nine comma-separated numbers")
+    return DisplayArea(tuple(values[0:3]), tuple(values[3:6]), tuple(values[6:9]))
+
+
+def word_value(value: int) -> tuple[bytes, bytes]:
+    return struct.pack("<II", 8, value), struct.pack("<I", 4)
+
+
+def presence_value(present: bool, since_us: int) -> tuple[bytes, bytes]:
+    """Property 0xB: time of the last presence change (high, low word), then the wire value.
+
+    The real service answered two subscribes minutes apart with the same timestamp, so
+    the time is that of the last change, not of the request.
+    """
+    block = struct.pack("<IIII", 0x10, since_us >> 32 & 0xFFFFFFFF, since_us & 0xFFFFFFFF,
+                        PRESENCE_PRESENT if present else PRESENCE_AWAY)
+    return block, struct.pack("<I", 4)
+
+
+def property_error(tag: int, property_id: int, status: int = STATUS_NOT_SUPPORTED):
+    """Refusal with a zero value block, so the client decoder still accepts the packet."""
+    size = PROPERTY_BLOCK_SIZES.get(property_id, DEFAULT_PROPERTY_BLOCK_SIZE)
+    block = struct.pack("<I", size) + bytes(size - 4)
+    return PropertyResponse(tag, status, property_id, block, struct.pack("<I", 4))
+
+
 # Relay framing ------------------------------------------------------------------------
 
 
@@ -152,6 +200,8 @@ class HeadPoseHub:
     def __init__(self, depth: int = 4):
         self.depth = depth
         self.queues: set[asyncio.Queue] = set()
+        self.present = False
+        self.presence_since_us: int | None = None
 
     def subscribe(self) -> asyncio.Queue:
         queue = asyncio.Queue(self.depth)
@@ -162,6 +212,8 @@ class HeadPoseHub:
         self.queues.discard(queue)
 
     def publish(self, sample: HeadPoseSample) -> None:
+        if self.presence_since_us is None or bool(sample.valid) != self.present:
+            self.present, self.presence_since_us = bool(sample.valid), sample.timestamp_us
         for queue in self.queues:
             if queue.full():
                 queue.get_nowait()
@@ -203,6 +255,13 @@ def stream_package(sample: HeadPoseSample) -> bytes:
 
 
 # Command handling -----------------------------------------------------------------------
+
+
+def packet_operation(packet: bytes) -> int:
+    payload = decode_envelope(packet)
+    if len(payload) < 12:
+        raise ProtocolError("truncated PRP header")
+    return struct.unpack_from("<I", payload, 8)[0]
 
 
 @dataclass(frozen=True)
@@ -323,7 +382,16 @@ class PipeConnection:
         if self.channel == SUBSCRIPTION_CHANNEL:
             log.warning("ignoring client packet on subscription channel")
             return
+        if packet_operation(packet) == OPERATION_PROPERTY_GET:
+            tag, property_id = decode_property_request(packet)
+            response = self.service.answer_property(tag, property_id)
+            log.info("property %#x tag %d status %d", property_id, tag, response.status)
+            self.send(encode_property_response(response))
+            return
         header = request_header(packet)
+        if header.command in (COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE):
+            self.send(self.property_subscription(packet))
+            return
         try:
             request = decode_command_request(packet)
         except ProtocolError:
@@ -332,14 +400,26 @@ class PipeConnection:
             return
         self.send(encode_command_response(self.service.respond(self, request)))
 
+    def property_subscription(self, packet: bytes) -> bytes:
+        """Command 5 answers with the current value; command 6 echoes the property id."""
+        tag, command, property_id = decode_property_subscribe_request(packet)
+        if command == COMMAND_PROPERTY_UNSUBSCRIBE:
+            log.info("property %#x unsubscribe tag %d", property_id, tag)
+            return encode_command_response(CommandResponse(tag, command, STATUS_OK, property_id))
+        response = self.service.answer_property(tag, property_id, subscribe=True)
+        log.info("property %#x subscribe tag %d status %d", property_id, tag, response.status)
+        return encode_property_subscribe_response(response)
+
 
 class PrpService:
     """Shared state: pipe names, subscription ids and the sample hub."""
 
     def __init__(self, hub: HeadPoseHub, name: str = DEFAULT_NAME, serial: str | None = None,
-                 clock=service_clock_us):
+                 clock=service_clock_us, display_area: DisplayArea | None = None,
+                 display_id: str | None = None):
         self.hub, self.name, self.clock = hub, name, clock
         self.serial = serial or name
+        self.display_area, self.display_id = display_area, display_id
         self.subscription_pipe = str(uuid.uuid4())
         self.timesync_pipe = str(uuid.uuid4())
         self.subscriptions: dict[int, Subscription] = {}
@@ -395,6 +475,34 @@ class PrpService:
         log.info("head pose stream stopped for subscription %d", subscription.subscription_id)
         return CommandResponse(request.tag, request.command, STATUS_OK, request.stream)
 
+    def answer_property(self, tag: int, property_id: int,
+                        subscribe: bool = False) -> PropertyResponse:
+        """Value of a property for a get, or for a subscribe (command 5), or a refusal.
+
+        Served: display area and display id when configured, the model name, properties
+        2 and 4 (0, as the real service sent them; meaning unknown), and user presence for
+        subscribes only (the real service refused the plain get). Subscribing sends no
+        later notifications.
+        """
+        value = self.property_value(property_id, subscribe)
+        if value is None:
+            return property_error(tag, property_id)
+        return PropertyResponse(tag, STATUS_OK, property_id, *value)
+
+    def property_value(self, property_id: int, subscribe: bool):
+        if property_id == PROPERTY_DISPLAY_AREA and self.display_area:
+            area = self.display_area
+            return display_area_value(area.top_left, area.top_right, area.bottom_left)
+        if property_id == PROPERTY_DISPLAY_ID and self.display_id:
+            return string_value(self.display_id)
+        if property_id == PROPERTY_MODEL:
+            return string_value(MODEL_NAME)
+        if property_id in PROPERTY_ZERO_WORDS:
+            return word_value(0)
+        if property_id == PROPERTY_USER_PRESENCE and subscribe:
+            return presence_value(self.hub.present, self.hub.presence_since_us or 0)
+        return None
+
     def connect(self, connection: PipeConnection, request) -> CommandResponse:
         subscription = self.subscriptions.get(request.connect.subscription_client_id)
         if subscription is None:
@@ -435,7 +543,8 @@ class PrpService:
 async def _main(args) -> None:
     hub = HeadPoseHub()
     clock = wine_clock(args.wine_clock)
-    service = PrpService(hub, args.name, clock=clock)
+    service = PrpService(hub, args.name, clock=clock, display_area=args.display_area,
+                         display_id=args.display_id)
     server = await service.serve(args.host, args.port)
     log.info("PRP service on %s, pipes %s", server.sockets[0].getsockname()[:2], service.pipe_names)
     producer = asyncio.create_task(publish_synthetic(hub, clock=clock)) if args.synthetic else None
@@ -452,6 +561,12 @@ def main(argv=None) -> None:
     parser.add_argument("--name", default=DEFAULT_NAME, help="device name in tobii-prp://<name>")
     parser.add_argument("--synthetic", action="store_true",
                         help="publish a synthetic head sweep instead of tracker output")
+    parser.add_argument("--display-area", type=parse_display_area,
+                        help="top-left, top-right and bottom-left display corners in mm, "
+                             "x,y,z each, comma-separated (tobii_get_display_area)")
+    parser.add_argument("--display-id",
+                        help="display id string (tobii_get_display_id); the game layer matches "
+                             "the part before '##' with a monitor's device instance id")
     parser.add_argument("--debug", action="store_true", help="log every relayed pipe message")
     parser.add_argument("--wine-clock", choices=WINE_CLOCKS, default="boottime",
                         help="clock behind the game's Wine QueryPerformanceCounter: "

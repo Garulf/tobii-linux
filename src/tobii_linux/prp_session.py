@@ -2,8 +2,10 @@
 
 Covers the named-pipe connection handshake, transport framing, and the command
 request/response messages the client sends to obtain head pose: connect (1),
-stream start (3), stream stop (4) and timesync (22). These are pure codecs; they
-do not open pipes or sockets and do not implement a service.
+stream start (3), stream stop (4) and timesync (22), and the property messages of
+the game integration layer: get (operation 5, answered by operation 6), subscribe
+(command 5) and unsubscribe (command 6). These are pure codecs; they do not open
+pipes or sockets and do not implement a service.
 
 Recovered from DLL SHA256 35a071073c7498fd917b7e29292299f8b3214fe5a7a8cf5d62610d0331146020.
 See docs/service-transport.md for locations, evidence and limits.
@@ -32,6 +34,8 @@ MAX_HANDSHAKE_INFO = 0x100
 PIPE_CHUNK = 0x1000
 
 OPERATION_STREAM_PACKAGE = 1
+OPERATION_PROPERTY_GET = 5
+OPERATION_PROPERTY_GET_RESPONSE = 6
 OPERATION_COMMAND_REQUEST = 9
 OPERATION_COMMAND_RESPONSE = 10
 
@@ -39,6 +43,10 @@ COMMAND_CONNECT = 1
 COMMAND_STREAM_START = 3
 COMMAND_STREAM_STOP = 4
 COMMAND_TIMESYNC = 0x16
+COMMAND_PROPERTY_SUBSCRIBE = 5
+COMMAND_PROPERTY_UNSUBSCRIBE = 6
+WORD_RESPONSE_COMMANDS = (COMMAND_STREAM_START, COMMAND_STREAM_STOP,
+                          COMMAND_PROPERTY_UNSUBSCRIBE)
 
 STATUS_NAMES = (
     "NO_ERROR", "INTERNAL", "NOT_SUPPORTED", "CONNECTION_FAILED",
@@ -243,6 +251,13 @@ class _Writer:
 
     def put(self, offset: int, fmt: str, *values) -> None:
         struct.pack_into(fmt, self.buf, self.region + offset, *values)
+
+    def raw(self, block: bytes, region: bytes) -> None:
+        """Append an already encoded block and its region."""
+        self._close()
+        self.buf += block
+        self.region = len(self.buf)
+        self.buf += region
 
     def _close(self):
         if self.region is not None:
@@ -507,14 +522,14 @@ def _encode_connect_body(writer: _Writer, response: ConnectResponse, extended: b
 
 
 def encode_command_response(response: CommandResponse, *, extended: bool = True) -> bytes:
-    """Serialize operation 10 for connect, stream start/stop and timesync."""
+    """Serialize operation 10 for connect, stream start/stop, timesync and unsubscribe."""
     writer = _message(response.tag, OPERATION_COMMAND_RESPONSE)
     header = writer.block(3)
     writer.set(header, 1, _i32(response.status))
     writer.set(header, 2, response.command)
     if response.command == COMMAND_CONNECT:
         _encode_connect_body(writer, response.connect or ConnectResponse(), extended)
-    elif response.command in (COMMAND_STREAM_START, COMMAND_STREAM_STOP):
+    elif response.command in WORD_RESPONSE_COMMANDS:
         writer.set(writer.block(2), 1, _i32(response.value or 0))
     elif response.command == COMMAND_TIMESYNC:
         if not 0 <= (response.value or 0) < (1 << 64):
@@ -560,12 +575,136 @@ def decode_command_response(packet: bytes, *, extended: bool = True) -> CommandR
     if command == COMMAND_CONNECT:
         return CommandResponse(tag, command, status,
                                connect=_decode_connect_body(block, region, extended))
-    if command in (COMMAND_STREAM_START, COMMAND_STREAM_STOP):
+    if command in WORD_RESPONSE_COMMANDS:
         return CommandResponse(tag, command, status, _signed(_words(block, 8)[1]))
     if command == COMMAND_TIMESYNC:
         w = _words(block, 12)
         return CommandResponse(tag, command, status, w[1] << 32 | w[2])
     raise ProtocolError("command is outside the head-pose session subset")
+
+
+# Property messages ---------------------------------------------------------------------
+
+PROPERTY_DISPLAY_AREA = 1
+PROPERTY_DISPLAY_ID = 0x12
+DISPLAY_AREA_FLOATS = 9
+STRING_PROPERTIES = (8, PROPERTY_DISPLAY_ID)
+STRING_PROPERTY_LIMIT = 0x100
+
+
+def encode_property_request(tag: int, property_id: int) -> bytes:
+    """Operation 5 as the client sends it (0x180019f60): one block holding the property id."""
+    writer = _message(tag, OPERATION_PROPERTY_GET)
+    writer.set(writer.block(2), 1, property_id)
+    return writer.finish()
+
+
+def encode_property_subscribe_request(tag: int, property_id: int,
+                                      command: int = COMMAND_PROPERTY_SUBSCRIBE) -> bytes:
+    """Command 5 (subscribe, 0x180019830) or 6 (unsubscribe) with the property id."""
+    if command not in (COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE):
+        raise ProtocolError("not a property subscription command")
+    writer = _message(tag, OPERATION_COMMAND_REQUEST)
+    writer.set(writer.block(2), 1, command)
+    writer.set(writer.block(2), 1, property_id)
+    return writer.finish()
+
+
+def decode_property_subscribe_request(packet: bytes) -> tuple[int, int, int]:
+    """Tag, command (5 or 6) and property id of a property subscription request."""
+    tag, operation, pairs = _header(packet)
+    command = _words(pairs[0][0], 8)[1] if pairs else None
+    if (operation != OPERATION_COMMAND_REQUEST or len(pairs) < 2
+            or command not in (COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE)):
+        raise ProtocolError("not a PRP property subscription request")
+    return tag, command, _words(pairs[1][0], 8)[1]
+
+
+def decode_property_request(packet: bytes) -> tuple[int, int]:
+    """Tag and property id of an operation 5 request."""
+    tag, operation, pairs = _header(packet)
+    if operation != OPERATION_PROPERTY_GET:
+        raise ProtocolError("not a PRP property get")
+    return tag, _words(pairs[0][0], 8)[1]
+
+
+@dataclass(frozen=True)
+class PropertyResponse:
+    """A property value with its status, as the raw value block and region.
+
+    Sent as operation 6 for a get (operation 5) and inside the command 5 response for
+    a subscribe; the value block layout depends on the property id.
+    """
+    tag: int
+    status: int
+    property_id: int
+    block: bytes = struct.pack("<I", 4)
+    region: bytes = struct.pack("<I", 4)
+
+
+def encode_property_response(response: PropertyResponse) -> bytes:
+    writer = _message(response.tag, OPERATION_PROPERTY_GET_RESPONSE)
+    header = writer.block(3)
+    writer.set(header, 1, _i32(response.status))
+    writer.set(header, 2, response.property_id)
+    writer.raw(response.block, response.region)
+    return writer.finish()
+
+
+def encode_property_subscribe_response(response: PropertyResponse) -> bytes:
+    """Command 5 response: status, property id, then its current value (decoder 0x180055780)."""
+    writer = _message(response.tag, OPERATION_COMMAND_RESPONSE)
+    header = writer.block(3)
+    writer.set(header, 1, _i32(response.status))
+    writer.set(header, 2, COMMAND_PROPERTY_SUBSCRIBE)
+    writer.set(writer.block(2), 1, response.property_id)
+    writer.raw(response.block, response.region)
+    return writer.finish()
+
+
+def decode_property_response(packet: bytes) -> PropertyResponse:
+    tag, operation, pairs = _header(packet)
+    if operation != OPERATION_PROPERTY_GET_RESPONSE or len(pairs) < 2:
+        raise ProtocolError("not a PRP property get response")
+    _, status, property_id = _words(pairs[0][0], 12)[:3]
+    return PropertyResponse(tag, _signed(status), property_id, *pairs[1])
+
+
+def decode_property_subscribe_response(packet: bytes) -> PropertyResponse:
+    tag, operation, pairs = _header(packet)
+    if operation != OPERATION_COMMAND_RESPONSE or len(pairs) < 3:
+        raise ProtocolError("not a PRP command response with a property value")
+    _, status, command = _words(pairs[0][0], 12)[:3]
+    if command != COMMAND_PROPERTY_SUBSCRIBE:
+        raise ProtocolError("not a PRP property subscribe response")
+    return PropertyResponse(tag, _signed(status), _words(pairs[1][0], 8)[1], *pairs[2])
+
+
+def display_area_value(top_left, top_right, bottom_left) -> tuple[bytes, bytes]:
+    """Value block for property 1: nine floats in millimetres (decoder 0x180055780)."""
+    floats = (*top_left, *top_right, *bottom_left)
+    if len(floats) != DISPLAY_AREA_FLOATS:
+        raise ProtocolError("display area needs three corners of three coordinates")
+    block = struct.pack("<I9f", 4 + 4 * DISPLAY_AREA_FLOATS, *floats)
+    return block, struct.pack("<I", 4)
+
+
+def string_value(text: str) -> tuple[bytes, bytes]:
+    """Value block for string properties: a region offset, then the NUL-terminated text."""
+    raw = _ascii(text, STRING_PROPERTY_LIMIT) + b"\0"
+    raw += bytes(-len(raw) % 4)
+    return struct.pack("<II", 8, 4), struct.pack("<I", 4 + len(raw)) + raw
+
+
+def decode_display_area(response: PropertyResponse) -> tuple[float, ...]:
+    if len(response.block) < 4 + 4 * DISPLAY_AREA_FLOATS:
+        raise ProtocolError("display area value block is too short")
+    return struct.unpack_from("<9f", response.block, 4)
+
+
+def decode_string_value(response: PropertyResponse) -> str:
+    offset = _words(response.block, 8)[1]
+    return _string_at(response.region, offset, STRING_PROPERTY_LIMIT)
 
 
 def minimal_connect_response(build_version: str, license_count: int,

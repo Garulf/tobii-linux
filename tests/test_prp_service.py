@@ -13,9 +13,14 @@ from tobii_linux.head_pose_pipeline import HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, decode_envelope, decode_head_body, encode_envelope
 from tobii_linux.prp_service import (
     FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_REPLY_PIPE,
-    HeadPoseHub, PrpService, decode_names, encode_frame, encode_pipe_open, error_response,
-    read_frame, request_header, stream_package)
+    DisplayArea, HeadPoseHub, PrpService, parse_display_area, decode_names, encode_frame, encode_pipe_open,
+    error_response, property_error, read_frame, request_header, stream_package)
 from tobii_linux.prp_session import (
+    COMMAND_PROPERTY_UNSUBSCRIBE, PROPERTY_DISPLAY_AREA,
+    PROPERTY_DISPLAY_ID, decode_display_area, decode_property_response,
+    decode_property_subscribe_response, decode_string_value, encode_property_request,
+    encode_property_response, encode_property_subscribe_request,
+    encode_property_subscribe_response,
     CommandResponse, HandshakeInfo, encode_command_response, encode_handshake_info,
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
     COMMAND_TIMESYNC, CONNECT_RESPONSE_BLOCK_EXTENDED, SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL,
@@ -36,6 +41,82 @@ REAL_STREAM_STOP_RESPONSE = bytes.fromhex(
 REAL_TIMESYNC_RESPONSE = bytes.fromhex(
     "5450525034000000605052500c000000010000000a000000040000000c0000000000000016000000"
     "040000000c000000cb000000c01fa7e80400000000000000")
+REAL_DISPLAY_AREA_RESPONSE = bytes.fromhex(
+    "5450525050000000045052500c0000000200000006000000040000000c000000000000000100000004000000"
+    "280000005f4f94c38500a34333a3df42a13096438500a34333a3df425f4f94c3fc462441bb6646c0"
+    "0400000000000000")
+REAL_DISPLAY_ID = "DISPLAY\\GSM5B7F\\5&5028A6B&0&UID41221##eId:1E6D7F5B0B220100061E#or:1#v:1.0"
+REAL_DISPLAY_ID_RESPONSE = bytes.fromhex(
+    "545052507c000000285052500c0000000300000006000000040000000c000000000000001200000004000000"
+    "080000000400000050000000444953504c41595c47534d354237465c35263530323841364226302655494434"
+    "3132323123236549643a3145364437463542304232323031303030363145236f723a3123763a312e30000000"
+    "00000000")
+REAL_MODEL_RESPONSE = bytes.fromhex(
+    "54505250480000001c5052500c0000000900000006000000040000000c000000000000000800000004000000"
+    "08000000040000001c0000004953355f4c617267655f457965747261636b65725f35003600000000")
+REAL_PROPERTY_4_RESPONSE = bytes.fromhex(
+    "5450525030000000645052500c0000000400000006000000040000000c000000000000000400000004000000"
+    "08000000000000000400000000000000")
+REAL_PROPERTY_REFUSALS = {
+    (0xd, 0x0):
+        "545052502c000000785052500c0000000d00000006000000040000000c000000020000000000000004000000"
+        "040000000400000000000000",
+    (0x9, 0x3):
+        "5450525030000000645052500c0000000900000006000000040000000c000000020000000300000004000000"
+        "08000000000000000400000000000000",
+    (0xa, 0xa):
+        "5450525044000000105052500c0000000a00000006000000040000000c000000020000000a00000004000000"
+        "1c0000000000000000000000000000000000000000000000000000000400000000000000",
+    (0x2, 0xb):
+        "54505250380000006c5052500c0000000200000006000000040000000c000000020000000b00000004000000"
+        "100000000000000000000000000000000400000000000000",
+    (0x7, 0xd):
+        "5450525034000000605052500c0000000700000006000000040000000c000000020000000d00000004000000"
+        "0c00000000000000000000000400000000000000",
+    (0x8, 0xe):
+        "5450525030000000645052500c0000000800000006000000040000000c000000020000000e00000004000000"
+        "08000000000000000400000000000000",
+    (0x3, 0x14):
+        "54505250380000006c5052500c0000000300000006000000040000000c000000020000001400000004000000"
+        "100000000000000000000000000000000400000000000000",
+    (0xc, 0x17):
+        "545052505c000000085052500c0000000c00000006000000040000000c000000020000001700000004000000"
+        "3400000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        "00000000000000000400000000000000",
+    (0x4, 0x18):
+        "54505250380000006c5052500c0000000400000006000000040000000c000000020000001800000004000000"
+        "100000000000000000000000000000000400000000000000",
+}
+REAL_SUBSCRIBE_RESPONSES = {
+    (0x3, 0x1):
+        "545052505c000000085052500c000000030000000a000000040000000c000000000000000500000004000000"
+        "080000000100000004000000280000005f4f94c38500a34333a3df42a13096438500a34333a3df425f4f94c3"
+        "fc462441bb6646c00400000000000000",
+    (0x4, 0xb):
+        "5450525044000000105052500c000000040000000a000000040000000c000000000000000500000004000000"
+        "080000000b0000000400000010000000cd0000005d058c72020000000400000000000000",
+    (0x5, 0x2):
+        "545052503c000000685052500c000000050000000a000000040000000c000000000000000500000004000000"
+        "08000000020000000400000008000000000000000400000000000000",
+    (0x6, 0x4):
+        "545052503c000000685052500c000000060000000a000000040000000c000000000000000500000004000000"
+        "08000000040000000400000008000000000000000400000000000000",
+}
+REAL_UNSUBSCRIBE_RESPONSES = {
+    (0x7, 0x1):
+        "5450525030000000645052500c000000070000000a000000040000000c000000000000000600000004000000"
+        "08000000010000000400000000000000",
+    (0x8, 0xb):
+        "5450525030000000645052500c000000080000000a000000040000000c000000000000000600000004000000"
+        "080000000b0000000400000000000000",
+}
+REAL_PRESENCE_SINCE_US = 0xCD_728C_055D
+# Requests as the game DLL sent them to this service under Wine (PRP_DEBUG=1 log).
+GAME_DISPLAY_AREA_REQUEST = bytes.fromhex(
+    "5450525020000000745052500c00000002000000050000000400000008000000010000000400000000000000")
+GAME_PRESENCE_SUBSCRIBE_REQUEST = bytes.fromhex(
+    "545052502c000000785052500c00000004000000090000000400000008000000050000000400000008000000"
+    "0b0000000400000000000000")
 REAL_SUBSCRIPTION_INFO = bytes.fromhex("080000000000")
 REAL_TIMESYNC_INFO = bytes.fromhex("000000000000")
 CLIENT_PID = 0x1234
@@ -110,6 +191,99 @@ class RealServiceVectorTests(unittest.TestCase):
     def test_handshake_info_without_urls(self):
         self.assertEqual(encode_handshake_info(HandshakeInfo(8, "", "")), REAL_SUBSCRIPTION_INFO)
         self.assertEqual(encode_handshake_info(HandshakeInfo(0, "", "")), REAL_TIMESYNC_INFO)
+
+
+def real_display_area() -> DisplayArea:
+    floats = struct.unpack_from("<9f", REAL_DISPLAY_AREA_RESPONSE, 48)
+    return DisplayArea(floats[0:3], floats[3:6], floats[6:9])
+
+
+def presence_service(present: bool) -> PrpService:
+    hub = HeadPoseHub()
+    hub.publish(HeadPoseSample(REAL_PRESENCE_SINCE_US, present, (0.0,) * 3, (0.0,) * 3))
+    return PrpService(hub, "ET5-TEST", clock=lambda: FIXED_CLOCK_US)
+
+
+class PropertyVectorTests(unittest.TestCase):
+    """Property replies of the service against the real service's bytes (live, Windows)."""
+
+    def setUp(self):
+        self.service = PrpService(HeadPoseHub(), "ET5-TEST", display_area=real_display_area(),
+                                  display_id=REAL_DISPLAY_ID)
+
+    def reply(self, tag, property_id):
+        return encode_property_response(self.service.answer_property(tag, property_id))
+
+    def test_requests_match_the_game_dll(self):
+        self.assertEqual(encode_property_request(2, PROPERTY_DISPLAY_AREA),
+                         GAME_DISPLAY_AREA_REQUEST)
+        self.assertEqual(encode_property_subscribe_request(4, 0xB),
+                         GAME_PRESENCE_SUBSCRIBE_REQUEST)
+
+    def test_display_area_and_id(self):
+        self.assertEqual(self.reply(2, PROPERTY_DISPLAY_AREA), REAL_DISPLAY_AREA_RESPONSE)
+        self.assertEqual(self.reply(3, PROPERTY_DISPLAY_ID), REAL_DISPLAY_ID_RESPONSE)
+        area = decode_display_area(decode_property_response(REAL_DISPLAY_AREA_RESPONSE))
+        self.assertAlmostEqual(area[3] - area[0], 597.0, places=3)
+        self.assertEqual(decode_string_value(decode_property_response(REAL_DISPLAY_ID_RESPONSE)),
+                         REAL_DISPLAY_ID)
+
+    def test_model_name_differs_only_in_padding(self):
+        reply = self.reply(9, 8)
+        self.assertEqual(len(reply), len(REAL_MODEL_RESPONSE))
+        self.assertEqual(reply[:-6], REAL_MODEL_RESPONSE[:-6])
+        self.assertEqual(decode_string_value(decode_property_response(reply)),
+                         decode_string_value(decode_property_response(REAL_MODEL_RESPONSE)))
+
+    def test_property_4(self):
+        self.assertEqual(self.reply(4, 4), REAL_PROPERTY_4_RESPONSE)
+
+    def test_refusals(self):
+        for (tag, property_id), expected in REAL_PROPERTY_REFUSALS.items():
+            with self.subTest(property_id=property_id):
+                self.assertEqual(self.reply(tag, property_id), bytes.fromhex(expected))
+
+    def test_unconfigured_display_is_refused(self):
+        service = PrpService(HeadPoseHub(), "ET5-TEST")
+        for property_id in (PROPERTY_DISPLAY_AREA, PROPERTY_DISPLAY_ID):
+            with self.subTest(property_id=property_id):
+                self.assertEqual(service.answer_property(5, property_id),
+                                 property_error(5, property_id))
+
+    def test_subscribe_responses(self):
+        service = presence_service(False)
+        service.display_area = real_display_area()
+        for (tag, property_id), expected in REAL_SUBSCRIBE_RESPONSES.items():
+            with self.subTest(property_id=property_id):
+                response = service.answer_property(tag, property_id, subscribe=True)
+                self.assertEqual(encode_property_subscribe_response(response),
+                                 bytes.fromhex(expected))
+
+    def test_presence_follows_sample_validity(self):
+        for present, wire in ((False, 2), (True, 3)):
+            with self.subTest(present=present):
+                response = presence_service(present).answer_property(1, 0xB, subscribe=True)
+                self.assertEqual(struct.unpack("<IIII", response.block),
+                                 (0x10, REAL_PRESENCE_SINCE_US >> 32,
+                                  REAL_PRESENCE_SINCE_US & 0xFFFFFFFF, wire))
+
+    def test_presence_time_is_the_last_change(self):
+        hub = HeadPoseHub()
+        for timestamp, valid in ((10, False), (20, False), (30, True), (40, True)):
+            hub.publish(HeadPoseSample(timestamp, valid, (0.0,) * 3, (0.0,) * 3))
+        self.assertEqual((hub.present, hub.presence_since_us), (True, 30))
+
+    def test_unsubscribe_responses(self):
+        for (tag, property_id), expected in REAL_UNSUBSCRIBE_RESPONSES.items():
+            with self.subTest(property_id=property_id):
+                self.assertEqual(encode_command_response(CommandResponse(
+                    tag, COMMAND_PROPERTY_UNSUBSCRIBE, 0, property_id)), bytes.fromhex(expected))
+
+    def test_display_area_option(self):
+        area = parse_display_area("-296.62,326.0,111.8,300.38,326.0,111.8,-296.62,10.27,-3.1")
+        self.assertEqual(area.top_right, (300.38, 326.0, 111.8))
+        with self.assertRaises(ValueError):
+            parse_display_area("1,2,3")
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -271,6 +445,42 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(packet, error_response(9, 2, 2))
         payload = decode_envelope(packet)
         self.assertEqual(struct.unpack_from("<IIIIIiI", payload), (12, 9, 10, 4, 12, 2, 2))
+
+    async def test_property_get_and_subscribe_keep_the_session(self):
+        self.service.display_area = real_display_area()
+        command, subscription, _, tags, _, _ = await self.session()
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_request(tag, PROPERTY_DISPLAY_AREA))
+        response = decode_property_response(await command.packet())
+        self.assertEqual((response.tag, response.status, response.property_id),
+                         (tag, 0, PROPERTY_DISPLAY_AREA))
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_request(tag, PROPERTY_DISPLAY_ID))
+        response = decode_property_response(await command.packet())
+        self.assertEqual((response.tag, response.status), (tag, 2))
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_subscribe_request(tag, 0xB))
+        response = decode_property_subscribe_response(await command.packet())
+        self.assertEqual((response.tag, response.status, response.property_id), (tag, 0, 0xB))
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_subscribe_request(tag, 0xB,
+                                                              COMMAND_PROPERTY_UNSUBSCRIBE))
+        response = decode_command_response(await command.packet())
+        self.assertEqual((response.tag, response.command, response.status, response.value),
+                         (tag, COMMAND_PROPERTY_UNSUBSCRIBE, 0, 0xB))
+        tag = tags.next_command_tag()
+        command.send_packet(encode_stream_request(tag, COMMAND_STREAM_START, HEAD_POSE))
+        self.assertEqual(decode_command_response(await command.packet()).status, 0)
+        self.hub.publish(HeadPoseSample(FIXED_CLOCK_US, True, (0.0,) * 3, (0.0,) * 3))
+        self.assertTrue(await subscription.packet())
+
+    async def test_unsupported_property_subscribe_carries_a_value_block(self):
+        command, _, _, tags, _, _ = await self.session()
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_subscribe_request(tag, 5))
+        response = decode_property_subscribe_response(await command.packet())
+        self.assertEqual((response.tag, response.status, response.property_id), (tag, 2, 5))
+        self.assertEqual(response.block, struct.pack("<II", 8, 0))
 
     async def test_pid_mismatch_closes_connection(self):
         command = await self.channel("ET5-TEST", client_pid=CLIENT_PID)

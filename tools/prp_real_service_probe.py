@@ -3,7 +3,8 @@
 
 Performs the client side of the named-pipe handshake on the command and
 subscription channels as the game DLL does (docs/service-transport.md), sends
-connect, optional timesync rounds, stream start for head pose (PRP stream 2),
+connect, optional timesync rounds, optional property gets (operation 5, read
+only, as the game integration layer sends them), stream start for head pose (PRP stream 2),
 records every pipe message with local QueryPerformanceCounter time, then sends
 stream stop and closes. It never sends calibration, settings or firmware
 commands. Output is JSONL on stdout.
@@ -28,10 +29,13 @@ from tobii_linux.prp import ProtocolError, decode_envelope, decode_head_body  # 
 from tobii_linux.prp_session import (  # noqa: E402
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
     COMMAND_TIMESYNC, SERVER_PIPE_PREFIX, SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL,
-    ClientHello, ClientSession, ConnectRequest, check_handshake_ack, client_pipe_name,
-    decode_command_response, decode_handshake_info, encode_client_hello, encode_client_pid,
-    encode_connect_request, encode_stream_request, encode_timesync_request, pipe_chunks,
-    split_packets)
+    COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, PROPERTY_DISPLAY_AREA,
+    STRING_PROPERTIES, ClientHello, ClientSession, ConnectRequest,
+    check_handshake_ack, client_pipe_name, decode_command_response, decode_display_area,
+    decode_handshake_info, decode_property_response, decode_string_value, encode_client_hello,
+    encode_client_pid, encode_connect_request, encode_property_request,
+    encode_property_subscribe_request, encode_stream_request, encode_timesync_request,
+    pipe_chunks, split_packets)
 
 PIPE_ROOT = "\\\\.\\pipe\\"
 GENERIC_WRITE = 0x40000000
@@ -294,6 +298,65 @@ class PacketReader:
             emit("unexpected_response", label=self.channel.label, tag=response.tag)
         raise PipeError(f"no response with tag {tag} on {self.channel.label}")
 
+    def property_response(self, tag, timeout_s):
+        for _, packet in self.packets(timeout_s):
+            try:
+                response = decode_property_response(packet)
+            except ProtocolError as exc:
+                emit("unparsed_packet", label=self.channel.label, error=str(exc), hex=packet.hex())
+                continue
+            if response.tag == tag:
+                return packet, response
+            emit("unexpected_response", label=self.channel.label, tag=response.tag)
+        raise PipeError(f"no property response with tag {tag} on {self.channel.label}")
+
+
+    def tagged_packet(self, tag, timeout_s):
+        for _, packet in self.packets(timeout_s):
+            words = struct.unpack_from("<3I", decode_envelope(packet))
+            if words[1] == tag:
+                return packet
+            emit("unexpected_packet", label=self.channel.label, hex=packet.hex())
+        raise PipeError(f"no packet with tag {tag} on {self.channel.label}")
+
+
+def subscribe_properties(command, commands, session, property_ids, subscribe_command):
+    """Command 5 (subscribe) or 6 (unsubscribe) per property; records the raw replies."""
+    for property_id in property_ids:
+        tag = session.next_command_tag()
+        command.send_packet(encode_property_subscribe_request(tag, property_id,
+                                                              subscribe_command))
+        packet = commands.tagged_packet(tag, 5.0)
+        payload = decode_envelope(packet)
+        emit("property_subscription_response", command=subscribe_command,
+             property_id=property_id, operation=struct.unpack_from("<I", payload, 8)[0],
+             status=struct.unpack_from("<i", payload, 20)[0], hex=packet.hex())
+
+
+def property_value(response):
+    if response.status != 0:
+        return None
+    if response.property_id == PROPERTY_DISPLAY_AREA:
+        return list(decode_display_area(response))
+    if response.property_id in STRING_PROPERTIES:
+        return decode_string_value(response)
+    return None
+
+
+def read_properties(command, commands, session, property_ids):
+    for property_id in property_ids:
+        tag = session.next_command_tag()
+        command.send_packet(encode_property_request(tag, property_id))
+        packet, response = commands.property_response(tag, 5.0)
+        emit("property_response", property_id=property_id, status=response.status,
+             returned_property=response.property_id, value=property_value(response),
+             block=response.block.hex(), region=response.region.hex(), hex=packet.hex())
+
+
+def notifications(reader, seconds):
+    for received_at, packet in reader.packets(seconds):
+        emit("subscription_packet", client_received_us=received_at, **stream_package(packet))
+
 
 def stream_package(packet):
     """Parse operation 1 head-pose packages; other operations are reported raw."""
@@ -372,6 +435,15 @@ def worker(args):
             raise RuntimeError(f"connect status {connect.status}")
         if COMMAND_TIMESYNC in connect.connect.supported_commands:
             timesync(state, session, 4)
+        if args.property:
+            read_properties(command, commands, session, args.property)
+            notifications(packages, 0.5)
+        if args.subscribe_property:
+            subscribe_properties(command, commands, session, args.subscribe_property,
+                                 COMMAND_PROPERTY_SUBSCRIBE)
+            notifications(packages, 1.0)
+            subscribe_properties(command, commands, session, args.subscribe_property,
+                                 COMMAND_PROPERTY_UNSUBSCRIBE)
         tag = session.next_command_tag()
         command.send_packet(encode_stream_request(tag, COMMAND_STREAM_START, HEAD_POSE_STREAM))
         start = commands.response(tag, 5.0)
@@ -402,6 +474,11 @@ def main():
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--field-of-use", type=int, choices=(1, 2), default=2,
                         help="connect request field_of_use; 2 matches recorded use")
+    parser.add_argument("--property", type=lambda text: int(text, 0), action="append",
+                        default=[], help="property id to read with operation 5 (repeatable)")
+    parser.add_argument("--subscribe-property", type=lambda text: int(text, 0), action="append",
+                        default=[], help="property id to subscribe with command 5 and "
+                                         "unsubscribe with command 6 afterwards (repeatable)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not 0 < args.seconds <= 30:
@@ -414,6 +491,8 @@ def main():
             return 1
     command = [sys.executable, str(Path(__file__).resolve()), "--worker",
                "--seconds", str(args.seconds), "--field-of-use", str(args.field_of_use)]
+    command += [f"--property={property_id}" for property_id in args.property]
+    command += [f"--subscribe-property={property_id}" for property_id in args.subscribe_property]
     try:
         return subprocess.run(command, timeout=args.seconds + 30).returncode
     except subprocess.TimeoutExpired:

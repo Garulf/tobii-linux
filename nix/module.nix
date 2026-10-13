@@ -9,6 +9,8 @@ let
     "--wine-clock" cfg.headPoseService.wineClock
     "--port" (toString cfg.headPoseService.port)
     "--name" cfg.headPoseService.deviceName
+  ] ++ lib.optionals (cfg.headPoseService.displayId != null) [
+    "--display-id" cfg.headPoseService.displayId
   ];
 in {
   options.hardware.tobii-eye-tracker-5 = {
@@ -37,6 +39,15 @@ in {
         type = lib.types.port;
         default = 7760;
         description = "Loopback TCP port the bridge in the Wine prefix connects to.";
+      };
+      displayId = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Monitor device instance id as seen inside the game's Wine prefix.
+          Only needed when the game tracks a window rather than the tracker
+          itself; see docs/game-integration-layer.md.
+        '';
       };
       deviceName = lib.mkOption {
         type = lib.types.str;

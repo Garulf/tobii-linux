@@ -35,7 +35,9 @@ Evidence labels:
 | Discovery of `TOBIIPRP-*` under stock Wine | fails; the client falls back to the bare pipe name | live (Wine) |
 | Discovery with the pipe-listing patch ([wine-pipe-enumeration.md](wine-pipe-enumeration.md)), both client DLLs, `PRP_URL=discover` | finds `tobii-prp://ET5-LINUX`, connects and receives about 100 samples per 3 s run | live (Wine master + patch) |
 | Real tracker through `cli serve`, patched Wine 11.0, discovery, both client DLLs | 361 samples per 10 s client run, timestamp lag median 11 ms; samples invalid (no face in view) | live (Wine 11.0 + patch) |
-| Game integration layer (`GetApi`, `TrackTracker` and its display-area query) | not exercised | |
+| Game integration layer through its C exports ([game-integration-layer.md](game-integration-layer.md)): scan, `TrackTracker`, `GetHeadPoses` | works, 330 head poses per 10 s run (every package), two runs per bridge session; `TrackRectangle` works only with `--display-id` | live (Wine 11.0 + patch) |
+| Same client against the real service | tracker found and connected; no head poses because nobody was in front of the tracker | live (Windows) |
+| Property replies (display area, display id, model, properties 2 and 4, user presence subscribe, refusals, unsubscribe) | byte-identical to the real service except one uninitialised padding byte in the model string | live (Windows), unit |
 
 ## Architecture
 
@@ -130,6 +132,7 @@ pipe as a `tobii-ttp://` device.
 | stream stop without start | status 5 (`NOT_SUBSCRIBED`) | guess |
 | stream start/stop for another stream | status 2 (`NOT_SUPPORTED`) | guess |
 | timesync (on any channel) | status 0, service clock in microseconds | real service |
+| property get (operation 5), property subscribe and unsubscribe (commands 5 and 6) | see [game-integration-layer.md](game-integration-layer.md#service-behaviour) | real service |
 | any other command | status 2 with a 16-byte zero body block | guess; the body size satisfies the client decoder's fixed-size branches (0x180055780, static) |
 
 Stream packages: operation 1, message tag 0, stream 2, one 52-byte head body,
@@ -175,8 +178,9 @@ bridge and test client under Wine 11.0 with the pipe-listing patch,
 | `tobii_stream_engine.dll` | `tobii-prp://ET5-LINUX` | 361 | 8.6 to 17.4 ms, median 11.4 ms |
 
 All samples were invalid because no face was in view. The pipeline took
-3.8 ms per frame on the reference host's CPU (replay of 150 recorded frames,
-95th percentile 4.3 ms). Logs: `evidence/private/e2e/`.
+3.8 ms per frame on the reference host's CPU in that run (replay of 150
+recorded frames, 95th percentile 4.3 ms); with the landmark smoothing added
+since, 9.6 ms (95th percentile 10.6 ms). Logs: `evidence/private/e2e/`.
 
 ### Connect response fields
 
@@ -207,14 +211,22 @@ Build (Linux, mingw-w64):
 make -C tools/prp_bridge
 ```
 
-This produces `prp_bridge.exe` and `prp_test_client.exe`, both static and
-dependency-free.
+This produces `prp_bridge.exe`, `prp_test_client.exe` and `tgi_test_client.exe`,
+all static and dependency-free. `tgi_test_client.exe <game dll> [first|window|rectangle|displays|<url>] [seconds]`
+drives the game integration layer through its C exports and prints the trackers
+it found and every head pose.
 
 Service on Linux, synthetic samples:
 
 ```sh
-PYTHONPATH=src python3 -m tobii_linux.prp_service --synthetic [--name ET5-LINUX] [--port 7760] [--debug]
+PYTHONPATH=src python3 -m tobii_linux.prp_service --synthetic [--name ET5-LINUX] [--port 7760] [--debug] \
+    [--display-area tlx,tly,tlz,trx,try,trz,blx,bly,blz] [--display-id 'DISPLAY\...']
 ```
+
+`--display-area` (mm) and `--display-id` answer the game integration layer's
+display queries; without them those two properties are refused, which is enough
+for `TrackTracker` but not for `TrackWindow` or `TrackRectangle`
+([game-integration-layer.md](game-integration-layer.md)).
 
 Without `--synthetic` the service publishes nothing. A driver feeds it through
 the API:
@@ -254,7 +266,9 @@ call at `0x1800089ae`. All of these returned success in the live runs.
 
 `tools/prp_bridge/run_wine_test.sh <dll> [seconds] [outdir]` starts the
 service, the bridge and the client and prints the three logs. `PRP_RUNS=n`
-repeats the client, `PRP_DEBUG=1` logs every relayed message.
+repeats the client, `PRP_DEBUG=1` logs every relayed message,
+`PRP_CLIENT=tgi` runs `tgi_test_client.exe` (mode from `PRP_TGI_MODE`) and
+`PRP_SERVICE_ARGS` adds service options such as `--display-area`.
 
 ## Real-service comparison
 
@@ -408,11 +422,12 @@ stream start/stop and timesync responses and the handshake information.
   `\\.\pipe\*` listing, which fails under stock Wine (live). The pipe-listing
   patch fixes this (live, both client DLLs); the game's Wine runner has to
   carry it.
-- **Game integration layer**: only the embedded Stream Engine was driven.
-  The layer above it (`GetApi`, `TrackTracker`, 0x180008a50) also reads the
-  display area with a property get (0x1800147d0), which this service answers
-  with `NOT_SUPPORTED`. Whether the game still tracks after that failure is
-  untested; the real service's property replies were not captured.
+- **Game integration layer**: delivers head pose under Wine with the pipe-listing
+  patch ([game-integration-layer.md](game-integration-layer.md)). Open: whether
+  Star Citizen tracks its window (then the service needs `--display-id` equal to
+  the monitor instance id in the game's prefix), `TrackWindow` itself (no Wine
+  build with a display driver was available), property notifications, and
+  passing the display options through `tobii_linux.cli serve`.
 - **Licensed connect**: the game may use `tobii_device_create_ex` with license
   keys (0x180008820). The service returns one result 0 per license, which
   satisfies device_create statically, but this was not run.

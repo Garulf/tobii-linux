@@ -169,8 +169,9 @@ command and subscription channels.
    supported. For PRP devices `0x18002c6d0` searches the connect response's
    `streams` list. Stream Engine stream 4 (head pose) maps to PRP stream 2,
    stream 0 to 3 and stream 12 to 29 (`0x18002c5d0`). Next it reads the display
-   area through a property get (`0x1800147d0`, not reconstructed; a failure is
-   logged and the tracker is still reported) and the device info.
+   area and display id through property gets (`0x1800147d0`, `0x1800154a0`; a
+   failure is logged and the tracker is still reported) and the device info, see
+   [game-integration-layer.md](game-integration-layer.md).
 4. **stream start** (command 3, stream 2) from `tobii_head_pose_subscribe`
    (`0x18000fd80`, then `0x180028560`, `0x18002d270`, `0x1800189f0`). A status of
    3 (connection failed) is tolerated: the subscription is remembered and redone
@@ -371,7 +372,7 @@ oracle-derived vectors plus round-trip and malformed-input tests.
 | --- | --- |
 | `evidence/private/d-transport-assembly.txt` | objdump of the transport constructor, client pipe open, service handshake, discovery order, stream map, timesync and stop requests |
 | `evidence/private/d-transport-import-callers.txt`, `d-game-iat.txt` | socket and pipe import call sites and the IAT map |
-| `evidence/private/d-batch1-focused.c` ... `d-batch6-focused.c` | Ghidra 12.1.4 `-noanalysis` focused decompilation, with logs; project in `evidence/private/ghidra-agent-d-dlls/` |
+| `evidence/private/d-batch1-focused.c` ... `d-batch6-focused.c` | Ghidra 12.1.4 `-noanalysis` focused decompilation, with logs; project in `evidence/private/ghidra-copy-d-dlls/` |
 | `evidence/private/d-wine-source-notes.txt` | Wine source excerpts with commit |
 | `evidence/private/prp-session-oracle.json` | emulation results |
 
@@ -389,9 +390,9 @@ machine, game integration enumeration.
 - The real service's handshake timing, its subscription and timesync URL
   naming, its serializer version and its values for the unnamed connect-response
   fields are unknown. Only the DLL's built-in service code was read.
-- Property get and notifications (display area, device info and others) were
-  not reconstructed. The game integration layer requests the display area during
-  enumeration (`0x1800147d0`).
+- Property get, subscribe and unsubscribe are described in
+  [game-integration-layer.md](game-integration-layer.md); property notifications
+  (operation 2) are still not captured.
 - The game's later tracking connection after enumeration, and its call pattern
   for `tobii_update_timesync` and `tobii_device_process_callbacks`, were not
   traced.

@@ -9,6 +9,9 @@
 # n times against the same service and bridge; PRP_URL=discover uses the DLL's own
 # pipe discovery instead of the explicit URL; PRP_EXTERNAL_SERVICE=1 uses a service
 # that is already listening (for example `tobii_linux.cli serve`).
+# PRP_CLIENT=tgi runs tgi_test_client.exe (game integration layer of the game DLL)
+# instead, with PRP_TGI_MODE first (default), window or a tracker URL.
+# PRP_SERVICE_ARGS adds options to the synthetic service command line.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 dll=${1:?stream engine dll path}
@@ -23,7 +26,8 @@ mkdir -p "$out"
 service=
 if [ -z "${PRP_EXTERNAL_SERVICE:-}" ]; then
     (cd "$out" && PYTHONPATH=$src exec python3 -m tobii_linux.prp_service --synthetic \
-        --port "$port" --name "$name" ${PRP_DEBUG:+--debug}) > "$out/service.log" 2>&1 &
+        --port "$port" --name "$name" ${PRP_DEBUG:+--debug} ${PRP_SERVICE_ARGS:-}) \
+        > "$out/service.log" 2>&1 &
     service=$!
 fi
 bridge=
@@ -41,8 +45,13 @@ sleep 1
 : > "$out/client.txt"
 for run in $(seq "${PRP_RUNS:-1}"); do
     echo "client run $run" >> "$out/client.txt"
-    timeout $((seconds + 60)) wine "$here/prp_test_client.exe" "$(winepath -w "$dll")" \
-        "${PRP_URL:-tobii-prp://$name}" "$seconds" 1 >> "$out/client.txt" 2>&1
+    if [ "${PRP_CLIENT:-}" = tgi ]; then
+        timeout $((seconds + 60)) wine "$here/tgi_test_client.exe" "$(winepath -w "$dll")" \
+            "${PRP_TGI_MODE:-first}" "$seconds" >> "$out/client.txt" 2>&1
+    else
+        timeout $((seconds + 60)) wine "$here/prp_test_client.exe" "$(winepath -w "$dll")" \
+            "${PRP_URL:-tobii-prp://$name}" "$seconds" 1 >> "$out/client.txt" 2>&1
+    fi
     echo "client exit $?" >> "$out/client.txt"
 done
 sleep 0.5

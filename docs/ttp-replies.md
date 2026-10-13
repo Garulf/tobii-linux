@@ -246,7 +246,7 @@ synthetic vectors derived from the instructions.
 ```sh
 PYTHONPATH=.local/python:.local/inference:src:tools python3 tools/ttp_reply_oracle.py
 PYTHONPATH=.local/python:.local/inference:src:tools python3 tools/ttp_reply_oracle.py --quick  # schema scan 0..0x8ff
-GHIDRA_PROJECT_DIR=$PWD/evidence/private/ghidra-agent-a tools/ghidra/focused.sh a-fields 0x1402cc1c0 0x1402c3c50
+GHIDRA_PROJECT_DIR=$PWD/evidence/private/ghidra-copy-a tools/ghidra/focused.sh a-fields 0x1402cc1c0 0x1402c3c50
 PYTHONPATH=.local/inference:src python3 -m unittest tests.test_ttp_fields tests.test_camera_info
 ```
 
