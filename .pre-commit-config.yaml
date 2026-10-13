@@ -15,6 +15,11 @@ repos:
       - id: check-toml
       - id: check-yaml
       - id: check-json
+  - repo: https://github.com/Garulf/readwright
+    rev: v0.5.0
+    hooks:
+      - id: readwright-check
+        stages: [pre-push]
   - repo: local
     hooks:
       - id: unittest
