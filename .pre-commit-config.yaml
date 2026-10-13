@@ -8,7 +8,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: \.patch$
       - id: end-of-file-fixer
+        exclude: \.patch$
       - id: check-added-large-files
         args: [--maxkb=5000]
       - id: check-merge-conflict

@@ -1,0 +1,729 @@
+From 093086194da25e3c5dda5ade36777430dc10e0c6 Mon Sep 17 00:00:00 2001
+From: Garulf <535299+Garulf@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:55:18 -0400
+Subject: [PATCH] ntdll: Implement NtQueryDirectoryFile() on the named pipe
+ root directory.
+
+Add a get_named_pipe_entries server request that walks the pipe names
+of the named pipe device. The search expression and the scan position
+are kept with the directory file object, so FindFirstFile("\\.\pipe\*")
+and FindNextFile() list the existing pipes.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=55485
+---
+ dlls/ntdll/tests/pipe.c        | 165 +++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/file.c         | 135 +++++++++++++++++++++++++++
+ include/wine/server_protocol.h |  31 ++++++-
+ server/named_pipe.c            |  91 ++++++++++++++++++
+ server/protocol.def            |  21 +++++
+ server/request_handlers.h      |   9 ++
+ server/request_trace.h         |  20 ++++
+ server/trace.c                 |  27 ++++++
+ 8 files changed, 498 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/tests/pipe.c b/dlls/ntdll/tests/pipe.c
+index 8a2c8e55..6ab7778b 100644
+--- a/dlls/ntdll/tests/pipe.c
++++ b/dlls/ntdll/tests/pipe.c
+@@ -3002,6 +3002,170 @@ static void subtest_pipe_name(const struct pipe_name_test *pnt)
+     NtClose(pipe);
+ }
+ 
++static void check_pipe_dir_entries( const void *buffer, ULONG size, FILE_INFORMATION_CLASS class,
++                                    const WCHAR **names, BOOL *found, unsigned int count )
++{
++    const FILE_DIRECTORY_INFORMATION *dir_info;
++    const WCHAR *name;
++    ULONG name_len, offset = 0;
++    unsigned int i;
++
++    for (;;)
++    {
++        dir_info = (const FILE_DIRECTORY_INFORMATION *)((const char *)buffer + offset);
++        ok( offset < size, "entry offset %lu out of %lu\n", offset, size );
++        if (offset >= size) break;
++
++        if (class == FileBothDirectoryInformation)
++        {
++            const FILE_BOTH_DIRECTORY_INFORMATION *both = (const void *)dir_info;
++            name = both->FileName;
++            name_len = both->FileNameLength;
++            ok( !both->ShortNameLength, "got short name length %u\n", both->ShortNameLength );
++        }
++        else if (class == FileFullDirectoryInformation)
++        {
++            const FILE_FULL_DIRECTORY_INFORMATION *full = (const void *)dir_info;
++            name = full->FileName;
++            name_len = full->FileNameLength;
++        }
++        else
++        {
++            name = dir_info->FileName;
++            name_len = dir_info->FileNameLength;
++        }
++
++        for (i = 0; i < count; i++)
++        {
++            if (name_len != wcslen( names[i] ) * sizeof(WCHAR) ||
++                wcsnicmp( name, names[i], name_len / sizeof(WCHAR) )) continue;
++            ok( !found[i], "%s listed twice\n", debugstr_w(names[i]) );
++            found[i] = TRUE;
++            ok( dir_info->EndOfFile.QuadPart == i + 1, "%s: got EndOfFile %s\n",
++                debugstr_w(names[i]), wine_dbgstr_longlong( dir_info->EndOfFile.QuadPart ) );
++            ok( dir_info->AllocationSize.QuadPart == 3, "%s: got AllocationSize %s\n",
++                debugstr_w(names[i]), wine_dbgstr_longlong( dir_info->AllocationSize.QuadPart ) );
++            break;
++        }
++        ok( i < count, "unexpected entry %s\n", debugstr_wn(name, name_len / sizeof(WCHAR)) );
++
++        if (!dir_info->NextEntryOffset) break;
++        offset += dir_info->NextEntryOffset;
++    }
++}
++
++static void test_pipe_directory(void)
++{
++    static const FILE_INFORMATION_CLASS classes[] =
++    {
++        FileDirectoryInformation, FileBothDirectoryInformation, FileFullDirectoryInformation
++    };
++    WCHAR pipe_names[2][64], path[MAX_PATH], mask_str[64];
++    const WCHAR *names[2] = { pipe_names[0], pipe_names[1] };
++    HANDLE pipes[3], dir, find;
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING name, mask;
++    IO_STATUS_BLOCK io;
++    WIN32_FIND_DATAW data;
++    BOOL found[2];
++    ULONG_PTR info_len;
++    char buffer[4096];
++    unsigned int i, j;
++    NTSTATUS status;
++
++    swprintf( mask_str, ARRAY_SIZE(mask_str), L"wine_test_pipe_dir_%lx_*", GetCurrentProcessId() );
++    for (i = 0; i < 2; i++)
++        swprintf( pipe_names[i], ARRAY_SIZE(pipe_names[i]), L"wine_test_pipe_dir_%lx_%u",
++                  GetCurrentProcessId(), i );
++
++    swprintf( path, ARRAY_SIZE(path), L"\\\\.\\pipe\\%s", pipe_names[0] );
++    pipes[0] = CreateNamedPipeW( path, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 3, 1024, 1024, 0, NULL );
++    ok( pipes[0] != INVALID_HANDLE_VALUE, "CreateNamedPipe failed, error %lu\n", GetLastError() );
++    swprintf( path, ARRAY_SIZE(path), L"\\\\.\\pipe\\%s", pipe_names[1] );
++    for (i = 1; i < 3; i++)
++    {
++        pipes[i] = CreateNamedPipeW( path, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 3, 1024, 1024, 0, NULL );
++        ok( pipes[i] != INVALID_HANDLE_VALUE, "CreateNamedPipe failed, error %lu\n", GetLastError() );
++    }
++
++    pRtlInitUnicodeString( &name, L"\\Device\\NamedPipe\\" );
++    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
++    status = NtOpenFile( &dir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
++    ok( !status, "NtOpenFile failed: %#lx\n", status );
++
++    pRtlInitUnicodeString( &mask, mask_str );
++    for (i = 0; i < ARRAY_SIZE(classes); i++)
++    {
++        winetest_push_context( "class %u", classes[i] );
++        memset( found, 0, sizeof(found) );
++        memset( &io, 0xcc, sizeof(io) );
++        status = NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buffer, sizeof(buffer), classes[i],
++                                       FALSE, &mask, TRUE );
++        ok( !status, "got %#lx\n", status );
++        ok( io.Status == status, "got io status %#lx\n", io.Status );
++        if (!status) check_pipe_dir_entries( buffer, io.Information, classes[i], names, found, 2 );
++        ok( found[0] && found[1], "pipes not listed: %d %d\n", found[0], found[1] );
++
++        status = NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buffer, sizeof(buffer), classes[i],
++                                       FALSE, &mask, FALSE );
++        ok( status == STATUS_NO_MORE_FILES, "got %#lx\n", status );
++        winetest_pop_context();
++    }
++
++    memset( found, 0, sizeof(found) );
++    for (j = 0; j < 2; j++)
++    {
++        status = NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buffer, sizeof(buffer),
++                                       FileDirectoryInformation, TRUE, &mask, j == 0 );
++        ok( !status, "got %#lx\n", status );
++        if (status) continue;
++        info_len = io.Information;
++        ok( info_len == offsetof( FILE_DIRECTORY_INFORMATION, FileName[wcslen( pipe_names[0] )] ),
++            "got length %Iu\n", info_len );
++        check_pipe_dir_entries( buffer, io.Information, FileDirectoryInformation, names, found, 2 );
++        ok( !((FILE_DIRECTORY_INFORMATION *)buffer)->NextEntryOffset, "got more than one entry\n" );
++    }
++    ok( found[0] && found[1], "pipes not listed: %d %d\n", found[0], found[1] );
++    status = NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buffer, sizeof(buffer),
++                                   FileDirectoryInformation, TRUE, &mask, FALSE );
++    ok( status == STATUS_NO_MORE_FILES, "got %#lx\n", status );
++    NtClose( dir );
++
++    status = NtOpenFile( &dir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
++    ok( !status, "NtOpenFile failed: %#lx\n", status );
++    pRtlInitUnicodeString( &mask, L"wine_test_pipe_dir_nonexistent" );
++    status = NtQueryDirectoryFile( dir, NULL, NULL, NULL, &io, buffer, sizeof(buffer),
++                                   FileDirectoryInformation, FALSE, &mask, TRUE );
++    ok( status == STATUS_NO_SUCH_FILE || broken( status == STATUS_NO_MORE_FILES ), "got %#lx\n", status );
++    NtClose( dir );
++
++    memset( found, 0, sizeof(found) );
++    swprintf( path, ARRAY_SIZE(path), L"\\\\.\\pipe\\%s", mask_str );
++    find = FindFirstFileW( path, &data );
++    ok( find != INVALID_HANDLE_VALUE, "FindFirstFile failed, error %lu\n", GetLastError() );
++    if (find != INVALID_HANDLE_VALUE)
++    {
++        do
++        {
++            for (i = 0; i < 2; i++)
++                if (!wcsicmp( data.cFileName, pipe_names[i] )) found[i] = TRUE;
++        } while (FindNextFileW( find, &data ));
++        ok( GetLastError() == ERROR_NO_MORE_FILES, "got error %lu\n", GetLastError() );
++        FindClose( find );
++    }
++    ok( found[0] && found[1], "pipes not found: %d %d\n", found[0], found[1] );
++
++    for (i = 0; i < 3; i++) CloseHandle( pipes[i] );
++
++    swprintf( path, ARRAY_SIZE(path), L"\\\\.\\pipe\\%s", mask_str );
++    find = FindFirstFileW( path, &data );
++    ok( find == INVALID_HANDLE_VALUE, "pipes still listed\n" );
++    ok( GetLastError() == ERROR_FILE_NOT_FOUND, "got error %lu\n", GetLastError() );
++    if (find != INVALID_HANDLE_VALUE) FindClose( find );
++}
++
+ static void test_pipe_names(void)
+ {
+     static const struct pipe_name_test tests[] = {
+@@ -3215,6 +3379,7 @@ START_TEST(pipe)
+     test_security_info();
+     test_empty_name();
+     test_pipe_names();
++    test_pipe_directory();
+     test_async_cancel_on_handle_close();
+ 
+     pipe_for_each_state(create_pipe_server, connect_pipe, test_pipe_state);
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 1bfec7a4..3914a116 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2876,6 +2876,133 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
+ }
+ 
+ 
++/***********************************************************************
++ *           put_named_pipe_entry
++ *
++ * Store a named pipe entry in the directory query buffer.
++ */
++static NTSTATUS put_named_pipe_entry( const struct named_pipe_entry *entry, void *info_ptr,
++                                      IO_STATUS_BLOCK *io, ULONG max_length, FILE_INFORMATION_CLASS class,
++                                      union file_directory_info **last_info )
++{
++    union file_directory_info *info;
++    ULONG name_len = entry->name_len, start, dir_size;
++
++    start = dir_info_align( io->Information );
++    dir_size = dir_info_size( class, 0 );
++    if (start + dir_size > max_length) return STATUS_MORE_ENTRIES;
++
++    max_length -= start + dir_size;
++    /* if this is not the first entry, fail; the first entry is always returned (but truncated) */
++    if (*last_info && name_len > max_length) return STATUS_MORE_ENTRIES;
++
++    info = (union file_directory_info *)((char *)info_ptr + start);
++    memset( info, 0, dir_size );
++
++    if (class == FileNamesInformation)
++        info->names.FileNameLength = name_len;
++    else
++    {
++        /* all the other structures start with a FileDirectoryInformation layout */
++        info->dir.EndOfFile.QuadPart = entry->instances;
++        info->dir.AllocationSize.QuadPart = (LONG)entry->max_instances;
++        info->dir.FileAttributes = FILE_ATTRIBUTE_NORMAL;
++        info->dir.FileNameLength = name_len;
++    }
++
++    memcpy( (char *)info + dir_size, entry + 1, min( name_len, max_length ) );
++    io->Information = start + dir_size + min( name_len, max_length );
++    if (*last_info) (*last_info)->next = (char *)info - (char *)*last_info;
++    *last_info = info;
++    return name_len > max_length ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
++ *           query_named_pipe_directory
++ *
++ * List the pipes of the named pipe root directory; helper for NtQueryDirectoryFile.
++ */
++static NTSTATUS query_named_pipe_directory( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
++                                            ULONG length, FILE_INFORMATION_CLASS class,
++                                            BOOLEAN single_entry, const UNICODE_STRING *mask,
++                                            BOOLEAN restart_scan )
++{
++    static const data_size_t reply_size = 0x10000 + 0x2000;
++    union file_directory_info *last_info = NULL;
++    unsigned int status, skip = 0;
++    BOOL first = FALSE, done = FALSE, started = FALSE;
++    NTSTATUS ret = STATUS_SUCCESS;
++    char *data;
++
++    if (!(data = malloc( reply_size ))) return STATUS_NO_MEMORY;
++
++    for (;;)
++    {
++        data_size_t size = 0, pos = 0, entries_len = 0;
++        UNICODE_STRING captured;
++
++        SERVER_START_REQ( get_named_pipe_entries )
++        {
++            req->handle  = wine_server_obj_handle( handle );
++            req->restart = restart_scan;
++            req->skip    = skip;
++            if (!started && mask) wine_server_add_data( req, mask->Buffer, mask->Length );
++            if (!done) wine_server_set_reply( req, data, reply_size );
++            if (!(status = wine_server_call( req )))
++            {
++                if (!started) first = reply->first;
++                entries_len = reply->entries_len;
++                size = wine_server_reply_size( reply );
++            }
++        }
++        SERVER_END_REQ;
++        if (status || done) break;
++
++        if (!started) io->Information = 0;
++        started = TRUE;
++        restart_scan = FALSE;
++        skip = 0;
++
++        if (!entries_len) break;  /* no more entries */
++
++        captured.Buffer = (WCHAR *)(data + entries_len);
++        captured.Length = captured.MaximumLength = size - entries_len;
++
++        while (!done && pos < entries_len)
++        {
++            const struct named_pipe_entry *entry = (const struct named_pipe_entry *)(data + pos);
++
++            pos += (sizeof(*entry) + entry->name_len + 3) & ~3;
++            if (captured.Length && !match_filename( (const WCHAR *)(entry + 1),
++                                             entry->name_len / sizeof(WCHAR), &captured ))
++            {
++                skip++;
++                continue;
++            }
++            ret = put_named_pipe_entry( entry, buffer, io, length, class, &last_info );
++            if (ret == STATUS_MORE_ENTRIES)
++            {
++                ret = STATUS_SUCCESS;
++                done = TRUE;
++                break;
++            }
++            skip++;
++            if (ret == STATUS_BUFFER_OVERFLOW || single_entry) done = TRUE;
++        }
++        /* the next request commits the consumed entries */
++        if (done && !skip) break;
++    }
++    free( data );
++
++    if (status && !last_info) return status;
++    if (!last_info) ret = first ? STATUS_NO_SUCH_FILE : STATUS_NO_MORE_FILES;
++    if (ret != STATUS_NO_SUCH_FILE) io->Status = ret;
++    TRACE( "=> %x (%ld)\n", ret, io->Information );
++    return ret;
++}
++
++
+ /******************************************************************************
+  *              NtQueryDirectoryFile   (NTDLL.@)
+  */
+@@ -2926,7 +3053,15 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+     if (!buffer) return STATUS_ACCESS_VIOLATION;
+ 
+     if ((status = server_get_unix_fd( handle, FILE_LIST_DIRECTORY, &fd, &needs_close, &type, NULL )))
++    {
++        if (status == STATUS_BAD_DEVICE_TYPE)
++        {
++            NTSTATUS pipe_status = query_named_pipe_directory( handle, io, buffer, length, info_class,
++                                                               single_entry, mask, restart_scan );
++            if (pipe_status != STATUS_OBJECT_TYPE_MISMATCH) return pipe_status;
++        }
+         return status;
++    }
+ 
+     if (type != FD_TYPE_DIR)
+     {
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 62a78270..b9881bab 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -898,6 +898,14 @@ struct directory_entry
+ 
+ };
+ 
++struct named_pipe_entry
++{
++    unsigned int instances;
++    unsigned int max_instances;
++    data_size_t  name_len;
++
++};
++
+ struct monitor_info
+ {
+     struct rectangle raw;
+@@ -3515,6 +3523,24 @@ struct set_named_pipe_info_reply
+ };
+ 
+ 
++struct get_named_pipe_entries_request
++{
++    struct request_header __header;
++    obj_handle_t   handle;
++    int            restart;
++    unsigned int   skip;
++    /* VARARG(mask,unicode_str); */
++};
++struct get_named_pipe_entries_reply
++{
++    struct reply_header __header;
++    int            first;
++    data_size_t    entries_len;
++    /* VARARG(entries,named_pipe_entries,entries_len); */
++    /* VARARG(mask,unicode_str); */
++};
++
++
+ struct create_window_request
+ {
+     struct request_header __header;
+@@ -6390,6 +6416,7 @@ enum request
+     REQ_set_irp_result,
+     REQ_create_named_pipe,
+     REQ_set_named_pipe_info,
++    REQ_get_named_pipe_entries,
+     REQ_create_window,
+     REQ_destroy_window,
+     REQ_get_desktop_window,
+@@ -6705,6 +6732,7 @@ union generic_request
+     struct set_irp_result_request set_irp_result_request;
+     struct create_named_pipe_request create_named_pipe_request;
+     struct set_named_pipe_info_request set_named_pipe_info_request;
++    struct get_named_pipe_entries_request get_named_pipe_entries_request;
+     struct create_window_request create_window_request;
+     struct destroy_window_request destroy_window_request;
+     struct get_desktop_window_request get_desktop_window_request;
+@@ -7018,6 +7046,7 @@ union generic_reply
+     struct set_irp_result_reply set_irp_result_reply;
+     struct create_named_pipe_reply create_named_pipe_reply;
+     struct set_named_pipe_info_reply set_named_pipe_info_reply;
++    struct get_named_pipe_entries_reply get_named_pipe_entries_reply;
+     struct create_window_reply create_window_reply;
+     struct destroy_window_reply destroy_window_reply;
+     struct get_desktop_window_reply get_desktop_window_reply;
+@@ -7186,6 +7215,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 963
++#define SERVER_PROTOCOL_VERSION 964
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/named_pipe.c b/server/named_pipe.c
+index 1e51158a..db06ed66 100644
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -100,6 +100,10 @@ struct named_pipe_device_file
+     struct object             obj;         /* object header */
+     struct fd                *fd;          /* pseudo-fd for ioctls */
+     struct named_pipe_device *device;      /* named pipe device */
++    int                       scanned;     /* root directory: whether a scan was started */
++    unsigned int              index;       /* root directory: index of the next entry */
++    WCHAR                    *mask;        /* root directory: captured search expression */
++    data_size_t               mask_len;    /* root directory: length of the search expression */
+ };
+ 
+ struct named_pipe_init_data
+@@ -516,6 +520,10 @@ static struct object *named_pipe_device_lookup_name( struct object *obj, struct
+ 
+         dir->fd = NULL;  /* defer alloc_pseudo_fd() until after we have options */
+         dir->device = (struct named_pipe_device *)grab_object( obj );
++        dir->scanned = 0;
++        dir->index = 0;
++        dir->mask = NULL;
++        dir->mask_len = 0;
+ 
+         return &dir->obj;
+     }
+@@ -661,6 +669,7 @@ static void named_pipe_dir_destroy( struct object *obj )
+     assert( obj->ops == &named_pipe_dir_ops );
+     if (file->fd) release_object( file->fd );
+     release_object( file->device );
++    free( file->mask );
+ }
+ 
+ static void pipe_end_flush( struct fd *fd, struct async *async )
+@@ -1636,3 +1645,85 @@ DECL_HANDLER(set_named_pipe_info)
+ 
+     release_object( pipe_end );
+ }
++
++DECL_HANDLER(get_named_pipe_entries)
++{
++    struct named_pipe_device_file *dir;
++    struct named_pipe_entry *entry;
++    struct object *obj;
++    data_size_t size, name_len, entry_size;
++    unsigned int i, count;
++    const WCHAR *name;
++    char *ptr;
++
++    dir = (struct named_pipe_device_file *)get_handle_obj( current->process, req->handle,
++                                                          FILE_LIST_DIRECTORY, &named_pipe_dir_ops );
++    if (!dir) return;
++
++    reply->first = !dir->scanned;
++    if (!dir->scanned || req->restart)
++    {
++        data_size_t mask_len = get_req_data_size() & ~(sizeof(WCHAR) - 1);
++
++        /* a restart without a search expression keeps the captured one */
++        if (!dir->scanned || mask_len)
++        {
++            WCHAR *mask = NULL;
++
++            if (mask_len && !(mask = memdup( get_req_data(), mask_len )))
++            {
++                release_object( dir );
++                return;
++            }
++            free( dir->mask );
++            dir->mask = mask;
++            dir->mask_len = mask_len;
++        }
++        dir->scanned = 1;
++        dir->index = 0;
++    }
++    dir->index += req->skip;
++
++    size = dir->mask_len;
++    if (size > get_reply_max_size())
++    {
++        release_object( dir );
++        return;
++    }
++
++    for (count = 0; (obj = find_object_index( dir->device->pipes, dir->index + count )); count++)
++    {
++        get_object_name( obj, &name_len );
++        entry_size = (sizeof(*entry) + name_len + 3) & ~3;
++        release_object( obj );
++        if (size + entry_size > get_reply_max_size()) break;
++        size += entry_size;
++    }
++    reply->entries_len = size - dir->mask_len;
++
++    if (size && (ptr = set_reply_data_size( size )))
++    {
++        for (i = 0; i < count; i++)
++        {
++            struct named_pipe *pipe;
++
++            obj = find_object_index( dir->device->pipes, dir->index + i );
++            assert( obj && obj->ops == &named_pipe_ops );
++            pipe = (struct named_pipe *)obj;
++            name = get_object_name( obj, &name_len );
++
++            entry = (struct named_pipe_entry *)ptr;
++            entry->instances = pipe->instances;
++            entry->max_instances = pipe->maxinstances;
++            entry->name_len = name_len;
++            memcpy( entry + 1, name, name_len );
++            entry_size = (sizeof(*entry) + name_len + 3) & ~3;
++            memset( (char *)(entry + 1) + name_len, 0, entry_size - sizeof(*entry) - name_len );
++            ptr += entry_size;
++
++            release_object( obj );
++        }
++        if (dir->mask_len) memcpy( ptr, dir->mask, dir->mask_len );
++    }
++    release_object( dir );
++}
+diff --git a/server/protocol.def b/server/protocol.def
+index 3846cd9e..dd828f41 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -914,6 +914,14 @@ struct directory_entry
+     /* VARARG(type,unicode_str,type_len); */
+ };
+ 
++struct named_pipe_entry
++{
++    unsigned int instances;     /* current number of pipe instances */
++    unsigned int max_instances; /* maximum number of pipe instances */
++    data_size_t  name_len;      /* length of the pipe name in bytes */
++    /* VARARG(name,unicode_str,name_len); */
++};
++
+ struct monitor_info
+ {
+     struct rectangle raw;     /* host / physical position of the monitor rect */
+@@ -2651,6 +2659,19 @@ enum message_type
+     unsigned int   flags;
+ @END
+ 
++/* Retrieve the pipes listed in the named pipe root directory */
++@REQ(get_named_pipe_entries)
++    obj_handle_t   handle;       /* handle to the named pipe root directory */
++    int            restart;      /* restart the scan at the first pipe */
++    unsigned int   skip;         /* number of entries to move past before reading */
++    VARARG(mask,unicode_str);    /* search expression, captured on the first scan */
++@REPLY
++    int            first;        /* whether this request started the first scan */
++    data_size_t    entries_len;  /* length of the entries data */
++    VARARG(entries,named_pipe_entries,entries_len); /* entries following the scan position */
++    VARARG(mask,unicode_str);    /* captured search expression */
++@END
++
+ /* Create a window */
+ @REQ(create_window)
+     user_handle_t  parent;      /* parent window */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 41ee037a..a397979d 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -149,6 +149,7 @@ DECL_HANDLER(ioctl);
+ DECL_HANDLER(set_irp_result);
+ DECL_HANDLER(create_named_pipe);
+ DECL_HANDLER(set_named_pipe_info);
++DECL_HANDLER(get_named_pipe_entries);
+ DECL_HANDLER(create_window);
+ DECL_HANDLER(destroy_window);
+ DECL_HANDLER(get_desktop_window);
+@@ -461,6 +462,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_set_irp_result,
+     (req_handler)req_create_named_pipe,
+     (req_handler)req_set_named_pipe_info,
++    (req_handler)req_get_named_pipe_entries,
+     (req_handler)req_create_window,
+     (req_handler)req_destroy_window,
+     (req_handler)req_get_desktop_window,
+@@ -1487,6 +1489,13 @@ C_ASSERT( sizeof(struct create_named_pipe_reply) == 16 );
+ C_ASSERT( offsetof(struct set_named_pipe_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct set_named_pipe_info_request, flags) == 16 );
+ C_ASSERT( sizeof(struct set_named_pipe_info_request) == 24 );
++C_ASSERT( offsetof(struct get_named_pipe_entries_request, handle) == 12 );
++C_ASSERT( offsetof(struct get_named_pipe_entries_request, restart) == 16 );
++C_ASSERT( offsetof(struct get_named_pipe_entries_request, skip) == 20 );
++C_ASSERT( sizeof(struct get_named_pipe_entries_request) == 24 );
++C_ASSERT( offsetof(struct get_named_pipe_entries_reply, first) == 8 );
++C_ASSERT( offsetof(struct get_named_pipe_entries_reply, entries_len) == 12 );
++C_ASSERT( sizeof(struct get_named_pipe_entries_reply) == 16 );
+ C_ASSERT( offsetof(struct create_window_request, parent) == 12 );
+ C_ASSERT( offsetof(struct create_window_request, owner) == 16 );
+ C_ASSERT( offsetof(struct create_window_request, atom) == 20 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 288e4441..21cbf394 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -33,6 +33,7 @@ static void dump_varargs_ints( const char *prefix, data_size_t size );
+ static void dump_varargs_luid_attr( const char *prefix, data_size_t size );
+ static void dump_varargs_message_data( const char *prefix, data_size_t size );
+ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size );
++static void dump_varargs_named_pipe_entries( const char *prefix, data_size_t size );
+ static void dump_varargs_object_attributes( const char *prefix, data_size_t size );
+ static void dump_varargs_object_type_info( const char *prefix, data_size_t size );
+ static void dump_varargs_object_types_info( const char *prefix, data_size_t size );
+@@ -1688,6 +1689,22 @@ static void dump_set_named_pipe_info_request( const struct set_named_pipe_info_r
+     fprintf( stderr, ", flags=%08x", req->flags );
+ }
+ 
++static void dump_get_named_pipe_entries_request( const struct get_named_pipe_entries_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", restart=%d", req->restart );
++    fprintf( stderr, ", skip=%08x", req->skip );
++    dump_varargs_unicode_str( ", mask=", cur_size );
++}
++
++static void dump_get_named_pipe_entries_reply( const struct get_named_pipe_entries_reply *req )
++{
++    fprintf( stderr, " first=%d", req->first );
++    fprintf( stderr, ", entries_len=%u", req->entries_len );
++    dump_varargs_named_pipe_entries( ", entries=", min( cur_size, req->entries_len ));
++    dump_varargs_unicode_str( ", mask=", cur_size );
++}
++
+ static void dump_create_window_request( const struct create_window_request *req )
+ {
+     fprintf( stderr, " parent=%08x", req->parent );
+@@ -3685,6 +3702,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_set_irp_result_request,
+     (dump_func)dump_create_named_pipe_request,
+     (dump_func)dump_set_named_pipe_info_request,
++    (dump_func)dump_get_named_pipe_entries_request,
+     (dump_func)dump_create_window_request,
+     (dump_func)dump_destroy_window_request,
+     (dump_func)dump_get_desktop_window_request,
+@@ -3997,6 +4015,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     (dump_func)dump_create_named_pipe_reply,
+     NULL,
++    (dump_func)dump_get_named_pipe_entries_reply,
+     (dump_func)dump_create_window_reply,
+     NULL,
+     (dump_func)dump_get_desktop_window_reply,
+@@ -4309,6 +4328,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "set_irp_result",
+     "create_named_pipe",
+     "set_named_pipe_info",
++    "get_named_pipe_entries",
+     "create_window",
+     "destroy_window",
+     "get_desktop_window",
+diff --git a/server/trace.c b/server/trace.c
+index b6c2f27a..3c414fd2 100644
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -1653,6 +1653,33 @@ static void dump_varargs_directory_entries( const char *prefix, data_size_t size
+     fputc( '}', stderr );
+ }
+ 
++static void dump_varargs_named_pipe_entries( const char *prefix, data_size_t size )
++{
++    fprintf( stderr, "%s{", prefix );
++    while (size)
++    {
++        const struct named_pipe_entry *entry = cur_data;
++        data_size_t entry_size;
++
++        if (size < sizeof(*entry) || size - sizeof(*entry) < entry->name_len)
++        {
++            fprintf( stderr, "***invalid***}" );
++            remove_data( size );
++            return;
++        }
++
++        fputs( "{name=L\"", stderr );
++        dump_strW( (const WCHAR *)(entry + 1), entry->name_len, stderr, "\"\"" );
++        fprintf( stderr, "\",instances=%u,max_instances=%u}", entry->instances, entry->max_instances );
++
++        entry_size = min( size, (sizeof(*entry) + entry->name_len + 3) & ~3 );
++        size -= entry_size;
++        remove_data( entry_size );
++        if (size) fputc( ',', stderr );
++    }
++    fputc( '}', stderr );
++}
++
+ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size )
+ {
+     const struct monitor_info *monitor = cur_data;
+-- 
+2.43.0
+
