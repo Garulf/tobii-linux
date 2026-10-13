@@ -34,6 +34,7 @@ Evidence labels:
 | Connect response layout | same extended layout and field order as the real one; values partly copied, some guessed | live (Windows) |
 | Discovery of `TOBIIPRP-*` under stock Wine | fails; the client falls back to the bare pipe name | live (Wine) |
 | Discovery with the pipe-listing patch ([wine-pipe-enumeration.md](wine-pipe-enumeration.md)), both client DLLs, `PRP_URL=discover` | finds `tobii-prp://ET5-LINUX`, connects and receives about 100 samples per 3 s run | live (Wine master + patch) |
+| Real tracker through `cli serve`, patched Wine 11.0, discovery, both client DLLs | 361 samples per 10 s client run, timestamp lag median 11 ms; samples invalid (no face in view) | live (Wine 11.0 + patch) |
 | Game integration layer (`GetApi`, `TrackTracker` and its display-area query) | not exercised | |
 
 ## Architecture
@@ -137,14 +138,45 @@ one TPRP packet per pipe message, as the real service sends them.
 are dropped while more than 64 KiB are unsent on its TCP connection, so a
 stalled game never blocks the producer.
 
-Time base: timesync replies and package timestamps both use
-`service_clock_us()`, `CLOCK_MONOTONIC_RAW` in microseconds. Wine 9.0
-implements `QueryPerformanceCounter` from the same clock
-(`monotonic_counter` and `NtQueryPerformanceCounter` in
-https://raw.githubusercontent.com/wine-mirror/wine/wine-9.0/dlls/ntdll/unix/sync.c),
-and the DLL's client clock is QPC scaled to microseconds (0x180027650 calls
-`QueryPerformanceCounter` and multiplies by 1,000,000 over the frequency,
-static). A sample producer must stamp samples with `service_clock_us()`.
+Time base: timesync replies and package timestamps both use one service
+clock in microseconds, which must run at the rate of the game's
+`QueryPerformanceCounter`: the DLL's client clock is QPC scaled to
+microseconds (0x180027650 calls `QueryPerformanceCounter` and multiplies by
+1,000,000 over the frequency, static), and it converts package timestamps with
+the offset measured by timesync only. Wine's `monotonic_counter` in
+`dlls/ntdll/unix/sync.c` reads `CLOCK_MONOTONIC_RAW` up to Wine 10.16 and
+`CLOCK_BOOTTIME` from 10.17 on (commit
+https://github.com/wine-mirror/wine/commit/3d373e452388b60bea9dca6d5c4cf3f8b20a0c54,
+"ntdll: Switch to CLOCK_BOOTTIME for monotonic counters when available";
+checked in the 10.0, 10.16, 10.17, 10.20, 11.0 and 11.19 sources).
+`prp_service.wine_clock("boottime" | "raw")` and the `--wine-clock` option
+select the matching clock; the default is `boottime`. On most Linux hosts the
+two run at the same rate, but on the reference host's WSL2 kernel they differ
+by 9.1% (below), and the wrong choice makes timestamps run ahead of the game's
+clock by that fraction of the elapsed time.
+
+### Real tracker
+
+`python3 -m tobii_linux.cli serve --display ...` runs the USB session, the
+head-pose pipeline and this service in one process. Frames are read on their
+own thread and only the newest is processed, so a slow pipeline drops frames
+instead of letting the device stream back up. Device frame timestamps are
+mapped onto the service clock with the smallest receipt delay over the last
+64 frames, and never later than the current service time
+(`driver.ClockMapper`).
+
+Live on albedo (tracker attached to WSL2 with usbipd, `cli serve` as root,
+bridge and test client under Wine 11.0 with the pipe-listing patch,
+`PRP_URL=discover`, `PRP_EXTERNAL_SERVICE=1`, 10 s per client):
+
+| Client DLL | Discovery | Samples | Timestamp to callback |
+| --- | --- | --- | --- |
+| `tobii_gameintegration_x64.dll` | `tobii-prp://ET5-LINUX` | 361 | 8.6 to 18.6 ms, median 11.3 ms |
+| `tobii_stream_engine.dll` | `tobii-prp://ET5-LINUX` | 361 | 8.6 to 17.4 ms, median 11.4 ms |
+
+All samples were invalid because no face was in view. The pipeline took
+3.8 ms per frame on the reference host's CPU (replay of 150 recorded frames,
+95th percentile 4.3 ms). Logs: `evidence/private/e2e/`.
 
 ### Connect response fields
 
@@ -349,11 +381,11 @@ Observations (live, Wine):
 - Sample timestamps advance 33.0 ms per sample although the publisher waits
   30.207 ms on `CLOCK_MONOTONIC`. On this WSL2 kernel (clocksource `tsc`)
   `CLOCK_MONOTONIC_RAW` runs 9.1% faster than `CLOCK_MONOTONIC`
-  (3.2732 s against 3.0001 s, measured twice with `clocks.py`, `wsl-clock-rates.txt`). Wine's
-  QPC uses the same raw clock, so service and client still agree. Earlier
-  sessions showed 31.3 ms with a drifting relative sleep, so the rate error
-  probably differs between WSL boots (inference). On a Linux host with a
-  correctly calibrated clocksource the two clocks run at the same rate.
+  (3.2732 s against 3.0001 s, measured twice with `clocks.py`, `wsl-clock-rates.txt`).
+  Wine 9.0's QPC reads the raw clock, so service and client agreed in these
+  runs. With Wine 11.0 and master (`CLOCK_BOOTTIME`) and the raw service
+  clock, timestamps ran ahead of the client's QPC by 9% of the elapsed time
+  (0.9 s after 10 s); with `--wine-clock boottime` the offset stays flat.
 
 Full logs: `wine-test-stream-engine-1.txt`, `wine-test-game-dll-1.txt` (with
 every relayed message, `PRP_DEBUG=1`), `wine-test-final.txt`,
@@ -384,9 +416,11 @@ stream start/stop and timesync responses and the handshake information.
 - **Licensed connect**: the game may use `tobii_device_create_ex` with license
   keys (0x180008820). The service returns one result 0 per license, which
   satisfies device_create statically, but this was not run.
-- **Real samples**: the driver is not yet wired in. `HeadPoseHub.feed_iterator`
-  accepts any iterator of `HeadPoseSample`; samples must use
-  `service_clock_us()` timestamps.
+- **Valid live samples through Wine**: `tobii_linux.cli serve` feeds tracker
+  samples into the service (section "Real tracker"), but nobody was in front
+  of the tracker during that run, so only invalid samples reached the game
+  DLL. Valid output of the same pipeline was checked offline on recorded
+  frames.
 - **Startup**: the bridge has to run in the game's prefix and wineserver before
   the game connects, for example from a Lutris or Proton launch script. Proton
   was not tested.

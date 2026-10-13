@@ -4,9 +4,11 @@
 Experimental native Eye Tracker 5 head-pose driver
 
 The goal is a native Linux driver for the Tobii Eye Tracker 5 that gives
-Star Citizen head tracking under Wine. **The Linux session has produced head
-pose from a real tracker (through WSL2 and usbipd); the game-side connection
-under Wine is still unsolved.**
+Star Citizen head tracking under Wine. **The Linux session produces head pose
+from a real tracker, and under a patched Wine the Star Citizen Tobii DLL finds
+the Linux service and receives its samples. Star Citizen itself has not been
+run, and testing so far used WSL2 with usbipd rather than a native Linux
+machine.**
 
 Everything here is rebuilt from Tobii's installed binaries and the tracker on
 the Windows reference host `albedo`. No other ET5 driver project was used. Most
@@ -27,7 +29,9 @@ synthetic inputs; those checks are listed in the linked documents.
 | Face-model fit | `pose_*.py` | Updates, bounds, staged and temporal callers match the original |
 | Output conversion, geometry, smoothing | `pose_output.py`, `pose_geometry.py`, `head_pose_pipeline.py` | Euler conversion, geometry stage and One Euro filters match the original |
 | Device session and CLI | `driver.py`, `cli.py` | Runs against a real tracker; head pose within about 1% of the Windows depth |
-| Game client protocol (PRP) | `prp.py`, `prp_session.py` | Codecs and handshake match the game DLL; Wine delivery unsolved |
+| Game client protocol (PRP) | `prp.py`, `prp_session.py`, `prp_service.py` | Codecs and handshake match the game DLL; service replies match the real service byte for byte |
+| Wine pipe bridge | `tools/prp_bridge/` | The game DLL and `tobii_stream_engine.dll` receive tracker samples under Wine |
+| Wine pipe listing | `patches/wine/` | Needed for service discovery; tested on Wine 11.0 and master |
 
 On recorded live frames the Linux pipeline puts the head at 691 mm against
 694 mm from the Windows runtime moments earlier; lateral position and angles
@@ -54,6 +58,29 @@ PYTHONPATH=src python3 -m tobii_linux.cli headpose \
 It prints one JSON line per camera frame. Frames saved by
 `tools/linux_session_probe.py --until frames` can be replayed offline with
 `tools/replay_frames.py <log> <frames-dir>`.
+
+## Star Citizen under Wine
+
+Three pieces are needed:
+
+1. A Wine build with the named-pipe listing patch, so the game's Tobii DLL can
+   discover the service: `patches/wine/apply.sh <wine-source>` for Wine 10.0
+   or later, then build Wine as usual
+   ([details](docs/wine-pipe-enumeration.md)).
+2. The service on Linux, with the same display area as above:
+
+   ```sh
+   PYTHONPATH=src python3 -m tobii_linux.cli serve \
+     --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
+   ```
+
+   Pass `--wine-clock raw` when the game's Wine is 10.16 or older.
+3. The bridge, started in the game's Wine prefix before the game:
+   `wine tools/prp_bridge/prp_bridge.exe 127.0.0.1 7760` (build it with
+   `make -C tools/prp_bridge`, which needs MinGW-w64).
+
+See [the bridge document](docs/prp-bridge.md) for the protocol and test
+results.
 
 ## Tests
 
@@ -82,7 +109,7 @@ been evaluated yet; no NixOS machine is available.
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)
-- [Game client transport and Wine](docs/service-transport.md), [game interface](docs/game-interface.md)
+- [Game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
 - [models](models/README.md)
 - [Managed API](docs/managed-api.md), [Linux inference](docs/linux-inference.md)
 

@@ -24,11 +24,19 @@ next steps; detailed evidence is linked below.
   geometry stage ([pose geometry](pose-geometry.md)) and One Euro filters
   ([head-pose output](head-pose-output.md)), USB session and CLI
   (`driver.py`, `cli.py headpose`).
-- **Game side:** the game DLL's PRP client codecs and handshake are recovered
-  ([service transport](service-transport.md)). Under Wine 9.0 the DLL cannot
-  discover a service: `FindFirstFileA("\\.\pipe\*")` fails with error 66
-  (tested on the reference host's WSL2). Chosen route: a native PRP bridge
-  plus a Wine patch for pipe enumeration (both in progress).
+- **Game side, end to end:** with the tracker attached to WSL2, `cli serve`
+  feeds tracker samples to the PRP service; a bridge inside a Wine 11.0
+  prefix carrying the pipe-listing patch relays the Tobii pipes, and both
+  Star Citizen's `tobii_gameintegration_x64.dll` and `tobii_stream_engine.dll`
+  discover `tobii-prp://ET5-LINUX` and receive 361 samples in 10 s with a
+  flat 11 ms timestamp lag. No face was in view, so the samples were invalid;
+  Star Citizen itself has not been run
+  ([PRP bridge](prp-bridge.md), [Wine pipe listing](wine-pipe-enumeration.md)).
+- **Clock:** the service clock must match the game Wine's
+  `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
+  `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
+- **Speed:** 3.8 ms per frame on the reference host's CPU after vectorizing
+  the float32 inverse (results unchanged bit for bit).
 - **Fitting coordinates:** the live comparison only matches when the fit uses
   full-frame landmarks, so the tracker now does that; the static path that
   maps working-view records to the frame is still unidentified, and lateral
