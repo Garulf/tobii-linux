@@ -59,7 +59,7 @@ def main():
     samples = []
     for timestamp, width, height, path in frames:
         pixels = np.frombuffer(path.read_bytes(), np.uint8).reshape(height, width)
-        result = tracker.process(pixels)
+        result = tracker.process(pixels, timestamp // 1000)
         fit = result.fit['rigid_state'] if result.fit is not None else None
         sample = output(fit, timestamp)
         samples.append(sample)

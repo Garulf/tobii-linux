@@ -19,6 +19,11 @@ where `w`/`h` are the working image dimensions and `gate` is the D1 quality gate
 result. The gate is always 1 here because a failing gate branches past the fit.
 With `gate == 0` the caller would skip fitting and take its failure path.
 
+In the shipped configuration this core call is disabled; the live pose comes
+from the second call site `0x14004a2c0`, which passes the smoothed,
+frame-normalised records with the full frame size and the core result as gate
+([landmark smoothing](landmark-smoothing.md)).
+
 ## Caller `0x14007e440` (static, emulation)
 
 State: `+0x59` initialised, `+0x39` frontal shape refit done, `+0x38` rebuild
@@ -246,8 +251,9 @@ authoritative.
   stale LBF inputs) are not reproduced.
 - Non-finite intermediate states raise in the native update instead of
   propagating as in the original; no oracle case reaches them.
-- `FaceTracker` still uses the staged caller; wiring `TemporalPoseFitter` and
-  `refine_eye_landmarks` into it is not done here.
+- `FaceTracker` uses `TemporalPoseFitter` through the object step
+  (landmark smoothing); `refine_eye_landmarks` is not wired in because the
+  shipped configuration skips it.
 - Numerical agreement is not bit parity (see the tolerances above).
 
 ## Reproduction

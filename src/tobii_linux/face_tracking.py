@@ -3,7 +3,7 @@
 States: 0 searching (full-frame detection), 1 recovering (re-detection inside
 the working image), 2 tracking (box from the previous landmarks).
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
@@ -139,6 +139,27 @@ def redetect(image, face, run_network):
     return best.rectangle()
 
 
+ALIASED_RECORDS = (((2, 1), (15, 17)), ((13, 17), (15, 17)), ((14, 21), (9, 3)), ((9, 12), (14, 23)))
+OBJECT_TRACKING, OBJECT_LOST, OBJECT_RESTARTED = 1, 2, 3
+
+
+def frame_records(frame_points, quality, landmark_ids):
+    """Core records after 0x140049450: frame-normalised D1 points plus the 0x140055a20 aliases."""
+    from .landmark_smoothing import LandmarkRecord
+    records = {tuple(identifier): LandmarkRecord(float(x), float(y), True, float(q))
+               for identifier, (x, y), q in zip(landmark_ids, frame_points, quality)}
+    for alias, source in ALIASED_RECORDS:
+        original = records[source]
+        records[alias] = LandmarkRecord(original.x, original.y, True, original.quality)
+    return records
+
+
+def copy_records(records):
+    """0x140010560 copy of the fields the smoothing and the fit use."""
+    from .landmark_smoothing import LandmarkRecord
+    return {key: LandmarkRecord(r.x, r.y, r.present, r.quality) for key, r in records.items()}
+
+
 @dataclass(frozen=True)
 class TrackedFrame:
     state: int
@@ -150,22 +171,37 @@ class TrackedFrame:
     accepted: bool
     fit: object
     roll_degrees: float
+    fitted_points: object = None
+
+
+@dataclass(frozen=True)
+class CoreFrame:
+    """What 0x140049450 hands back: success flag and the frame-normalised records."""
+    tracked: object
+    succeeded: bool
+    records: object
 
 
 class FaceTracker:
-    """Detection, working-view D1 landmarks, confidence gate and temporal fit per frame.
+    """VNNTrackerCore frame loop followed by the per-object step 0x14004a530.
 
-The original then runs a yaw-dependent LBF eye refinement. It can only fail for
-a source-image region outside the image, which this loop never sets, and the
-installed models carry no group-10 points for it to write (docs/pose-temporal.md),
-so it is omitted.
+The core (0x140049450) finds the face, runs D1 in the working view and applies
+the confidence gate. Its own fit is disabled in the shipped configuration:
+0x140049e60 clears the core flag +0x15 because jk_300_rigid.fdp maps no FDP
+group 10 point, which also skips the LBF eye refinement. The object step then
+smooths the frame-normalised records (landmark_smoothing), copies them, flips Y
+back and fits them with 0x14007e440 at full-frame dimensions (0x14004a2c0).
+
+`timestamp_ms` should be the frame time in milliseconds; without it the
+monotonic host clock stands in, as the original falls back to _ftime.
 """
-    def __init__(self, model_directory, region=None):
+    def __init__(self, model_directory, region=None, smoothing_factors=None):
         import numpy as np
         from .d1 import D1LandmarkModel
         from .face_assets import read_shapes
         from .face_detect import FaceFinder
-        from .pose_model import load_pose_model
+        from .landmark_smoothing import LandmarkFilter, table_entries
+        from .pose_model import load_pose_model, numeric_config
         from .pose_temporal import TemporalPoseFitter
         directory = Path(model_directory)
         _, reference = read_shapes(directory/'support/bdtsdata/NN/vnn_nir/init_shape.bin')
@@ -173,30 +209,44 @@ so it is omitted.
         self.pose_model = load_pose_model(directory/'support')
         self.finder = FaceFinder(directory/'ff')
         self.fitter = TemporalPoseFitter(self.pose_model)
+        config = directory/'support/Head Tracker.cfg'
+        if smoothing_factors is None:
+            smoothing_factors = numeric_config(config, 'smoothing_factors', 7)
+        self.smoothing_entries = table_entries(smoothing_factors)
+        self.recovery_timeout_ms = int(numeric_config(config, 'recovery_timeout', 1)[0])
+        self.landmark_filter = LandmarkFilter()
         self.region = region
         self.roll = 0.0
         self.reset()
 
     def reset(self):
+        self._reset_core()
+        self.fitter.reset()
+        self.landmark_filter.reset()
+        self.object_state = OBJECT_RESTARTED
+        self.smoothing_epoch = 0
+        self.lost_since = -1
+        self.smoothed = None
+
+    def _reset_core(self):
+        """0x140049400 (vtable slot 2): back to searching with no box."""
         self.state = SEARCHING
         self.face = (-1, -1, -1, -1)
-        if hasattr(self, 'fitter'):
-            self.fitter.reset()
 
-    def _empty(self):
-        return TrackedFrame(self.state, None, None, None, None, float('nan'), False, None, self.roll)
+    def _failed_core(self):
+        self._reset_core()
+        return CoreFrame(TrackedFrame(self.state, None, None, None, None, float('nan'), False, None, self.roll),
+                         False, None)
 
-    def process(self, frame):
-        import numpy as np
+    def _track(self, pixels):
+        """0x140049450 with the core fit disabled; records are frame-normalised with Y down."""
         from .d1_quality import d1_quality_score, passes_d1_quality
-        pixels = np.asarray(frame, dtype=np.uint8)
         height, width = pixels.shape
         state = self.state
         if state == SEARCHING:
             found = self.finder.detect(pixels, region=self.region)
             if not found:
-                self.reset()
-                return self._empty()
+                return self._failed_core()
             face = found[0].rectangle()
         else:
             face = self.face
@@ -204,32 +254,85 @@ so it is omitted.
         if state == RECOVERING:
             refreshed = redetect(view.image, view.face, self.finder)
             if refreshed is None:
-                self.reset()
-                return self._empty()
+                return self._failed_core()
             view = WorkingView(view.image, view.region, view.ratio, refreshed)
         work_h, work_w = view.image.shape
-        compensate = state == TRACKING
         landmarks = self.landmarks.predict_frame(view.image.tobytes(), work_w, work_h, view.face,
-                                                 self.roll, compensate_roll=compensate)
+                                                 self.roll, compensate_roll=state == TRACKING)
         ids = self.pose_model.landmark_ids
         self.roll = temporal_roll(landmarks.normalized_points, ids, work_w, work_h)
         score = d1_quality_score(landmarks.quality, ids)
         accepted = passes_d1_quality(score, state)
         frame_points = to_frame_points(landmarks.normalized_points, view, width, height)
-        fit = None
-        if accepted:
-            # Live comparison with the Windows runtime: fitting full-frame points
-            # matches its depth within 0.5%, working-view points do not
-            # (docs/face-tracking.md, "Fitting coordinates").
-            fit = self.fitter.process(frame_points, width, height)
-            if not fit['valid']:
-                self.reset()
-                return self._empty()
         if accepted:
             self.state, self.face = TRACKING, landmark_box(frame_points, width, height)
         elif state == TRACKING:
             self.state, self.face = RECOVERING, working_face_in_frame(view)
         else:
-            self.reset()
-        return TrackedFrame(state, face, (work_w, work_h), landmarks.normalized_points, frame_points,
-                            float(score), bool(accepted), fit, self.roll)
+            return self._failed_core()
+        tracked = TrackedFrame(state, face, (work_w, work_h), landmarks.normalized_points, frame_points,
+                               float(score), bool(accepted), None, self.roll)
+        return CoreFrame(tracked, True, frame_records(frame_points, landmarks.quality, ids))
+
+    def _smooth(self, core, time_ms):
+        """0x14004a530 from the core result up to the copy that 0x14004a2c0 fits."""
+        from .landmark_smoothing import flip_y, smooth_records
+        landmark_filter = self.landmark_filter
+        landmark_filter.enabled = core.succeeded
+        landmark_filter.begin_frame()
+        if core.succeeded:
+            records = copy_records(core.records)
+            flip_y(records)
+            if self.object_state != OBJECT_TRACKING:
+                self.smoothing_epoch = time_ms
+                landmark_filter.reset()
+            smooth_records(landmark_filter, records, time_ms - self.smoothing_epoch, self.smoothing_entries)
+            self.smoothed = records
+        fitted = None
+        if self.smoothed is not None:
+            fitted = copy_records(self.smoothed)
+            flip_y(fitted)
+        if self.object_state == OBJECT_LOST:
+            if self.lost_since == -1:
+                self.lost_since = time_ms
+            elif self.recovery_timeout_ms <= time_ms - self.lost_since:
+                self.fitter.reset()
+                self.lost_since = -1
+                landmark_filter.reset()
+                self.object_state = OBJECT_RESTARTED
+        else:
+            self.lost_since = -1
+        return fitted
+
+    def _fit(self, core, fitted, width, height):
+        """0x14004a2c0: 0x14007e440 on the flipped copy at frame size; a failure resets core and fitter."""
+        import numpy as np
+        fit = None
+        if core.succeeded:
+            points = np.array([(fitted[tuple(i)].x, fitted[tuple(i)].y) for i in self.pose_model.landmark_ids],
+                              dtype=np.float32)
+            fit = self.fitter.process(points, width, height)
+        if fit is None or not fit['valid']:
+            self._reset_core()
+            self.fitter.reset()
+            return None
+        return fit
+
+    def process(self, frame, timestamp_ms=None):
+        import time
+        import numpy as np
+        pixels = np.asarray(frame, dtype=np.uint8)
+        height, width = pixels.shape
+        time_ms = time.monotonic_ns() // 1_000_000 if timestamp_ms is None else int(timestamp_ms)
+        core = self._track(pixels)
+        fitted = self._smooth(core, time_ms)
+        fit = self._fit(core, fitted, width, height)
+        if fit is not None:
+            self.object_state = OBJECT_TRACKING
+        elif self.object_state == OBJECT_TRACKING:
+            self.object_state = OBJECT_LOST
+        points = None
+        if fit is not None:
+            points = np.array([(fitted[tuple(i)].x, fitted[tuple(i)].y) for i in self.pose_model.landmark_ids],
+                              dtype=np.float32)
+        return replace(core.tracked, fit=fit, fitted_points=points)

@@ -40,11 +40,12 @@ In state 1, `0x1400499d0` runs the detector on the working image (sensitivity
 0.95, no size limits) and replaces the box with the detection of highest
 inclusive-pixel overlap, if that overlap exceeds 0.1.
 
-D1 runs on the working image. After the gate passes, the pose fit
-`0x14007e840` also runs on working-image coordinates, so the fitted pose is
-relative to the working view, not to the camera frame. Records are then mapped
+D1 runs on the working image. After the gate passes, the core's own pose fit
+would run on working-image coordinates, but the shipped configuration disables
+it (see [landmark smoothing](landmark-smoothing.md)). Records are then mapped
 back by the adjustments' inverses (`0x14007aa30`:
-`x = (region_w * x' + region_x) / frame_w`).
+`x = (region_w * x' + region_x) / frame_w`), copied to the caller and flipped
+to Y up (`0x14007ac80`).
 
 ## Temporal roll
 
@@ -57,10 +58,13 @@ The next frame's crop rotates by it when the tracker was in state 2 and
 ## Implementation and checks
 
 `src/tobii_linux/face_tracking.py`: `working_view`, `redetect`,
-`landmark_box`, `temporal_roll`, `to_frame_points` and `FaceTracker`, which
-combines the detector, D1, gate and the temporal fitter of
-[pose-temporal](pose-temporal.md) (the live caller `0x14007e440`, not the
-per-frame staged fit).
+`landmark_box`, `temporal_roll`, `to_frame_points`, `frame_records` and
+`FaceTracker`, which combines the detector, D1 and gate of this loop with the
+per-object step `0x14004a530`: landmark smoothing, then the temporal fitter of
+[pose-temporal](pose-temporal.md) (`0x14007e440`) on frame-normalised records
+([landmark smoothing](landmark-smoothing.md)). A failed gate while tracking
+still returns success: the core moves to recovering and its records are
+smoothed and fitted.
 
 `tools/face_tracking_oracle.py` runs the original `0x140079ce0` on five face
 boxes (centred, clamped at the top-left and bottom-right, downscaled 97 to 96,
@@ -96,8 +100,12 @@ immediately before at the same head position:
 | Full frame, focal 3.0 | (-42.8, 26.7, 790.4) | (10.5, 1.4, 4.2) |
 
 Only full-frame landmarks with the `Head Tracker.cfg` focal 2.6 reproduce the
-Windows depth (0.5% apart) and height, so `FaceTracker` fits full-frame
-points. The static path that maps working-view records to the frame before
-the fit has not been found. Remaining differences of about 15 mm in x and 3 to
-4 degrees in rotation are open; the comparison is not simultaneous (the
-device serves one host at a time), so some of it may be head movement.
+Windows depth (0.5% apart) and height. The static mechanism is now known
+(static, file parse): `0x140049e60` disables the core fit because the model
+FDP map has no group 10 point, and the object step `0x14004a530` fits the
+smoothed, frame-normalised records with the full frame size through
+`0x14004a2c0` ([landmark smoothing](landmark-smoothing.md)). Adding the
+smoothing leaves the means unchanged (live); the differences of about 15 mm in
+x and 3 to 4 degrees in rotation remain open. The comparison is not
+simultaneous (the device serves one host at a time), so some of it may be head
+movement.

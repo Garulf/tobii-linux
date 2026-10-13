@@ -193,7 +193,7 @@ timestamps are moved onto that clock.
         frames = newest_frames(frames, on_receive=lambda frame: to_host.observe(frame.timestamp))
     for frame in frames:
         pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
-        result = tracker.process(pixels)
+        result = tracker.process(pixels, frame.timestamp // 1000)
         fit = result.fit['rigid_state'] if result.fit is not None else None
         sample = output(fit, frame.timestamp)
         yield sample if to_host is None else replace(sample, timestamp_us=to_host(sample.timestamp_us))

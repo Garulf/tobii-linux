@@ -39,6 +39,15 @@ class FaceTrackingGeometryTests(unittest.TestCase):
         points = [(0.4, 0.3), (0.6, 0.3), (0.45, 0.6), (0.55, 0.6)]
         self.assertAlmostEqual(temporal_roll(points, ids, 100, 100), 0.0, places=4)
 
+    def test_core_records_carry_the_four_aliases(self):
+        from tobii_linux.face_tracking import frame_records
+        ids = [(15, 17), (9, 3), (14, 23)]
+        records = frame_records([(0.1, 0.2), (0.3, 0.4), (0.5, 0.6)], [0.9, 0.8, 0.7], ids)
+        self.assertEqual((records[(2, 1)].x, records[(13, 17)].y), (0.1, 0.2))
+        self.assertEqual(records[(14, 21)].quality, 0.8)
+        self.assertEqual(records[(9, 12)].x, 0.5)
+        self.assertTrue(all(record.present for record in records.values()))
+
 
 @unittest.skipUnless(importlib.util.find_spec('openvino') and (MODELS/'ff').exists(),
                      'Optional OpenVINO or model assets are not installed')
