@@ -1,0 +1,7 @@
+.local/
+evidence/private/
+__pycache__/
+*.egg-info/
+build/
+result
+result-*
