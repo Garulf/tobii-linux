@@ -153,10 +153,12 @@ class TrackedFrame:
 
 
 class FaceTracker:
-    """Detection, working-view D1 landmarks, confidence gate and staged fit per frame.
+    """Detection, working-view D1 landmarks, confidence gate and temporal fit per frame.
 
-The original also runs a yaw-dependent LBF eye refinement after a successful
-fit and resets when it fails; that refinement is not part of this loop yet.
+The original then runs a yaw-dependent LBF eye refinement. It can only fail for
+a source-image region outside the image, which this loop never sets, and the
+installed models carry no group-10 points for it to write (docs/pose-temporal.md),
+so it is omitted.
 """
     def __init__(self, model_directory, region=None):
         import numpy as np
@@ -164,11 +166,13 @@ fit and resets when it fails; that refinement is not part of this loop yet.
         from .face_assets import read_shapes
         from .face_detect import FaceFinder
         from .pose_model import load_pose_model
+        from .pose_temporal import TemporalPoseFitter
         directory = Path(model_directory)
         _, reference = read_shapes(directory/'support/bdtsdata/NN/vnn_nir/init_shape.bin')
         self.landmarks = D1LandmarkModel(directory/'d1', np.asarray(reference).reshape(57, 2))
         self.pose_model = load_pose_model(directory/'support')
         self.finder = FaceFinder(directory/'ff')
+        self.fitter = TemporalPoseFitter(self.pose_model)
         self.region = region
         self.roll = 0.0
         self.reset()
@@ -176,6 +180,8 @@ fit and resets when it fails; that refinement is not part of this loop yet.
     def reset(self):
         self.state = SEARCHING
         self.face = (-1, -1, -1, -1)
+        if hasattr(self, 'fitter'):
+            self.fitter.reset()
 
     def _empty(self):
         return TrackedFrame(self.state, None, None, None, None, float('nan'), False, None, self.roll)
@@ -183,7 +189,6 @@ fit and resets when it fails; that refinement is not part of this loop yet.
     def process(self, frame):
         import numpy as np
         from .d1_quality import d1_quality_score, passes_d1_quality
-        from .pose_policy import fit_staged_landmarks
         pixels = np.asarray(frame, dtype=np.uint8)
         height, width = pixels.shape
         state = self.state
@@ -212,7 +217,7 @@ fit and resets when it fails; that refinement is not part of this loop yet.
         accepted = passes_d1_quality(score, state)
         fit = None
         if accepted:
-            fit = fit_staged_landmarks(self.pose_model, landmarks.normalized_points, work_w, work_h)
+            fit = self.fitter.process(landmarks.normalized_points, work_w, work_h)
             if not fit['valid']:
                 self.reset()
                 return self._empty()

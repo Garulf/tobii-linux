@@ -58,7 +58,9 @@ The next frame's crop rotates by it when the tracker was in state 2 and
 
 `src/tobii_linux/face_tracking.py`: `working_view`, `redetect`,
 `landmark_box`, `temporal_roll`, `to_frame_points` and `FaceTracker`, which
-combines the detector, D1, gate and staged fit.
+combines the detector, D1, gate and the temporal fitter of
+[pose-temporal](pose-temporal.md) (the live caller `0x14007e440`, not the
+per-frame staged fit).
 
 `tools/face_tracking_oracle.py` runs the original `0x140079ce0` on five face
 boxes (centred, clamped at the top-left and bottom-right, downscaled 97 to 96,
@@ -69,8 +71,14 @@ are byte-exact in all five. Report: `evidence/private/face-tracking-oracle.json`
 PYTHONPATH=.local/python:.local/inference:src python3 tools/face_tracking_oracle.py
 ```
 
-Not yet covered: the two-stage resize for faces of 768 pixels or more, an
-emulated check of re-detection and the landmark box, and the yaw-dependent
-LBF eye refinement `0x14007d270` that follows a successful fit (its failure
-resets the original tracker; `FaceTracker` does not run it yet). No real face
-images have been run through the loop.
+Not yet covered: the two-stage resize for faces of 768 pixels or more and an
+emulated check of re-detection and the landmark box. The LBF eye refinement
+`0x14007d270` is omitted: it fails only for a source-image region outside the
+image, which this loop never sets, and writes nothing with the installed
+models. A public-domain portrait (NASA astronaut photo from scikit-image's
+sample data) runs through detection, D1, the gate and the temporal fit and
+holds a stable frontal pose over repeated frames; this is a sanity check only.
+
+Open: the fitted translation is relative to the working view, which always
+scales the face to 96 pixels. Nothing found so far rescales it to the camera
+frame, so depth may not follow real distance; a live comparison should settle it.
