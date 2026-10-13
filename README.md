@@ -100,8 +100,19 @@ nix build path:.#default
 
 Import `inputs.tobii-linux.nixosModules.default` and set
 `hardware.tobii-eye-tracker-5.enable = true;` to install the command and a udev
-rule granting the active seat user access to `2104:0313`. The flake has not
-been evaluated yet; no NixOS machine is available.
+rule granting the active seat user access to `2104:0313`. To run the game
+service in the background as a systemd user service:
+
+```nix
+hardware.tobii-eye-tracker-5.headPoseService = {
+  enable = true;
+  displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
+  # wineClock = "raw"; # for Wine 10.16 and older
+};
+```
+
+The flake and module evaluate (`nix flake check` includes a module
+evaluation), but no NixOS machine has run them yet.
 
 ## Documents
 

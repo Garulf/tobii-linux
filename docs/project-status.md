@@ -35,8 +35,16 @@ next steps; detailed evidence is linked below.
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
-- **Speed:** 3.8 ms per frame on the reference host's CPU after vectorizing
-  the float32 inverse (results unchanged bit for bit).
+- **Speed:** on the reference host's CPU, 9.6 ms per frame with landmark
+  smoothing (3.8 ms before it), after vectorizing the float32 inverse
+  (results unchanged bit for bit).
+- **Nix:** the flake evaluates against nixpkgs unstable
+  (`7fd4004d0511991fff3a0524856a9be09e28c5f0`), and the NixOS module, including
+  the optional `headPoseService` systemd user service, evaluates in a minimal
+  system; `checks.nixos-module` repeats that evaluation. The package builds
+  with Python 3.14 from that nixpkgs and its check phase passes (214 tests,
+  88 skipped for missing private inputs). Checked with nix-portable in a
+  container, not on NixOS hardware.
 - **Fitting coordinates:** the live comparison only matches when the fit uses
   full-frame landmarks, so the tracker now does that; the static path that
   maps working-view records to the frame is still unidentified, and lateral
