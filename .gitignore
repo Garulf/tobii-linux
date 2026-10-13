@@ -5,3 +5,4 @@ __pycache__/
 build/
 result
 result-*
+tools/prp_bridge/*.exe
