@@ -32,6 +32,19 @@ next steps; detailed evidence is linked below.
   flat 11 ms timestamp lag. No face was in view, so the samples were invalid;
   Star Citizen itself has not been run
   ([PRP bridge](prp-bridge.md), [Wine pipe listing](wine-pipe-enumeration.md)).
+- **Game integration layer:** the API Star Citizen calls (`GetApi`, tracking
+  and head-pose reads) needs the display area, display id, model name and a
+  presence subscription answered; the service now does so in the real
+  service's encoding, and the bridge reports the prefix's primary monitor id.
+  Under patched Wine 11.0 the layer receives every synthetic sample
+  ([game integration layer](game-integration-layer.md)).
+- **Fit and smoothing:** the shipped configuration fits in the per-object
+  driver (`0x14004a2c0`) on full-frame records after quality-weighted landmark
+  smoothing (`0x14007f5a0`), now reproduced within 5 ulps
+  ([landmark smoothing](landmark-smoothing.md)). It reduces jitter but leaves
+  the 15 mm / 3 degree offset against Windows unexplained; a simultaneous
+  comparison needs frames captured from the Windows runtime, and USBPcap's
+  device listing returned nothing on the reference host.
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
