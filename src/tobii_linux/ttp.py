@@ -147,3 +147,16 @@ def protocol_upgrade(request_id: int) -> Message:
     versions = range(0x10000, 0x10009)
     payload = b"\0\0" + uint32_array(versions).encode()
     return Message(0x51, uint32(request_id), 0, 1000, 0, payload)
+
+
+HARDWARE_INFO_COMMAND = 0x848
+HARDWARE_INFO_MIN_PROTOCOL = 0x10008
+
+
+def hardware_info_request(request_id: int) -> Message:
+    """Payload-free camera hardware-info request built by 0x1402c5c10.
+
+The tracker sends it only after negotiating protocol 0x10008 or later; the
+reply carries up to four camera calibration records.
+"""
+    return Message(0x51, uint32(request_id), 0, HARDWARE_INFO_COMMAND, 0)

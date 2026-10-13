@@ -65,6 +65,13 @@ class TtpTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             protocol_upgrade(-1)
 
+    def test_hardware_info_request_matches_original_bytes(self):
+        from tobii_linux.ttp import hardware_info_request
+        self.assertEqual(hardware_info_request(0x12345678).encode(), bytes.fromhex(
+            "00000051" "12345678" "00000000" "00000848" "00000000" "00000000"))
+        with self.assertRaises(ProtocolError):
+            hardware_info_request(1 << 32)
+
 
 if __name__ == "__main__":
     unittest.main()

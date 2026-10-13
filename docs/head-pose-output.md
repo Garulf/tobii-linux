@@ -122,6 +122,29 @@ One Euro filters keyed on microsecond timestamps (rate = 1e6 / dt):
 Filter parameters come from pipeline settings getters `+0x20`/`+0x28` and a
 third 0x30-byte object; their values are not yet recovered.
 
+## Camera hardware info
+
+`platmod_algo::populate_hw_info` (`0x140286410`) takes the device's camera
+records (see [USB protocol](usb-protocol.md#camera-hardware-info-request)) and
+`0x1402871e0` converts the selected camera's doubles to the algorithm's floats:
+
+| Algorithm field | Source in device record |
+| --- | --- |
+| `+1` byte, `+4`, `+8` | record `+0`, `+8`, `+4` |
+| `+0x10`, `+0x12` (u16) | `+0xa0`, `+0xa4` (image size candidates) |
+| `+0x14`, `+0x18` | `+0x90`, `+0x98` times 1e6 |
+| `+0x1c` | `+0x40` |
+| `+0x20..+0x2c` (4 floats) | `+0x70..+0x88` |
+| `+0x30..+0x40` (5 floats) | `+0x48..+0x68` |
+| `+0x44..+0x58` (6 floats) | `+0x10..+0x38` |
+| `+0x5c`, `+0x5d` | byte `+0xa8`, coefficient count `+0xac` (capped at 40) |
+| `+0x60..` | up to 40 doubles from `+0xb0` |
+
+The groups look like intrinsics (4), distortion (5) and an extrinsic pose (6),
+but these names are inferences from shape only. Without hardware info the
+module logs "No hardware info available; using the defaults." and copies
+defaults from its configuration block instead.
+
 ## Configured geometry on the Windows reference
 
 `tools/windows_geometry_probe.py` calls only getters (`tobii_get_display_area`,

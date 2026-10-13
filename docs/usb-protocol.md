@@ -56,6 +56,33 @@ helper is `tools/ttp_encoder_oracle.py`; retained results are in
 `evidence/private/ttp-encoder-oracle.json`. This strengthens the encoder
 reconstruction without claiming device acceptance.
 
+## Camera hardware-info request
+
+The head-pose subsystem asks the tracker for its camera model before starting
+(`platmod_castor_device.cpp`, start routine `0x140261ca0`). The device object
+is the `tracker_lib_usb` tracker (`tobii-usbttp://`, constructor `0x1402b3d90`,
+vtable `0x1410af508`); slot `0x2c0` is `0x1402bb550`.
+
+- Refused with code 2 unless the negotiated protocol is at least `0x10008`.
+- Request: `0x1402c5c10` calls the generic builder `0x1402c3bc0` with command
+  `0x848` and no field data, giving a bare header
+  `0x51, request_id, 0, 0x848, 0, 0` (24 bytes, big-endian words).
+  `ttp.hardware_info_request` reproduces it; `tools/ttp_hwinfo_oracle.py`
+  matches the original builder byte-for-byte for five request IDs
+  (`evidence/private/ttp-hwinfo-oracle.json`).
+- Sent through `0x1402bed50` with timeout argument 3,000,000. The reply must
+  have a zero status and pass `0x1402c18b0(reply+0x28, 0x1b, 0xc, 2)`, which
+  checks three parsed field tags.
+- The parsed reply holds up to four camera records (count at `+8`), up to 40
+  float triples widened to doubles (count at `+0x210`), and an integer at
+  `+0x418`. The camera record fields consumed by the algorithm are listed in
+  [head-pose output](head-pose-output.md#camera-hardware-info).
+
+Around this call the start routine also calls tracker slot `0x390`
+(`0x1402bd400`) with id `0x2712` and a 16-byte constant at `0x1412b8e38`, and
+slot `0x398` (`0x1402b5410`) to release it. Their purpose is not established.
+The wire layout of the reply fields is not reconstructed yet.
+
 ## USB access and remaining work
 
 The Linux backend requires descriptor-confirmed bulk IN `0x83` and bulk OUT
