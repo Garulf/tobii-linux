@@ -5,6 +5,30 @@ next steps; detailed evidence is linked below.
 
 ## Latest continuation checkpoint
 
+### Driver checkpoint: live USB, full pipeline, Wine route
+
+- **Live hardware (WSL2 on the reference host, usbipd-win):** channel 0
+  carries TTP; protocol upgrade, unlock, realm `0x2712` challenge, camera
+  hardware info, image subscription and unsubscribe all succeed on the real
+  tracker. Image frames are 280x280 at about 33 Hz. No person was present, so
+  no live head pose has been produced yet. See
+  [USB streams, live observations](usb-streams.md#live-observations-wsl2-on-the-windows-reference).
+- **Pipeline, all native and mostly checked against the original by
+  emulation:** face finder ([face detection](face-detection.md)), tracking
+  loop and working view ([face tracking](face-tracking.md)), D1 and gate,
+  temporal fitter ([pose temporal](pose-temporal.md)), output conversion,
+  geometry stage ([pose geometry](pose-geometry.md)) and One Euro filters
+  ([head-pose output](head-pose-output.md)), USB session and CLI
+  (`driver.py`, `cli.py headpose`).
+- **Game side:** the game DLL's PRP client codecs and handshake are recovered
+  ([service transport](service-transport.md)). Under Wine 9.0 the DLL cannot
+  discover a service: `FindFirstFileA("\\.\pipe\*")` fails with error 66
+  (tested on the reference host's WSL2). Chosen route: a native PRP bridge
+  plus a Wine patch for pipe enumeration (both in progress).
+- **Open:** fitted translation is relative to the 96-pixel working view;
+  whether the original rescales it to camera depth is unresolved and needs a
+  live comparison with a person in front of the tracker.
+
 ### Head-pose output path traced
 
 The fitted pose reaches the public sample through `platmod_algo`: a face
