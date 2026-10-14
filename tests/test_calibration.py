@@ -287,12 +287,40 @@ class CalibratorTests(unittest.TestCase):
         device = CalibrationDevice(fail_compute_at=2)
         before = device.blob
         with self.assertRaises(cal.CalibrationFailed) as failure:
-            cal.Calibrator(TrackerSession(device), RecordingUI()).run()
+            cal.Calibrator(TrackerSession(device), RecordingUI(), restarts=0).run()
         self.assertEqual(failure.exception.step, 'compute stage 1 (1070)')
         self.assertEqual(device.commands(), FULL_SEQUENCE[:9] + [STOP, UNSUBSCRIBE])
         self.assertNotIn(APPLY, device.commands())
         self.assertFalse(device.calibrating)
         self.assertNotEqual(device.blob, before)
+
+    def test_refused_compute_restarts_from_the_first_target(self):
+        device = CalibrationDevice(fail_compute_at=1)
+        ui = RecordingUI()
+        calibrator = cal.Calibrator(TrackerSession(device), ui)
+        outcome = calibrator.run()
+        restart = [SUBSCRIBE, START, CLEAR, COLLECT, COMPUTE, STIMULUS, STOP, START, CLEAR]
+        self.assertEqual(device.commands()[:9], restart)
+        self.assertEqual(device.commands()[9:], FULL_SEQUENCE[3:])
+        self.assertEqual([(stage, attempt) for stage, attempt, _ in calibrator.compute_failures], [(0, 0)])
+        self.assertIn(('show', 0), ui.events[1:])
+        self.assertEqual(len(outcome.points), 7)
+
+    def test_compute_refused_every_time_gives_up(self):
+        device = CalibrationDevice()
+        original = device.handle
+
+        def refuse(request):
+            if request.command == COMPUTE:
+                device.reply(request, word4=OPERATION_FAILED)
+            else:
+                original(request)
+        device.handle = refuse
+        with self.assertRaises(cal.CalibrationFailed):
+            cal.Calibrator(TrackerSession(device), restarts=1).run()
+        self.assertEqual(device.commands().count(COMPUTE), 2)
+        self.assertEqual(device.commands()[-2:], [STOP, UNSUBSCRIBE])
+        self.assertNotIn(APPLY, device.commands())
 
     def test_collect_failure_stops(self):
         device = CalibrationDevice(fail_collect_at=3)
@@ -357,6 +385,16 @@ class UnreadStreamTests(unittest.TestCase):
                                              UNSUBSCRIBE, RETRIEVE, STATUS, STIMULUS])
         self.assertEqual(len(outcome.points), 2)
 
+    def test_collect_waits_for_a_still_binocular_gaze(self):
+        device = StallingDevice(points=[(0.5, 0.5)])
+        log = []
+        cal.Calibrator(TrackerSession(device), stages=((0,),), wait_for_fixation=True,
+                       log=lambda kind, **values: log.append((kind, values))).run()
+        fixations = [values for kind, values in log if kind == 'fixation']
+        self.assertEqual(len(fixations), 1)
+        self.assertTrue(fixations[0]['stable'])
+        self.assertGreaterEqual(fixations[0]['samples'], cal.FIXATION_MIN_SAMPLES)
+
     def test_ui_errors_are_raised_after_the_worker_ends(self):
         device = StallingDevice()
         with self.assertRaises(KeyboardInterrupt):
@@ -403,6 +441,26 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual([r['command'] for r in records if r['kind'] == 'would_send'], FULL_SEQUENCE[:15])
         self.assertTrue(next(r for r in records if r['kind'] == 'dry_run')['device_unchanged'])
         self.assertFalse(Path('unused-before').exists())
+
+
+class FixationTests(unittest.TestCase):
+    def samples(self, points, step_ms=30):
+        return [cal.GazeSample(i * step_ms * 1000, p) for i, p in enumerate(points)]
+
+    def test_still_gaze_is_a_fixation(self):
+        self.assertTrue(cal.fixation(self.samples([(0.2 + 0.001 * i, 0.3) for i in range(12)])))
+
+    def test_saccade_in_the_window_is_not(self):
+        points = [(0.2, 0.3)] * 8 + [(0.5, 0.3)] * 4
+        self.assertFalse(cal.fixation(self.samples(points)))
+        self.assertTrue(cal.fixation(self.samples(points + [(0.5, 0.3)] * 8)))
+
+    def test_one_eye_missing_is_not(self):
+        points = [(0.2, 0.3)] * 11 + [None]
+        self.assertFalse(cal.fixation(self.samples(points)))
+
+    def test_too_few_samples_is_not(self):
+        self.assertFalse(cal.fixation(self.samples([(0.2, 0.3)] * 3)))
 
 
 class FocusCheckTests(unittest.TestCase):

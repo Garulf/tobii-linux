@@ -210,6 +210,10 @@ settle_s, the 200 ms the Tobii client waits for the saccade to end.
             raise RuntimeError('The calibration page left fullscreen')
         time.sleep(self.settle_s)
 
+    def restarting(self, attempt):
+        self.message('Once more: look at each dot until it disappears')
+        time.sleep(2.0)
+
     def point_done(self, index, accepted):
         seq = self.page.publish(phase='collected' if accepted else 'message',
                                 index=index, message='' if accepted else 'Look at the dot again')

@@ -41,6 +41,10 @@ FOCUS_CHANGE_MS = 150.0
 GAZE_LOST_MS = 250.0
 EYE_VALID_BELOW = 2
 READ_SLICE_MS = 100
+FIXATION_WINDOW_MS = 300.0
+FIXATION_SPREAD = 0.03
+FIXATION_MIN_SAMPLES = 6
+FIXATION_TIMEOUT_S = 4.0
 
 READ_COMMANDS = frozenset(gd.READ_ONLY | {Command.GET_DEVICE_STATUS, Command.GET_DISPLAY_AREA,
                                           Command.GET_DEVICE_INFO, Command.GET_ENABLED_EYE})
@@ -204,6 +208,9 @@ device, so a callback may block but must not use the device session.
     def stage_done(self, stage):
         """The device computed and applied the calibration from all targets so far."""
 
+    def restarting(self, attempt):
+        """A compute failed; the calibration starts again from the first target."""
+
 
 @dataclass(frozen=True)
 class GazeSample:
@@ -220,6 +227,33 @@ def gaze_sample(message):
     eyes = [p for p, validity in ((g.left_gaze_point_2d, g.left_validity), (g.right_gaze_point_2d, g.right_validity))
             if validity < EYE_VALID_BELOW and p != (0.0, 0.0)]
     point = (sum(p[0] for p in eyes) / len(eyes), sum(p[1] for p in eyes) / len(eyes)) if eyes else None
+    return GazeSample(g.timestamp, point)
+
+
+def fixation(samples, window_ms=FIXATION_WINDOW_MS, spread=FIXATION_SPREAD, min_samples=FIXATION_MIN_SAMPLES):
+    """Whether the newest samples within window_ms all have both eyes valid and stay within spread of their mean.
+
+Points are in normalized display units of whatever calibration the device
+holds (none after 1060), so only their stability is used, not their position.
+"""
+    if not samples:
+        return False
+    newest = samples[-1].timestamp_us
+    window = [s for s in samples if (newest - s.timestamp_us) / 1000 <= window_ms]
+    if len(window) < min_samples or any(s.point is None for s in window):
+        return False
+    mean = (sum(s.point[0] for s in window) / len(window), sum(s.point[1] for s in window) / len(window))
+    return all(math.dist(s.point, mean) <= spread for s in window)
+
+
+def binocular_sample(message):
+    """GazeSample whose point is the mean of both eyes' display points, or None unless both eyes are valid."""
+    from .gaze import gaze_message
+    g = gaze_message(message)
+    if g is None:
+        return None
+    both = g.left_validity < EYE_VALID_BELOW and g.right_validity < EYE_VALID_BELOW
+    point = tuple((a + b) / 2 for a, b in zip(g.left_gaze_point_2d, g.right_gaze_point_2d)) if both else None
     return GazeSample(g.timestamp, point)
 
 
@@ -295,6 +329,13 @@ looked away from, then 1030 again) and 1070 once the stage is complete, then
 its id (1490 key 7) and the per-target quality (1120). Any failure after 1010
 sends 1020 and raises CalibrationFailed; nothing is applied on failure.
 
+A compute the device refuses (PROTOCOL_OPERATION_FAILED, the Tobii app's
+"all points failed") stops the calibration (1020) and, up to `restarts`
+times, starts it again from the first target (1010, 1060), as the app's "try
+again" does. With `wait_for_fixation`, each collect waits until both eyes are
+valid and the gaze has been still for 300 ms (at most 4 s); this is a Linux
+addition, the app relies on its 200 ms saccade delay alone.
+
 The UI callbacks block (a target animates for about 1.5 s), so they run on a
 worker thread while this thread keeps reading the device. The device stops
 sending, and stops answering requests for the rest of the USB session, once a
@@ -304,7 +345,8 @@ subscribed.
 """
 
     def __init__(self, session, ui=None, targets=INTERACTIVE_POINTS, stages=STAGES, previous=None,
-                 focus=None, max_attempts=3, subscribe_gaze=True, log=None):
+                 focus=None, max_attempts=3, subscribe_gaze=True, log=None, restarts=2,
+                 wait_for_fixation=False):
         self.session = session
         self.ui = ui or CalibrationUI()
         self.targets = tuple(targets)
@@ -316,6 +358,9 @@ subscribed.
         self.log = log or (lambda kind, **values: None)
         self.notifications = []
         self.discarded = []
+        self.restarts = restarts
+        self.wait_for_fixation = wait_for_fixation
+        self.compute_failures = []
 
     def _call(self, step, build, timeout_s=COMMAND_TIMEOUT_S):
         self.log('command', step=step)
@@ -331,18 +376,36 @@ subscribed.
             raise CalibrationFailed('calibration start (1010)', error) from error
         step = 'calibration clear (1060)'
         try:
-            self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_CLEAR))
-            if self.previous is not None:
-                step = 'apply previous calibration (1110)'
-                self._call(step, lambda rid: gd.calibration_apply(rid, self.previous.blob), TRANSFER_TIMEOUT_S)
-            for number, stage in enumerate(self.stages):
-                for index in stage:
-                    step = f'target {index}'
-                    self._collect(number, stage, index)
-                step = f'compute stage {number} (1070)'
-                self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY),
-                           COMPUTE_TIMEOUT_S)
-                self._while_reading(self.ui.stage_done, number)
+            for attempt in range(self.restarts + 1):
+                if attempt:
+                    step = 'restart: calibration start (1010)'
+                    self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_START))
+                step = 'calibration clear (1060)'
+                self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_CLEAR))
+                if self.previous is not None:
+                    step = 'apply previous calibration (1110)'
+                    self._call(step, lambda rid: gd.calibration_apply(rid, self.previous.blob), TRANSFER_TIMEOUT_S)
+                failed_stage = None
+                for number, stage in enumerate(self.stages):
+                    for index in stage:
+                        step = f'target {index}'
+                        self._collect(number, stage, index)
+                    step = f'compute stage {number} (1070)'
+                    try:
+                        self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY),
+                                   COMPUTE_TIMEOUT_S)
+                    except Exception as error:
+                        if 'PROTOCOL_OPERATION_FAILED' not in str(error) or attempt == self.restarts:
+                            raise
+                        failed_stage = number
+                        break
+                    self._while_reading(self.ui.stage_done, number)
+                if failed_stage is None:
+                    break
+                self._record_compute_failure(failed_stage, attempt)
+                step = 'restart: calibration stop (1020)'
+                self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_STOP))
+                self._while_reading(self.ui.restarting, attempt + 1)
             step = 'calibration stop (1020)'
             self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_STOP))
         except BaseException as error:
@@ -353,10 +416,42 @@ subscribed.
         self._unsubscribe()
         return self._outcome()
 
+    def _record_compute_failure(self, stage, attempt):
+        """Log the device's view of the collected targets (1120, read only) before restarting."""
+        try:
+            points = read_stimulus_points(self.session)
+        except Exception as error:
+            points = ()
+            self.log('stimulus_points_failed', error=str(error))
+        self.compute_failures.append((stage, attempt, points))
+        self.log('compute_failed', stage=stage, attempt=attempt, stimulus_points=quality_report(points))
+
+    def _await_fixation(self, index):
+        """Read until both eyes are valid and the gaze has been still, or FIXATION_TIMEOUT_S passes."""
+        gaze_id = wire_stream_id(Stream.GAZE)
+        self.session.pending_streams.clear()
+        samples = []
+        deadline = time.monotonic() + FIXATION_TIMEOUT_S
+        while time.monotonic() < deadline:
+            self._read_once()
+            for message in self.session.pending_streams:
+                if message.kind == STREAM_DATA_KIND and message.command == gaze_id:
+                    sample = binocular_sample(message)
+                    if sample is not None:
+                        samples.append(sample)
+            self.session.pending_streams.clear()
+            if fixation(samples):
+                self.log('fixation', target=index, samples=len(samples), stable=True)
+                return True
+        self.log('fixation', target=index, samples=len(samples), stable=False)
+        return False
+
     def _collect(self, stage_number, stage, index):
         x, y = self.targets[index]
         for attempt in range(1, self.max_attempts + 1):
             self._while_reading(self.ui.show_point, index, x, y)
+            if self.wait_for_fixation:
+                self._await_fixation(index)
             self.session.pending_streams.clear()
             started = time.monotonic()
             self._call(f'collect target {index} (1030)',

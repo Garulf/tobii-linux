@@ -128,6 +128,10 @@ class LoggedUI(cal.CalibrationUI):
         emit('stage_done', stage=stage)
         self.inner.stage_done(stage)
 
+    def restarting(self, attempt):
+        emit('restarting', attempt=attempt)
+        self.inner.restarting(attempt)
+
 
 def calibrate(session, args):
     display_mm = cal.read_display_size(session)
@@ -153,6 +157,7 @@ def calibrate(session, args):
     device = dry_run(session, args.dry_run)
     calibrator = cal.Calibrator(device, LoggedUI(ui), targets=targets, focus=focus,
                                 previous=before if args.improve else None,
+                                wait_for_fixation=args.ui == 'page' and not args.dry_run,
                                 log=lambda kind, **v: emit(kind, **v))
     try:
         return run_and_save(session, args, calibrator, before, page)
