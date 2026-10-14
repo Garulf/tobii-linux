@@ -14,7 +14,8 @@ from tobii_linux.head_pose_pipeline import HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body, encode_envelope
 from tobii_linux.prp_service import (
     FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_REPLY_PIPE,
-    GAZE_SERVICE_STREAMS, DisplayArea, GazeHub, HeadPoseHub, PrpService, parse_display_area,
+    GAZE_SERVICE_STREAMS, DisplayArea, GazeHub, HeadPoseHub, PrpService, UserPresence,
+    parse_display_area, presence_subscribe_time,
     decode_names, encode_frame, encode_pipe_open, error_response, gaze_package, property_error,
     read_frame, request_header, stream_package, synthetic_gaze_frame)
 from tobii_linux.prp_session import (
@@ -103,6 +104,26 @@ REAL_SUBSCRIBE_RESPONSES = {
     (0x6, 0x4):
         "545052503c000000685052500c000000060000000a000000040000000c000000000000000500000004000000"
         "08000000040000000400000008000000000000000400000000000000",
+}
+# Exclusive mode (5) and presence (0x14), live (Windows), evidence/private/robust-live/prop5.jsonl.
+REAL_EXCLUSIVE_MODE_GET = bytes.fromhex(
+    "5450525030000000645052500c0000000200000006000000040000000c000000000000000500000004000000"
+    "08000000000000000400000000000000")
+REAL_SUBSCRIBE_RESPONSES.update({
+    (0x4, 0x5):
+        "545052503c000000685052500c000000040000000a000000040000000c000000000000000500000004000000"
+        "08000000050000000400000008000000000000000400000000000000",
+    (0x6, 0x14):
+        "5450525044000000105052500c000000060000000a000000040000000c000000110000000500000004000000"
+        "080000001400000004000000100000000000000000000000000000000400000000000000",
+})
+# The real service left memory uninitialised in these answers: the display id string's
+# padding, and the refused 0x13 block (it held display id text).
+UNINITIALISED_SUBSCRIBE_BYTES = {(5, 0x12), (5, 0x13)}
+REAL_UNSUBSCRIBE_LICENSED = {
+    (0x9, 0x14):
+        "5450525030000000645052500c000000090000000a000000040000000c000000110000000600000004000000"
+        "08000000140000000400000000000000",
 }
 REAL_UNSUBSCRIBE_RESPONSES = {
     (0x7, 0x1):
@@ -211,10 +232,17 @@ def real_display_area() -> DisplayArea:
     return DisplayArea(floats[0:3], floats[3:6], floats[6:9])
 
 
-def presence_service(present: bool) -> PrpService:
-    hub = HeadPoseHub()
-    hub.publish(HeadPoseSample(REAL_PRESENCE_SINCE_US, present, (0.0,) * 3, (0.0,) * 3))
-    return PrpService(hub, "ET5-TEST", clock=lambda: FIXED_CLOCK_US)
+def presence_service(platmod_value: int) -> PrpService:
+    service = PrpService(HeadPoseHub(), "ET5-TEST", clock=lambda: FIXED_CLOCK_US)
+    service.publish_presence(REAL_PRESENCE_SINCE_US, platmod_value)
+    return service
+
+
+# Emulated game DLL serializer 0x18004f730 on a queued presence record (tools/presence_oracle.py):
+# timestamp 0x112233445566, value 1.
+ORIGINAL_PRESENCE_NOTIFICATION = bytes.fromhex(
+    "5450525034000000605052500c000000000000000200000004000000080000000b000000040000001000000022"
+    "11000066554433010000000400000000000000")
 
 
 class PropertyVectorTests(unittest.TestCase):
@@ -264,7 +292,7 @@ class PropertyVectorTests(unittest.TestCase):
                                  property_error(5, property_id))
 
     def test_subscribe_responses(self):
-        service = presence_service(False)
+        service = presence_service(gaze.PLATMOD_AWAY)
         service.display_area = real_display_area()
         for (tag, property_id), expected in REAL_SUBSCRIBE_RESPONSES.items():
             with self.subTest(property_id=property_id):
@@ -272,19 +300,39 @@ class PropertyVectorTests(unittest.TestCase):
                 self.assertEqual(encode_property_subscribe_response(response),
                                  bytes.fromhex(expected))
 
-    def test_presence_follows_sample_validity(self):
-        for present, wire in ((False, 2), (True, 3)):
-            with self.subTest(present=present):
-                response = presence_service(present).answer_property(1, 0xB, subscribe=True)
+    def test_presence_follows_the_device(self):
+        for platmod, wire in ((gaze.PLATMOD_UNKNOWN, 1), (gaze.PLATMOD_AWAY, 2),
+                              (gaze.PLATMOD_PRESENT, 3)):
+            with self.subTest(platmod=platmod):
+                response = presence_service(platmod).answer_property(1, 0xB, subscribe=True)
                 self.assertEqual(struct.unpack("<IIII", response.block),
                                  (0x10, REAL_PRESENCE_SINCE_US >> 32,
                                   REAL_PRESENCE_SINCE_US & 0xFFFFFFFF, wire))
 
-    def test_presence_time_is_the_last_change(self):
-        hub = HeadPoseHub()
-        for timestamp, valid in ((10, False), (20, False), (30, True), (40, True)):
-            hub.publish(HeadPoseSample(timestamp, valid, (0.0,) * 3, (0.0,) * 3))
-        self.assertEqual((hub.present, hub.presence_since_us), (True, 30))
+    def test_presence_is_refused_before_any_record(self):
+        service = PrpService(HeadPoseHub(), "ET5-TEST")
+        self.assertEqual(service.answer_property(1, 0xB, subscribe=True), property_error(1, 0xB))
+
+    def test_every_record_after_the_first_is_notified(self):
+        presence = UserPresence()
+        notified = [presence.record(time_us, value)
+                    for time_us, value in ((10, 0), (20, 1), (30, 1), (40, 2))]
+        self.assertEqual(notified, [False, True, True, True])
+        self.assertEqual((presence.value, presence.since_us, presence.present), (3, 40, True))
+        presence.clear()
+        self.assertFalse(presence.record(50, 2))
+
+    def test_notification_matches_the_original_serializer(self):
+        presence = UserPresence()
+        presence.record(0x112233445566, gaze.PLATMOD_UNKNOWN)
+        self.assertEqual(presence.notification(), ORIGINAL_PRESENCE_NOTIFICATION)
+
+    def test_subscribe_time_leads_the_tracker_by_30_ms(self):
+        self.assertEqual(presence_subscribe_time(900_000_000_000), 899_999_970_000)
+        self.assertEqual(presence_subscribe_time(12_345), 12_345)
+
+    def test_exclusive_mode_get(self):
+        self.assertEqual(self.reply(2, 5), REAL_EXCLUSIVE_MODE_GET)
 
     def test_unsubscribe_responses(self):
         for (tag, property_id), expected in REAL_UNSUBSCRIBE_RESPONSES.items():
@@ -303,15 +351,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.hub = HeadPoseHub()
         self.service = PrpService(self.hub, "ET5-TEST", clock=lambda: FIXED_CLOCK_US)
+        self.attach()
         self.server = await self.service.serve("127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
         self.channels = []
 
+    def attach(self):
+        self.service.attach_tracker()
+        self.service.publish_presence(REAL_PRESENCE_SINCE_US, gaze.PLATMOD_AWAY)
+
     async def asyncTearDown(self):
         for channel in self.channels:
             channel.close()
-        self.server.close()
-        await self.server.wait_closed()
+        await self.service.close(self.server)
 
     async def channel(self, pipe, **kwargs):
         channel = await RelayedChannel.open(self.port, pipe, **kwargs)
@@ -508,10 +560,137 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_property_subscribe_carries_a_value_block(self):
         command, _, _, tags, _, _ = await self.session()
         tag = tags.next_command_tag()
-        command.send_packet(encode_property_subscribe_request(tag, 5))
+        command.send_packet(encode_property_subscribe_request(tag, 3))
         response = decode_property_subscribe_response(await command.packet())
-        self.assertEqual((response.tag, response.status, response.property_id), (tag, 2, 5))
+        self.assertEqual((response.tag, response.status, response.property_id), (tag, 2, 3))
         self.assertEqual(response.block, struct.pack("<II", 8, 0))
+
+    async def test_every_property_subscription_matches_the_real_service(self):
+        """Commands 5 and 6 for properties 1 to 24 against the real service's answers.
+
+The real run (field_of_use 2) is in tests/data/real-property-subscriptions.json.
+"""
+        import json
+        from pathlib import Path
+        real = json.loads((Path(__file__).resolve().parent/'data/real-property-subscriptions.json')
+                          .read_text())
+        self.service.display_area = real_display_area()
+        self.service.display_id = REAL_DISPLAY_ID
+        self.service.calibration_id = 0xBC381A37
+        self.service.presence.clear()
+        self.service.publish_presence(0xD4_41C5_AAA6, gaze.PLATMOD_AWAY)
+        command, subscription, _, tags, _, _ = await self.session_with_field_of_use(2)
+        for command_id in (5, 6):
+            key = 'subscribe' if command_id == 5 else 'unsubscribe'
+            for property_id, vector in sorted(real[key].items(), key=lambda item: int(item[0])):
+                with self.subTest(command=command_id, property_id=int(property_id)):
+                    command.send_packet(encode_property_subscribe_request(
+                        vector['tag'], int(property_id), command_id))
+                    packet, expected = await command.packet(), bytes.fromhex(vector['hex'])
+                    if (command_id, int(property_id)) in UNINITIALISED_SUBSCRIBE_BYTES:
+                        self.assertEqual(len(packet), len(expected))
+                        self.assertEqual(packet[:52], expected[:52])
+                    else:
+                        self.assertEqual(packet, expected)
+
+    async def session_with_field_of_use(self, field_of_use):
+        command = await self.channel("ET5-TEST")
+        info = await command.handshake(COMMAND_CHANNEL, "client_TOBIIPRP-ET5-TEST_00001234_1")
+        subscription = await self.channel(info.subscription_url.removeprefix("prp-internal://"))
+        sub_info = await subscription.handshake(SUBSCRIPTION_CHANNEL, "client_sub")
+        tags = ClientSession()
+        tag = tags.next_command_tag()
+        command.send_packet(encode_connect_request(tag, ConnectRequest(
+            sub_info.client_id, process_id=CLIENT_PID, field_of_use=field_of_use)))
+        packet = await command.packet()
+        return command, subscription, info, tags, tag, packet
+
+    async def test_licensed_presence_unsubscribe_matches_the_real_service(self):
+        command, *_ = await self.session()
+        for (tag, property_id), expected in REAL_UNSUBSCRIBE_LICENSED.items():
+            command.send_packet(encode_property_subscribe_request(tag, property_id,
+                                                                  COMMAND_PROPERTY_UNSUBSCRIBE))
+            self.assertEqual(await command.packet(), bytes.fromhex(expected))
+
+    async def closed(self, channel):
+        """The service closed `channel`; messages it sent before closing are skipped."""
+        with self.assertRaises((asyncio.IncompleteReadError, ConnectionError)):
+            for _ in range(1000):
+                await channel.receive()
+
+    async def subscribe_presence(self, command, tags):
+        tag = tags.next_command_tag()
+        command.send_packet(encode_property_subscribe_request(tag, 0xB))
+        return decode_property_subscribe_response(await command.packet())
+
+    async def test_presence_changes_reach_only_subscribed_clients(self):
+        watching, watching_sub, _, watching_tags, _, _ = await self.session()
+        other, other_sub, _, other_tags, _, _ = await self.session()
+        response = await self.subscribe_presence(watching, watching_tags)
+        self.assertEqual(struct.unpack("<IIII", response.block)[3], 2)
+        self.service.publish_presence(FIXED_CLOCK_US + 10, gaze.PLATMOD_PRESENT)
+        notification = await watching_sub.packet()
+        self.assertEqual(notification, self.service.presence.notification())
+        self.assertEqual(struct.unpack_from("<3I", decode_envelope(notification)), (12, 0, 2))
+        with self.assertRaises(asyncio.TimeoutError):
+            await other_sub.packet(timeout=0.2)
+        tag = watching_tags.next_command_tag()
+        watching.send_packet(encode_property_subscribe_request(tag, 0xB,
+                                                               COMMAND_PROPERTY_UNSUBSCRIBE))
+        await watching.packet()
+        self.service.publish_presence(FIXED_CLOCK_US + 20, gaze.PLATMOD_AWAY)
+        with self.assertRaises(asyncio.TimeoutError):
+            await watching_sub.packet(timeout=0.2)
+        self.assertEqual(self.service.sent_notifications, 1)
+
+    async def test_two_clients_receive_every_sample(self):
+        clients = [await self.session() for _ in range(2)]
+        for command, _, _, tags, _, _ in clients:
+            command.send_packet(encode_stream_request(tags.next_command_tag(),
+                                                      COMMAND_STREAM_START, HEAD_POSE))
+            self.assertEqual(decode_command_response(await command.packet()).status, 0)
+        samples = [HeadPoseSample(FIXED_CLOCK_US + i, True, (float(i), 0.0, 600.0), (0.0,) * 3)
+                   for i in range(3)]
+        for sample in samples:
+            self.hub.publish(sample)
+            await asyncio.sleep(0.01)
+        for _, subscription, *_ in clients:
+            self.assertEqual([await subscription.packet() for _ in samples],
+                             [stream_package(sample) for sample in samples])
+        first_command, first_sub, _, first_tags, _, _ = clients[0]
+        first_command.send_packet(encode_stream_request(first_tags.next_command_tag(),
+                                                        COMMAND_STREAM_STOP, HEAD_POSE))
+        await first_command.packet()
+        self.hub.publish(samples[0])
+        self.assertEqual(await clients[1][1].packet(), stream_package(samples[0]))
+        with self.assertRaises(asyncio.TimeoutError):
+            await first_sub.packet(timeout=0.2)
+
+    async def test_closing_the_command_channel_closes_its_subscription(self):
+        command, subscription, *_ = await self.session()
+        command.close()
+        await self.closed(subscription)
+        for _ in range(50):
+            if not self.service.subscriptions:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual(self.service.subscriptions, {})
+
+    async def test_tracker_loss_closes_clients_until_it_is_back(self):
+        command, subscription, _, tags, _, _ = await self.session()
+        command.send_packet(encode_stream_request(tags.next_command_tag(), COMMAND_STREAM_START,
+                                                  HEAD_POSE))
+        await command.packet()
+        self.service.detach_tracker()
+        await self.closed(command)
+        await self.closed(subscription)
+        self.assertEqual(self.hub.queues, set())
+        refused = await self.channel("ET5-TEST")
+        refused.send(encode_client_hello(ClientHello(COMMAND_CHANNEL, "client_cmd")))
+        await self.closed(refused)
+        self.attach()
+        *_, packet = await self.session()
+        self.assertEqual(decode_command_response(packet).status, 0)
 
     async def test_pid_mismatch_closes_connection(self):
         command = await self.channel("ET5-TEST", client_pid=CLIENT_PID)
@@ -554,22 +733,10 @@ class GazeServiceTests(ServiceTests):
         self.hub, self.gaze_hub = HeadPoseHub(), GazeHub()
         self.service = PrpService(self.hub, "ET5-TEST", clock=lambda: FIXED_CLOCK_US,
                                   gaze_hub=self.gaze_hub)
+        self.attach()
         self.server = await self.service.serve("127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
         self.channels = []
-
-    def test_device_presence_replaces_head_pose_validity(self):
-        hub = HeadPoseHub()
-        hub.publish(HeadPoseSample(10, True, (0.0,) * 3, (0.0,) * 3))
-        self.assertEqual(hub.presence, 3)
-        hub.publish_presence(20, 1)
-        hub.publish(HeadPoseSample(30, True, (0.0,) * 3, (0.0,) * 3))
-        self.assertEqual((hub.presence, hub.presence_since_us, hub.present), (2, 20, False))
-        hub.publish_presence(40, 2)
-        hub.publish_presence(50, 2)
-        self.assertEqual((hub.presence, hub.presence_since_us), (3, 40))
-        hub.publish_presence(60, 7)
-        self.assertEqual(hub.presence, 1)
 
     async def test_connect_lists_the_real_service_gaze_streams(self):
         *_, packet = await self.session()

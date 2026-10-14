@@ -199,7 +199,18 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(gaze[1]['point'])
         self.assertEqual(len(published.wait_for('gaze_columns')), 1)
         self.assertEqual(pipeline.status()['counters']['gaze_valid'], 1)
-        self.assertEqual(pipeline.status()['presence'], {'value': 2, 'state': 'present'})
+        self.assertEqual(pipeline.status()['presence'],
+                         {'value': 2, 'state': 'present', 'property_value': 3, 'since_us': 1,
+                          'notifications': 0})
+
+    def test_presence_is_unknown_until_the_device_reports(self):
+        pipeline = DemoPipeline(Collector(), AREA, head_pose=False)
+        pipeline.on_presence_subscribed()
+        self.assertEqual(pipeline.status()['presence']['state'], 'unknown')
+        pipeline.on_presence(Presence(7, 1))
+        presence = pipeline.status()['presence']
+        self.assertEqual((presence['state'], presence['property_value'], presence['notifications']),
+                         ('away', 2, 1))
 
     def test_missing_models_leave_camera_images_running(self):
         def broken(model_directory, display_area):
@@ -337,6 +348,53 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(received['status'][0]['mode'], 'replay')
         self.assertEqual(received['frame'][0]['width'], 4)
         self.assertIn(received['gaze'][0]['point'], ([0.4717, 1.1246], [0.6322, 0.0999], None))
+
+
+
+class LiveSourceReconnectTests(unittest.TestCase):
+    """LiveSource across a missing tracker, an unplug and a new session (scripted devices)."""
+
+    def test_sessions_restart_after_the_tracker_is_lost(self):
+        from contextlib import contextmanager
+        from unittest import mock
+        from tobii_linux import driver
+        from tobii_linux.demo import sources
+        from tobii_linux.supervisor import Backoff
+        from test_supervisor import StreamingDevice
+
+        devices = [None, StreamingDevice(), StreamingDevice()]
+        opened = []
+
+        @contextmanager
+        def usb_session(index, channel):
+            device = devices[min(len(opened), len(devices) - 1)]
+            opened.append(device)
+            if device is None:
+                raise driver.NoTrackerError('No Eye Tracker 5 is visible to libusb')
+            session = driver.TrackerSession(device)
+            session.initialize()
+            yield session
+
+        pipeline = DemoPipeline(Collector(), AREA, head_pose=False)
+        source = sources.LiveSource(pipeline, backoff=Backoff(first_s=0.01, max_s=0.02))
+        with mock.patch.object(sources, 'usb_session', usb_session):
+            source.start()
+            deadline = time.monotonic() + 5
+            while pipeline.status()['sessions'] < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.2)
+            devices[1].unplugged = True
+            while pipeline.status()['sessions'] < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.2)
+            source.stop()
+            self.assertTrue(source.join(5))
+        status = pipeline.status()
+        self.assertEqual((status['sessions'], status['lost_sessions']), (2, 1))
+        self.assertEqual(status['presence']['state'], 'present')
+        self.assertGreater(status['counters']['frames'], 0)
+        unsubscribed = [m for m in devices[2].log if m.command == 1230]
+        self.assertEqual(len(unsubscribed), 3)
 
 
 if __name__ == '__main__':

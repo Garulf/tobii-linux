@@ -1,5 +1,6 @@
 import itertools
 import json
+import time
 from pathlib import Path
 import sys
 import unittest
@@ -29,7 +30,7 @@ def image_message():
 
 
 def presence_message(timestamp, value):
-    payload = gaze.columns_payload({1: gaze.int64_column(timestamp), 2: gaze.uint32_column(value)})
+    payload = gaze.columns_payload({1: gaze.int64_column(timestamp), 2: gaze.int32_column(value)})
     return Message(tc.STREAM_DATA_KIND, 0, 0, tc.wire_stream_id(tc.Stream.PRESENCE), 0, payload)
 
 
@@ -178,8 +179,10 @@ class GazeAndImageStreamsTests(unittest.TestCase):
         device = ScriptedTracker(script, after=3)
         published, presences = [], []
         clock = HostClock()
+        any_order = streams.DeviceClockWatch(rewind_us=1 << 62)
         with GazeAndImageStreams(driver.TrackerSession(device), clock, published.append,
-                                 lambda t, v: presences.append((t, v)), silence_timeout_s=0.2) as live:
+                                 lambda t, v: presences.append((t, v)), silence_timeout_s=0.2,
+                                 device_clock=any_order) as live:
             frames = live.newest_frames()
             first = next(frames)
             remaining = []
@@ -195,11 +198,30 @@ class GazeAndImageStreamsTests(unittest.TestCase):
         for frame, device_us in zip(published, device_times):
             self.assertGreater(frame.timestamp_us, device_us + 4_000_000)
             self.assertEqual(frame.gaze_point.timestamp, frame.timestamp_us)
-        self.assertEqual(presences[0][1], 2)
+        self.assertEqual([value for _, value in presences], [gaze.PLATMOD_UNKNOWN, gaze.PLATMOD_PRESENT])
         self.assertGreater(mapped, first.timestamp)
         self.assertLessEqual(len([first, *remaining]), 2)
         commands = [m.command for m in device.log]
-        self.assertEqual(commands, [1220, 1220, 1220, 1230, 1230, 1230])
+        self.assertEqual(commands, [1220, 1220, 1220], 'a silent session is not asked to unsubscribe')
+
+    def test_stopping_unsubscribes_every_stream(self):
+        device = ScriptedTracker([image_message()] * 3, after=3)
+        with GazeAndImageStreams(driver.TrackerSession(device), HostClock(), lambda frame: None,
+                                 lambda t, v: None) as live:
+            next(live.newest_frames())
+            live.reader.stop()
+        self.assertEqual([m.command for m in device.log], [1220, 1220, 1220, 1230, 1230, 1230])
+
+    def test_device_clock_going_back_ends_the_session(self):
+        late, early = gaze.int64_column(900_000_000_000), gaze.int64_column(800_000_000_000)
+        script = [gaze.gaze_stream_message({1: late}), gaze.gaze_stream_message({1: early})]
+        device = ScriptedTracker(script)
+        session = driver.TrackerSession(device)
+        with self.assertRaisesRegex(driver.DeviceError, 'restarted'):
+            with GazeAndImageStreams(session, HostClock(), lambda frame: None) as live:
+                list(live.newest_frames())
+        self.assertTrue(session.dead)
+        self.assertEqual([m.command for m in device.log], [1220, 1220])
 
     def test_head_pose_and_gaze_yields_samples_on_the_host_clock(self):
         def processor(session, model_directory, display_area, camera=0):
@@ -214,6 +236,116 @@ class GazeAndImageStreamsTests(unittest.TestCase):
             samples.close()
         self.assertGreater(sample.timestamp_us, 123456789)
         self.assertEqual([m.command for m in device.log][-2:], [1230, 1230])
+
+
+class StallingTracker(ScriptedTracker):
+    """Streams one message per read while subscribed; goes silent for good after an unread gap.
+
+Models the live finding that the tracker stops sending stream data and replies
+for the rest of a session when its endpoint is not read for about a second.
+"""
+    def __init__(self, stall_s=0.3, after=2):
+        super().__init__([], after=after)
+        self.stall_s = stall_s
+        self.last_read = None
+        self.stalled = False
+        self.sent = 0
+
+    def write(self, data):
+        if not self.stalled:
+            super().write(data)
+
+    def read(self, timeout_ms):
+        now = time.monotonic()
+        streaming = self.subscriptions >= self.after
+        if streaming and self.last_read is not None and now - self.last_read > self.stall_s:
+            self.stalled = True
+        self.last_read = now
+        if self.stalled:
+            time.sleep(timeout_ms / 1000)
+            return b''
+        if self.outgoing:
+            return self.outgoing.pop(0)
+        if streaming:
+            self.sent += 1
+            message = image_message() if self.sent % 2 else gaze_message(PAYLOADS['both'])
+            time.sleep(0.005)
+            return message.encode()
+        return b''
+
+
+class SlowConsumerTests(unittest.TestCase):
+    """The endpoint keeps being read while the consumer is slower than the stall limit."""
+    def test_live_streams_keep_reading_under_slow_processing(self):
+        device = StallingTracker()
+        gaze_frames = []
+        any_order = streams.DeviceClockWatch(rewind_us=1 << 62)
+        with GazeAndImageStreams(driver.TrackerSession(device), HostClock(), gaze_frames.append,
+                                 device_clock=any_order) as live:
+            frames = live.newest_frames()
+            for _ in range(2):
+                next(frames)
+                time.sleep(0.5)
+            next(frames)
+            live.reader.stop()
+        self.assertFalse(device.stalled)
+        self.assertGreater(len(gaze_frames), 20)
+
+    def test_head_pose_samples_keep_reading_under_slow_processing(self):
+        def processor(session, model_directory, display_area, camera=0):
+            return lambda frame: (time.sleep(0.5),
+                                  HeadPoseSample(frame.timestamp, True, (0.0,) * 3, (0.0,) * 3))[1]
+
+        device = StallingTracker(after=1)
+        with mock.patch.object(driver, 'head_pose_processor', processor):
+            samples = driver.head_pose_samples(driver.TrackerSession(device), None, None)
+            for _ in range(3):
+                next(samples)
+        self.assertFalse(device.stalled)
+
+    def test_drained_items_survive_a_slow_consumer(self):
+        device = StallingTracker()
+        reader = StreamReader(driver.TrackerSession(device))
+        with reader:
+            items = streams.drained(reader.items(silence_timeout_s=1))
+            for _ in range(3):
+                next(items)
+                time.sleep(0.5)
+            reader.stop()
+            remaining = list(items)
+        self.assertFalse(device.stalled)
+        self.assertGreater(len(remaining), 20)
+
+    def test_a_stalled_session_is_dead_and_not_asked_again(self):
+        device = StallingTracker()
+        session = driver.TrackerSession(device)
+        reader = StreamReader(session)
+        with self.assertRaises(driver.DeviceError):
+            with reader:
+                items = reader.items(silence_timeout_s=0.3)
+                next(items)
+                time.sleep(0.5)
+                list(items)
+        self.assertTrue(device.stalled)
+        self.assertTrue(session.dead)
+        self.assertEqual([m.command for m in device.log], [1220, 1220])
+
+
+class SuspendTests(unittest.TestCase):
+    def test_suspend_watch_notices_boottime_running_ahead(self):
+        gaps = iter([10.0, 10.1, 10.2, 75.0, 75.1])
+        watch = streams.SuspendWatch(lambda: next(gaps))
+        self.assertEqual([watch.resumed() for _ in range(4)], [False, False, True, False])
+
+    def test_resume_ends_the_session(self):
+        gaps = iter([0.0] + [0.0] * 3 + [60.0] * 100)
+        device = ScriptedTracker([image_message()] * 50)
+        session = driver.TrackerSession(device)
+        reader = StreamReader(session, suspend_watch=streams.SuspendWatch(lambda: next(gaps)))
+        with self.assertRaisesRegex(driver.DeviceError, 'suspended'):
+            with reader:
+                list(reader.items(silence_timeout_s=1))
+        self.assertTrue(session.dead)
 
 
 if __name__ == '__main__':

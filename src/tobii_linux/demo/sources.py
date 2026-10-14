@@ -6,16 +6,16 @@ import statistics
 import threading
 import time
 
-from ..driver import CameraCalibration, DeviceError
+from ..supervisor import Backoff
+from ..driver import CameraCalibration, NoTrackerError, usb_session
 from .. import gaze
 from ..frames import ImageFrame
 from ..ttp import ProtocolError
 from ..ttp_commands import Command, Stream, header_only_request
 
-RETRY_S = 3.0
 DEVICE_INFO_FIELDS = ('serial_number', 'model', 'generation', 'firmware_version')
-NO_TRACKER = ('No Eye Tracker 5 is visible to libusb. On WSL attach it with '
-              "'usbipd attach --wsl --busid <id>'; on Linux check the cable and the udev rule.")
+NO_TRACKER_HINT = ("On WSL attach it with 'usbipd attach --wsl --busid <id>'; "
+                   'on Linux check the cable and the udev rule.')
 MAX_REPLAY_GAP_S = 0.5
 
 
@@ -33,10 +33,6 @@ def device_info(session):
     info.update({f'value_{index}': v for index, v in enumerate(values[len(DEVICE_INFO_FIELDS):],
                                                                 len(DEVICE_INFO_FIELDS))})
     return info
-
-
-class NoTrackerError(RuntimeError):
-    pass
 
 
 class SourceThread:
@@ -62,14 +58,21 @@ class SourceThread:
 
 
 class LiveSource(SourceThread):
-    """One USB session subscribed to gaze and images; reconnects every few seconds after a failure."""
+    """One USB session subscribed to gaze, images and presence; starts a new one after any failure.
+
+The endpoint is read on its own thread (streams.drained) so slow browser
+publishing never stalls the tracker; a silent session, a restarted tracker
+or a host resume ends the session, and the next attempt follows a growing
+delay (supervisor.Backoff).
+"""
     name = 'live'
 
-    def __init__(self, pipeline, index=0, channel=0):
+    def __init__(self, pipeline, index=0, channel=0, backoff=None):
         super().__init__()
         self.pipeline = pipeline
         self.index, self.channel = index, channel
         self.reader = None
+        self.backoff = backoff or Backoff()
 
     def stop(self):
         super().stop()
@@ -78,52 +81,43 @@ class LiveSource(SourceThread):
             reader.stop()
 
     def run(self, stop):
-        from ..usb import USBError
         while not stop.is_set():
+            started = time.monotonic()
             try:
-                self.session(stop)
+                self.pipeline.set_connection('connecting', 'Starting the tracker')
+                with usb_session(self.index, self.channel) as session:
+                    self.session(session, stop)
             except NoTrackerError as error:
-                self.pipeline.set_connection('no-device', str(error))
-            except (USBError, DeviceError, ProtocolError, OSError, RuntimeError, ValueError) as error:
+                self.pipeline.set_connection('no-device', f'{error}. {NO_TRACKER_HINT}')
+            except Exception as error:
                 message = f'{type(error).__name__}: {error}'
                 self.pipeline.report_error(message)
                 self.pipeline.set_connection('error', message)
+                self.pipeline.on_session_lost()
             if not stop.is_set():
-                stop.wait(RETRY_S)
+                stop.wait(self.backoff.delay(time.monotonic() - started))
         self.pipeline.set_connection('stopped', 'Stopped')
 
-    def session(self, stop):
-        from ..driver import TrackerSession
-        from ..streams import StreamReader
-        from ..usb import USBContext
-        from ..usb_channel import USBChannel
-        with USBContext() as context:
-            devices = context.probe()
-            if not devices:
-                raise NoTrackerError(NO_TRACKER)
-            if self.index >= len(devices):
-                raise NoTrackerError(f'Tracker index {self.index} requested, {len(devices)} visible')
-            device = devices[self.index]
-            self.pipeline.set_connection('connecting', f"Starting the tracker on bus {device['bus']}")
-            with context.open_transport(bus=device['bus'], address=device['address']) as transport:
-                with USBChannel(transport, self.channel) as channel:
-                    session = TrackerSession(channel)
-                    session.initialize()
-                    info = device_info(session)
-                    calibration = session.camera_calibration()
-                    self.pipeline.on_session(calibration, info, {
-                        'bus': device['bus'], 'address': device['address'], 'channel': self.channel,
-                        'camera_translation': list(calibration.translation),
-                        'camera_angles': list(calibration.angles)})
-                    reader = StreamReader(session, (Stream.GAZE, Stream.IMAGE, Stream.PRESENCE),
-                                          optional=(Stream.PRESENCE,))
-                    self.reader = self.pipeline.reader = reader
-                    if stop.is_set():
-                        return
-                    with reader:
-                        self.pipeline.set_connection('streaming', 'Streaming gaze and images')
-                        self.dispatch(reader.items())
-                    self.pipeline.set_connection('stopping', 'Unsubscribed the tracker streams')
+    def session(self, session, stop):
+        from ..streams import StreamReader, SuspendWatch, drained
+        info = device_info(session)
+        calibration = session.camera_calibration()
+        device = session.usb_device
+        self.pipeline.on_session(calibration, info, {
+            'bus': device.get('bus'), 'address': device.get('address'), 'channel': self.channel,
+            'camera_translation': list(calibration.translation),
+            'camera_angles': list(calibration.angles)})
+        reader = StreamReader(session, (Stream.GAZE, Stream.IMAGE, Stream.PRESENCE),
+                              optional=(Stream.PRESENCE,), suspend_watch=SuspendWatch())
+        self.reader = self.pipeline.reader = reader
+        if stop.is_set():
+            return
+        with reader:
+            if Stream.PRESENCE in reader.subscribed:
+                self.pipeline.on_presence_subscribed()
+            self.pipeline.set_connection('streaming', 'Streaming gaze and images')
+            self.dispatch(drained(reader.items()))
+        self.pipeline.set_connection('stopping', 'Unsubscribed the tracker streams')
 
     def dispatch(self, items):
         handlers = {Stream.IMAGE: self.pipeline.on_frame, Stream.GAZE: self.pipeline.on_gaze,

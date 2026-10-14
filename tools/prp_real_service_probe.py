@@ -360,10 +360,25 @@ def notifications(reader, seconds):
         emit("subscription_packet", client_received_us=received_at, **stream_package(packet))
 
 
+def property_notification(payload):
+    """Operation 2: {8, property} {4} <value block> as decoder 0x180055780 reads it."""
+    header_size, tag, _ = struct.unpack_from("<3I", payload)
+    offset = header_size + struct.unpack_from("<I", payload, header_size)[0]
+    block_size, property_id = struct.unpack_from("<II", payload, offset)
+    offset += block_size
+    offset += struct.unpack_from("<I", payload, offset)[0]
+    value_size = struct.unpack_from("<I", payload, offset)[0]
+    words = struct.unpack_from(f"<{value_size // 4}I", payload, offset)
+    return {"message_tag": tag, "property_id": property_id,
+            "value_block": [f"{word:08x}" for word in words]}
+
+
 def stream_package(packet):
     """Parse operation 1 packages: head pose and gaze points decoded, every package kept raw."""
     payload = decode_envelope(packet)
     words = struct.unpack_from("<7I", payload)
+    if words[0] == 12 and words[2] == 2:
+        return {"operation": 2, **property_notification(payload), "raw": packet.hex()}
     if words[0] != 12 or words[2] != 1:
         return {"operation": words[2], "raw": packet.hex()}
     body_size = struct.unpack_from("<I", payload, 28)[0]
@@ -456,8 +471,9 @@ def worker(args):
             subscribe_properties(command, commands, session, args.subscribe_property,
                                  COMMAND_PROPERTY_SUBSCRIBE)
             notifications(packages, 1.0)
-            subscribe_properties(command, commands, session, args.subscribe_property,
-                                 COMMAND_PROPERTY_UNSUBSCRIBE)
+            if not args.hold_properties:
+                subscribe_properties(command, commands, session, args.subscribe_property,
+                                     COMMAND_PROPERTY_UNSUBSCRIBE)
         started = []
         for stream in args.stream:
             tag = session.next_command_tag()
@@ -471,13 +487,19 @@ def worker(args):
             parsed = stream_package(packet)
             count += 1
             emit("stream_package", client_received_us=received_at, **parsed)
-        if COMMAND_TIMESYNC in connect.connect.supported_commands:
-            timesync(state, session, 4)
-        for stream in started:
-            tag = session.next_command_tag()
-            command.send_packet(encode_stream_request(tag, COMMAND_STREAM_STOP, stream))
-            stop = commands.response(tag, 5.0)
-            emit("stream_stop_response", stream=stream, status=stop.status, value=stop.value)
+        try:
+            if COMMAND_TIMESYNC in connect.connect.supported_commands:
+                timesync(state, session, 4)
+            for stream in started:
+                tag = session.next_command_tag()
+                command.send_packet(encode_stream_request(tag, COMMAND_STREAM_STOP, stream))
+                stop = commands.response(tag, 5.0)
+                emit("stream_stop_response", stream=stream, status=stop.status, value=stop.value)
+            if args.subscribe_property and args.hold_properties:
+                subscribe_properties(command, commands, session, args.subscribe_property,
+                                     COMMAND_PROPERTY_UNSUBSCRIBE)
+        except PipeError as exc:
+            emit("error_after_window", message=str(exc))
         late = sum(1 for _ in packages.packets(0.5))
         emit("summary", packages=count, packages_after_stop=late, seconds=args.seconds)
     finally:
@@ -498,13 +520,18 @@ def main():
     parser.add_argument("--subscribe-property", type=lambda text: int(text, 0), action="append",
                         default=[], help="property id to subscribe with command 5 and "
                                          "unsubscribe with command 6 afterwards (repeatable)")
+    parser.add_argument("--hold-properties", action="store_true",
+                        help="keep the --subscribe-property subscriptions while the streams "
+                             "run and record their operation 2 notifications")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="start no stream; with --hold-properties only notifications arrive")
     parser.add_argument("--stream", type=lambda text: int(text, 0), action="append",
                         help="PRP stream id to start and record (repeatable, default 2)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    args.stream = args.stream or [HEAD_POSE_STREAM]
-    if not 0 < args.seconds <= 30:
-        parser.error("seconds must be in (0, 30]")
+    args.stream = [] if args.no_stream else args.stream or [HEAD_POSE_STREAM]
+    if not 0 < args.seconds <= 120:
+        parser.error("seconds must be in (0, 120]")
     if args.worker:
         try:
             return worker(args)
@@ -516,6 +543,7 @@ def main():
     command += [f"--property={property_id}" for property_id in args.property]
     command += [f"--subscribe-property={property_id}" for property_id in args.subscribe_property]
     command += [f"--stream={stream}" for stream in args.stream]
+    command += ["--hold-properties"] * args.hold_properties + ["--no-stream"] * args.no_stream
     try:
         return subprocess.run(command, timeout=args.seconds + 30).returncode
     except subprocess.TimeoutExpired:

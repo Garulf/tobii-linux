@@ -6,13 +6,16 @@ import threading
 import time
 
 from .. import gaze
+from ..prp_service import UserPresence
+from ..streams import Presence
 from ..ttp_commands import Stream
 from .events import frame_event, gaze_columns_event, gaze_event, mesh_topology_event, pose_event
 
 LOG = logging.getLogger('tobii_linux.demo')
 MAX_ERRORS = 20
 GAZE_COLUMNS_INTERVAL_S = 0.25
-PRESENCE_STATES = {gaze.PRESENCE_AWAY: 'away', gaze.PRESENCE_PRESENT: 'present'}
+PRESENCE_STATES = {gaze.PRESENCE_UNKNOWN: 'unknown', gaze.PRESENCE_AWAY: 'away',
+                   gaze.PRESENCE_PRESENT: 'present'}
 RATE_WINDOW_S = 2.0
 
 
@@ -162,6 +165,9 @@ a frame is being processed are dropped and head pose never falls behind.
             'disabled', 'Head pose disabled')
         self.reader = None
         self.presence = None
+        self.user_presence = UserPresence()
+        self.presence_notifications = 0
+        self.sessions = self.lost_sessions = 0
         self.counts = {'frames': 0, 'processed': 0, 'gaze': 0, 'gaze_valid': 0, 'gaze_errors': 0}
         self.rates = {name: RateMeter() for name in ('camera', 'processed', 'gaze', 'gaze_valid')}
         self.processing_ms = None
@@ -198,6 +204,7 @@ a frame is being processed are dropped and head pose never falls behind.
 
     def on_session(self, calibration, device, details=None):
         with self.lock:
+            self.sessions += 1
             self.device = dict(device)
             self.session_details = dict(details or {})
             self.calibration = calibration
@@ -209,9 +216,24 @@ a frame is being processed are dropped and head pose never falls behind.
         self.slot.put(frame)
 
     def on_presence(self, presence):
+        """A device presence record, kept as the game service keeps property 0xB."""
         with self.lock:
-            self.presence = {'value': presence.value, 'state': PRESENCE_STATES.get(
-                gaze.prp_presence(gaze.platmod_presence(presence.value)), 'unknown')}
+            if self.user_presence.record(presence.timestamp_us, gaze.platmod_presence(presence.value)):
+                self.presence_notifications += 1
+            value = self.user_presence.value
+            self.presence = {'value': presence.value, 'state': PRESENCE_STATES[value],
+                             'property_value': value, 'since_us': self.user_presence.since_us,
+                             'notifications': self.presence_notifications}
+
+    def on_presence_subscribed(self):
+        """A new session subscribed presence: unknown until the device reports, as on Windows."""
+        with self.lock:
+            self.user_presence.clear()
+        self.on_presence(Presence(0, 0))
+
+    def on_session_lost(self):
+        with self.lock:
+            self.lost_sessions += 1
 
     def on_gaze(self, frame):
         self.counts['gaze'] += 1
@@ -300,7 +322,8 @@ a frame is being processed are dropped and head pose never falls behind.
                 'mode': self.mode, 'connection': self.connection, 'message': self.message,
                 'device': self.device, 'session': self.session_details,
                 'head_pose': {'state': self.head_pose_state, 'message': self.head_pose_message},
-                'presence': self.presence, 'errors': list(self.errors)}
+                'presence': self.presence, 'errors': list(self.errors),
+                'sessions': self.sessions, 'lost_sessions': self.lost_sessions}
         status.update({
             'uptime_s': round(time.monotonic() - self.started, 1),
             'display_area': display_area_status(self.display_area),

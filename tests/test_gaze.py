@@ -307,8 +307,27 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual({v: gaze.prp_presence(gaze.platmod_presence(v)) for v in expected}, expected)
 
     def test_presence_message(self):
-        payload = gaze.columns_payload({1: gaze.int64_column(123), 2: gaze.uint32_column(2)})
+        payload = gaze.columns_payload({1: gaze.int64_column(123), 2: gaze.int32_column(2)})
         self.assertEqual(gaze.presence_message(payload), (123, 2))
+
+    def test_recorded_presence_message_is_int32(self):
+        """0x504 as a Linux capture received it with a person in front (gaze-device)."""
+        payload = bytes.fromhex(
+            '0000050000000400020bb8050000000400020bb90200000004000000010600000008000000d18a5be71e'
+            '050000000400020bb9020000000400000002010000000400000002')
+        self.assertEqual(gaze.presence_message(payload), (899969443614, 2))
+
+    def test_presence_message_types_as_parse_presence(self):
+        timestamp = gaze.int64_column(5)
+        cases = {(1, 2): None, (2,): (5, 0), (3,): None}
+        payloads = {
+            (1, 2): {1: timestamp, 2: gaze.uint32_column(2)},
+            (2,): {1: timestamp, 9: gaze.uint32_column(4)},
+            (3,): {1: gaze.uint32_column(5), 2: gaze.int32_column(1)},
+        }
+        for key, columns in payloads.items():
+            with self.subTest(columns=key):
+                self.assertEqual(gaze.presence_message(gaze.columns_payload(columns)), cases[key])
 
 
 class OfflineConversionTests(unittest.TestCase):

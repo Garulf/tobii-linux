@@ -193,7 +193,9 @@ function definitionList(id, entries) {
 }
 
 function presenceText(presence) {
-  return presence ? `${presence.state} (device value ${presence.value})` : 'not reported';
+  if (!presence) return 'not reported';
+  const since = presence.since_us ? `, since ${fixed(presence.since_us / 1e6, 1, ' s')} device time` : '';
+  return `${presence.state} (game value ${presence.property_value}, device value ${presence.value}${since})`;
 }
 
 function label(key) {
@@ -214,6 +216,8 @@ function renderStatus(status) {
     ['Uptime', duration(status.uptime_s)],
     ['Head pose', status.head_pose.message],
     ['User presence', presenceText(status.presence)],
+    ['Presence changes pushed to games', status.presence ? status.presence.notifications : 0],
+    ['Tracker sessions', `${status.sessions} started, ${status.lost_sessions} lost`],
   ]);
   const device = Object.entries(status.device || {}).map(([key, value]) => [label(key), value]);
   definitionList('deviceList', device.length ? device : [['Device', 'Not connected']]);

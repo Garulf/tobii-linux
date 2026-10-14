@@ -62,6 +62,15 @@ next steps; detailed evidence is linked below.
   Wine the game DLL's integration layer reads gaze points
   ([gaze host](gaze-host.md)). Live device gaze is not yet fed into
   `cli serve`.
+- **Presence and robustness:** the device decides user presence; Linux read 0
+  only because it parsed the int32 presence column as uint32. `cli serve` now
+  serves property 0xB from stream `0x504` with operation 2 change
+  notifications (emulated and byte-checked), answers every property
+  subscription as the real service does, and survives unplugging, stalls and
+  host suspend by restarting the tracker session while disconnecting clients,
+  as the Windows runtime shuts its server down. Live under Wine the game layer
+  reconnected and streamed again after a usbipd replug
+  ([service behaviour](service-behaviour.md)).
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.

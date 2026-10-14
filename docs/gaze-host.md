@@ -170,13 +170,13 @@ clock and moves device timestamps onto it as head pose does
 ### User presence
 
 `receive_presence_data` `0x140266b60` keeps device values 0, 1 and 2 of stream
-`0x504` column 2 and turns anything else into 0; service callback
+`0x504` column 2 (an int32) and turns anything else into 0; service callback
 `0x1400fa2b0` builds a property 0xB record with operation 2 and value 1, 2 or
-3 (unknown, away, present), and `0x1400fd220` queues it only when it differs
-from the last one (static; mapping emulated for 0, 1, 2, 3 and 7). The client
-maps 2 to away and 3 to present ([game-integration-layer.md](game-integration-layer.md)).
-`HeadPoseHub.publish_presence` uses this mapping once the device's presence is
-fed; until then presence still follows head-pose validity.
+3 (unknown, away, present), and `0x1400fd220` queues every record after the
+first as a notification (static, emulation). The client maps 2 to away and 3
+to present ([game-integration-layer.md](game-integration-layer.md)). The whole
+path, the earlier "device reports 0" (a parsing error on Linux) and the Linux
+service's notifications are in [service-behaviour.md](service-behaviour.md).
 
 ## Game side
 
@@ -217,10 +217,8 @@ subscribes `0x500` beside the image stream in the same session and publishes
 `gaze.gaze_frame(gaze.gaze_message(message)).with_timestamp(host_time)` for every
 message the runtime would keep, with device time mapped by its own
 `driver.ClockMapper`; head pose keeps its own mapper and newest-frame dropping.
-`cli serve --no-gaze` serves head pose only. Presence (`0x504`) is not fed to
-`HeadPoseHub.publish_presence`: every capture so far reports device value 0
-(unknown), even with a person in front, and feeding it would replace the
-head-pose-based presence the game layer currently relies on.
+`cli serve --no-gaze` serves head pose only. Presence (`0x504`) is subscribed
+in every session and feeds property 0xB ([service-behaviour.md](service-behaviour.md)).
 
 ## Checks
 
@@ -290,10 +288,11 @@ equal the raw column 28 figures; any remaining gap to Windows is in the device.
 
 - Whether licensed clients get streams 6 and 33 from the real service; the
   game layer requests 6 only when 29 fails.
-- The encoding of the operation 2 presence notification; none was captured.
+- A real operation 2 presence notification for an actual change; the framing
+  is known (a real operation 2 for property 0x11 and the emulated serializer,
+  [service-behaviour.md](service-behaviour.md)).
 - Live gaze through `cli serve` with the game: wired and unit tested, not yet
   run against a game under Wine with a real tracker.
-- Why the device's presence stream reads 0 with a person in front.
 - What sets the device settings word `+0x188`; the ET5 behaviour is inferred
   from the two observations above, not from the setter.
 - Columns 14, 17 and 20 and the parser's column capacity.

@@ -28,6 +28,7 @@ from .ttp_commands import (FIELD_FIXED16, FIELD_FIXED42, FIELD_INT32, FIELD_INT6
 from .ttp_fields import FIXED16_SCALE, FIXED42_SCALE, float32
 
 PARSED_UINT32 = 1
+PARSED_INT32 = 2
 PARSED_INT64 = 4
 PARSED_FLOAT = 5
 PARSED_VEC2 = 9
@@ -148,6 +149,8 @@ def parsed_value(items: tuple) -> tuple:
             return PARSED_INT64, struct.unpack('>q', first.data)[0]
         if first.tag == FIELD_UINT32 and len(first.data) == 4:
             return PARSED_UINT32, struct.unpack('>I', first.data)[0]
+        if first.tag == FIELD_INT32 and len(first.data) == 4:
+            return PARSED_INT32, struct.unpack('>i', first.data)[0]
         if first.tag == FIELD_FIXED16 and len(first.data) == 4:
             return PARSED_FLOAT, _fixed16_float(first)
     if first.tag == FIELD_STRUCT and all(item.tag == FIELD_FIXED42 and len(item.data) == 8
@@ -523,6 +526,7 @@ def frame_packet(frame: GazeFrame, stream: int, message_tag: int = 0,
 # User presence (device stream 0x504) --------------------------------------------------------
 
 PRESENCE_UNKNOWN, PRESENCE_AWAY, PRESENCE_PRESENT = 1, 2, 3
+PLATMOD_UNKNOWN, PLATMOD_AWAY, PLATMOD_PRESENT = 0, 1, 2
 PROPERTY_USER_PRESENCE = 0xB
 
 
@@ -536,16 +540,26 @@ def prp_presence(platmod_value: int) -> int:
     return {1: PRESENCE_AWAY, 2: PRESENCE_PRESENT}.get(platmod_value, PRESENCE_UNKNOWN)
 
 
-def presence_message(payload: bytes) -> tuple[int, int]:
-    """(timestamp, device presence value) of one 0x504 message: columns 1 and 2."""
+PRESENCE_COLUMN_TYPES = {1: PARSED_INT64, 2: PARSED_INT32}
+
+
+def presence_message(payload: bytes) -> tuple[int, int] | None:
+    """(timestamp, device presence value) of one 0x504 message, or None when the runtime drops it.
+
+    parse_presence 0x1402cba80 reads column 1 as int64 and column 2 as int32 (field
+    tag 1, which the ET5 sends) and skips other columns; a wrong type fails the parse.
+    The dispatcher 0x1402c2700 (index 5) leaves absent columns zero.
+    """
     values = {}
     for column in stream_columns(payload):
+        expected = PRESENCE_COLUMN_TYPES.get(column.column_id)
+        if expected is None:
+            continue
         parsed, value = parsed_value(column.value)
-        if column.column_id == 1 and parsed == PARSED_INT64:
-            values['timestamp'] = value
-        elif column.column_id == 2 and parsed == PARSED_UINT32:
-            values['presence'] = value
-    return values.get('timestamp', 0), values.get('presence', 0)
+        if parsed != expected:
+            return None
+        values[column.column_id] = value
+    return values.get(1, 0), values.get(2, 0)
 
 
 # Building messages (tests and oracle edge cases) --------------------------------------------

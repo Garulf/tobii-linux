@@ -6,8 +6,11 @@ module speaks the service side of the PRP handshake and the subset of the sessio
 the game DLL uses: connect, stream start/stop for head pose (stream 2) and, with a
 gaze hub, gaze point (3), responsive gaze point (29) and gaze origin (4),
 timesync, stream packages, and the property requests of the game integration
-layer (display area, display id, user presence). Relay framing and real-service
-comparison: docs/prp-bridge.md and docs/gaze-host.md.
+layer (display area, display id, user presence, with presence change notifications).
+Like the Windows runtime, it serves clients only while a tracker session runs: when
+the tracker goes away every client connection is closed and new ones are refused
+until it is back. Relay framing and real-service comparison: docs/prp-bridge.md,
+docs/gaze-host.md and docs/service-behaviour.md.
 """
 
 import argparse
@@ -35,7 +38,8 @@ from tobii_linux.prp_session import (
     ConnectResponse, HandshakeInfo, PropertyResponse, decode_client_hello, decode_client_pid,
     decode_command_request, decode_property_request, decode_property_subscribe_request,
     display_area_value, encode_command_response, encode_handshake_ack, encode_handshake_info,
-    encode_property_response, encode_property_subscribe_response, split_packets, string_value)
+    encode_property_notification, encode_property_response, encode_property_subscribe_response,
+    split_packets, string_value)
 
 log = logging.getLogger("tobii_linux.prp_service")
 
@@ -70,13 +74,35 @@ REAL_SERVICE_PERIOD_S = 0.030207
 # Unsent bytes above which stream packages are dropped for a slow client.
 MAX_PENDING_STREAM_BYTES = 64 * 1024
 PROPERTY_MODEL = 8
-PROPERTY_ZERO_WORDS = (2, 4)
-PROPERTY_USER_PRESENCE = 0xB
+# Power save active (2), device paused (4), exclusive mode (5), calibration active (7) and
+# 0x10: the real service answered subscribe with 0 (and get, where tried: 2, 4, 5). The game
+# layer drops its notification subscriptions when one of them is refused, and its reconnect
+# then stalls re-subscribing the refused one.
+PROPERTY_ZERO_WORDS = (2, 4, 5, 7, 0x10)
+PROPERTY_CALIBRATION_ID = 6
+PROPERTY_USER_PRESENCE = gaze.PROPERTY_USER_PRESENCE
+PROPERTY_TRACK_BOX = 0xF
+PROPERTY_FIELD_OF_USE = 0x11
+PROPERTY_FAULTS, PROPERTY_WARNINGS = 0x15, 0x16
+PROPERTY_LENS_CONFIGURATION = 0xC
+# Subscribe and unsubscribe answers of the real service (live, Windows,
+# evidence/private/robust-live/subscribe-all.jsonl): these are refused with INSUFFICIENT_LICENSE,
+# 3, 8 and 9 with NOT_SUPPORTED, and unsubscribing anything not subscribed gives NOT_SUBSCRIBED.
+LICENSED_SUBSCRIPTIONS = (0xA, 0xC, 0xD, 0xE, 0x13, 0x14, 0x17, 0x18)
+SUBSCRIBE_ONLY_PROPERTIES = (PROPERTY_USER_PRESENCE, PROPERTY_CALIBRATION_ID, PROPERTY_TRACK_BOX,
+                             PROPERTY_FIELD_OF_USE, PROPERTY_FAULTS, PROPERTY_WARNINGS)
+# Track box corners in mm as the reference tracker reported them: front plane at 450 mm,
+# back plane at 900 mm (property 0xF, live). The device getter 1400 is not queried.
+TRACK_BOX_MM = (125.0, 100.0, 450.0, -125.0, 100.0, 450.0, -125.0, -100.0, 450.0,
+                125.0, -100.0, 450.0, 250.0, 200.0, 900.0, -250.0, 200.0, 900.0,
+                -250.0, -200.0, 900.0, 250.0, -200.0, 900.0)
+TRACKER_STATUS_TEXT = "ok"
 MODEL_NAME = "IS5_Large_Eyetracker_5"
-# User presence on the wire: the client maps 2 to away and 3 to present (0x180030098); the
-# real service sent 2 with nobody in front of the tracker.
-PRESENCE_AWAY = 2
-PRESENCE_PRESENT = 3
+# Subscribing presence on the device emits an unknown record this much before the tracker's
+# current time when no presence data has arrived yet (0x140276dd0).
+PRESENCE_SUBSCRIBE_LEAD_US = 30000
+# Real service notifications carry message tag 0, as its stream packages do.
+NOTIFICATION_TAG = 0
 # Smallest value block the client decoder accepts per property id (0x180055780, operation 6);
 # ids not listed need 8 bytes. Error replies carry a zero block of this size, as the real
 # service did for the properties it refused.
@@ -158,11 +184,25 @@ def presence_value(value: int, since_us: int) -> tuple[bytes, bytes]:
     return block, struct.pack("<I", 4)
 
 
+def floats_value(values) -> tuple[bytes, bytes]:
+    return struct.pack(f"<I{len(values)}f", 4 + 4 * len(values), *values), struct.pack("<I", 4)
+
+
 def property_error(tag: int, property_id: int, status: int = STATUS_NOT_SUPPORTED):
     """Refusal with a zero value block, so the client decoder still accepts the packet."""
     size = PROPERTY_BLOCK_SIZES.get(property_id, DEFAULT_PROPERTY_BLOCK_SIZE)
     block = struct.pack("<I", size) + bytes(size - 4)
     return PropertyResponse(tag, status, property_id, block, struct.pack("<I", 4))
+
+
+def subscribe_error(tag: int, property_id: int, status: int = STATUS_NOT_SUPPORTED):
+    """Refused command 5, carrying the empty value the real service sent for that property."""
+    if property_id == PROPERTY_MODEL:
+        return PropertyResponse(tag, status, property_id, *string_value(""))
+    if property_id == PROPERTY_LENS_CONFIGURATION:
+        block = struct.pack("<6I", 0x18, 0, 4, 0, 4, 0)
+        return PropertyResponse(tag, status, property_id, block, struct.pack("<I", 4))
+    return property_error(tag, property_id, status)
 
 
 # Relay framing ------------------------------------------------------------------------
@@ -239,35 +279,49 @@ class SampleHub:
 
 
 class HeadPoseHub(SampleHub):
-    """HeadPoseSample values and user presence.
+    """HeadPoseSample values, one per processed camera frame, on the service clock."""
 
-    Presence follows head-pose validity until the device's presence stream is
-    published with publish_presence; from then on it follows the device, mapped
-    as the runtime maps it (gaze.prp_presence).
+
+def presence_subscribe_time(tracker_time_us: int) -> int:
+    """Time of the unknown record a presence subscription emits (0x140276dd0)."""
+    if tracker_time_us >= PRESENCE_SUBSCRIBE_LEAD_US:
+        return tracker_time_us - PRESENCE_SUBSCRIBE_LEAD_US
+    return tracker_time_us
+
+
+class UserPresence:
+    """Property 0xB as the service caches it (0x1400fd220, cache 0x14010e930).
+
+    Every platmod presence record replaces the cached property record; it is
+    pushed to subscribed clients unless it is the first record since the cache
+    was cleared. There is no comparison with the previous value: the device
+    only sends changes (and its current value when subscribed).
     """
 
-    def __init__(self, depth: int = 4):
-        super().__init__(depth)
-        self.present = False
-        self.presence = PRESENCE_AWAY
-        self.presence_since_us: int | None = None
-        self.device_presence = False
+    def __init__(self):
+        self.clear()
 
-    def _set_presence(self, value: int, timestamp_us: int) -> None:
-        if self.presence_since_us is None or value != self.presence:
-            self.presence, self.presence_since_us = value, timestamp_us
-            self.present = value == PRESENCE_PRESENT
+    def clear(self) -> None:
+        """Forget the record, as the service does when a device is added again (0x14010e8d0)."""
+        self.value: int | None = None
+        self.since_us = 0
 
-    def publish(self, sample: HeadPoseSample) -> None:
-        if not self.device_presence:
-            self._set_presence(PRESENCE_PRESENT if sample.valid else PRESENCE_AWAY,
-                               sample.timestamp_us)
-        super().publish(sample)
+    def record(self, timestamp_us: int, platmod_value: int) -> bool:
+        """Cache one platmod record; True when the service would push it as a notification."""
+        notify = self.value is not None
+        self.value, self.since_us = gaze.prp_presence(platmod_value), timestamp_us
+        return notify
 
-    def publish_presence(self, timestamp_us: int, device_value: int) -> None:
-        """One device presence record (stream 0x504 column 2) on the service clock."""
-        self.device_presence = True
-        self._set_presence(gaze.prp_presence(gaze.platmod_presence(device_value)), timestamp_us)
+    @property
+    def present(self) -> bool:
+        return self.value == gaze.PRESENCE_PRESENT
+
+    def value_block(self) -> tuple[bytes, bytes]:
+        return presence_value(self.value, self.since_us)
+
+    def notification(self) -> bytes:
+        return encode_property_notification(NOTIFICATION_TAG, PROPERTY_USER_PRESENCE,
+                                            *self.value_block())
 
 
 class GazeHub(SampleHub):
@@ -370,12 +424,20 @@ def error_response(tag: int, command: int, status: int) -> bytes:
 
 
 class Subscription:
-    """One client's subscription channel and the streams it has started."""
+    """One client: its subscription channel, the streams it started and the properties it watches.
+
+    The command channel that connected with this subscription is paired with it;
+    when either channel closes, the other is closed too, as the real service
+    destroys a command client together with its subscription client.
+    """
 
     def __init__(self, subscription_id: int, connection: "PipeConnection"):
         self.subscription_id = subscription_id
         self.connection = connection
+        self.command: "PipeConnection | None" = None
+        self.field_of_use = 0
         self.streams: dict[int, tuple] = {}
+        self.properties: set[int] = set()
 
     def streaming(self, stream: int) -> bool:
         return stream in self.streams
@@ -394,6 +456,13 @@ class Subscription:
     def stop_all(self) -> None:
         for stream in list(self.streams):
             self.stop(stream)
+        self.properties.clear()
+
+    def close(self) -> None:
+        self.stop_all()
+        for connection in (self.connection, self.command):
+            if connection is not None:
+                connection.close()
 
     async def _push(self, queue: asyncio.Queue, encode) -> None:
         while True:
@@ -411,8 +480,13 @@ class PipeConnection:
         self.tail = b""
 
     def send(self, message: bytes) -> None:
+        if self.writer.is_closing():
+            return
         log.debug("%s -> %s", self.pipe, message.hex())
         self.writer.write(encode_frame(FRAME_MESSAGE, message))
+
+    def close(self) -> None:
+        self.writer.close()
 
     def send_stream(self, packet: bytes) -> None:
         if self.writer.transport.get_write_buffer_size() > MAX_PENDING_STREAM_BYTES:
@@ -429,17 +503,19 @@ class PipeConnection:
         return payload
 
     async def run(self) -> None:
-        await self.handshake()
+        self.service.connections.add(self)
         try:
+            await self.handshake()
             while True:
                 packets, self.tail = split_packets(self.tail + await self.message())
                 for packet in packets:
                     self.handle_packet(packet)
                 await self.writer.drain()
         finally:
+            self.service.connections.discard(self)
             if self.subscription is not None:
-                self.subscription.stop_all()
                 self.service.subscriptions.pop(self.subscription.subscription_id, None)
+                self.subscription.close()
 
     async def handshake(self) -> None:
         """Steps 1 to 5 of docs/service-transport.md, as the real service answered them."""
@@ -477,12 +553,23 @@ class PipeConnection:
         self.send(encode_command_response(self.service.respond(self, request)))
 
     def property_subscription(self, packet: bytes) -> bytes:
-        """Command 5 answers with the current value; command 6 echoes the property id."""
+        """Command 5 answers with the current value and starts notifications; command 6 ends them."""
         tag, command, property_id = decode_property_subscribe_request(packet)
+        subscribed = self.subscription.properties if self.subscription is not None else set()
         if command == COMMAND_PROPERTY_UNSUBSCRIBE:
-            log.info("property %#x unsubscribe tag %d", property_id, tag)
-            return encode_command_response(CommandResponse(tag, command, STATUS_OK, property_id))
-        response = self.service.answer_property(tag, property_id, subscribe=True)
+            if property_id in LICENSED_SUBSCRIPTIONS:
+                status = STATUS_INSUFFICIENT_LICENSE
+            elif property_id in subscribed:
+                status = STATUS_OK
+            else:
+                status = STATUS_NOT_SUBSCRIBED
+            subscribed.discard(property_id)
+            log.info("property %#x unsubscribe tag %d status %d", property_id, tag, status)
+            return encode_command_response(CommandResponse(tag, command, status, property_id))
+        response = self.service.answer_property(tag, property_id, subscribe=True,
+                                                subscription=self.subscription)
+        if response.status == STATUS_OK and self.subscription is not None:
+            self.subscription.properties.add(property_id)
         log.info("property %#x subscribe tag %d status %d", property_id, tag, response.status)
         return encode_property_subscribe_response(response)
 
@@ -501,8 +588,49 @@ class PrpService:
         self.subscription_pipe = str(uuid.uuid4())
         self.timesync_pipe = str(uuid.uuid4())
         self.subscriptions: dict[int, Subscription] = {}
+        self.connections: set[PipeConnection] = set()
+        self.bridges: set = set()
         self.ids = itertools.count(1)
-        self.sent_packages = self.dropped_packages = 0
+        self.sent_packages = self.dropped_packages = self.sent_notifications = 0
+        self.presence = UserPresence()
+        self.tracker_attached = False
+        self.calibration_id = 0
+
+    def attach_tracker(self, calibration_id: int | None = None) -> None:
+        """A tracker session is running: accept clients, as the real server starts listening."""
+        if calibration_id is not None:
+            self.calibration_id = calibration_id
+        if not self.tracker_attached:
+            log.info("tracker attached; accepting game clients (calibration id %#x)",
+                     self.calibration_id)
+        self.tracker_attached = True
+
+    def detach_tracker(self) -> None:
+        """The tracker is gone: close every client connection and refuse new ones.
+
+        The real service shuts its server down when the device is removed or the
+        host goes to sleep, destroying every command, subscription and timesync
+        client, and listens again once the device is re-added; clients reconnect.
+        """
+        if self.tracker_attached:
+            log.info("tracker detached; closing %d client connection(s)", len(self.connections))
+        self.tracker_attached = False
+        for connection in list(self.connections):
+            connection.close()
+        for subscription in list(self.subscriptions.values()):
+            subscription.stop_all()
+        self.presence.clear()
+
+    def publish_presence(self, timestamp_us: int, platmod_value: int) -> None:
+        """One platmod presence record on the service clock; pushes operation 2 when due."""
+        if not self.presence.record(timestamp_us, platmod_value):
+            return
+        notification = self.presence.notification()
+        for subscription in self.subscriptions.values():
+            if PROPERTY_USER_PRESENCE in subscription.properties:
+                subscription.connection.send(notification)
+                self.sent_notifications += 1
+        log.info("user presence %d since %d", self.presence.value, self.presence.since_us)
 
     @property
     def served_streams(self) -> dict:
@@ -571,32 +699,48 @@ class PrpService:
                  subscription.subscription_id)
         return CommandResponse(request.tag, request.command, STATUS_OK, request.stream)
 
-    def answer_property(self, tag: int, property_id: int,
-                        subscribe: bool = False) -> PropertyResponse:
+    def answer_property(self, tag: int, property_id: int, subscribe: bool = False,
+                        subscription: Subscription | None = None) -> PropertyResponse:
         """Value of a property for a get, or for a subscribe (command 5), or a refusal.
 
         Served: display area and display id when configured, the model name, properties
-        2 and 4 (0, as the real service sent them; meaning unknown), and user presence for
-        subscribes only (the real service refused the plain get). Subscribing sends no
-        later notifications.
+        2 (power save active), 4 (device paused) and 5 (exclusive mode), all 0 as the real
+        service sent them, and user presence for subscribes only (the real service refused
+        the plain get).
         """
-        value = self.property_value(property_id, subscribe)
+        if subscribe and property_id in LICENSED_SUBSCRIPTIONS:
+            return subscribe_error(tag, property_id, STATUS_INSUFFICIENT_LICENSE)
+        value = self.property_value(property_id, subscribe, subscription)
         if value is None:
-            return property_error(tag, property_id)
+            return (subscribe_error if subscribe else property_error)(tag, property_id)
         return PropertyResponse(tag, STATUS_OK, property_id, *value)
 
-    def property_value(self, property_id: int, subscribe: bool):
+    def property_value(self, property_id: int, subscribe: bool,
+                       subscription: Subscription | None = None):
+        if property_id in SUBSCRIBE_ONLY_PROPERTIES and not subscribe:
+            return self.get_value(property_id)
+        if property_id == PROPERTY_CALIBRATION_ID:
+            return word_value(self.calibration_id)
+        if property_id == PROPERTY_TRACK_BOX:
+            return floats_value(TRACK_BOX_MM)
+        if property_id == PROPERTY_FIELD_OF_USE:
+            return word_value(subscription.field_of_use if subscription is not None else 0)
+        if property_id in (PROPERTY_FAULTS, PROPERTY_WARNINGS):
+            return string_value(TRACKER_STATUS_TEXT)
+        return self.get_value(property_id, subscribe)
+
+    def get_value(self, property_id: int, subscribe: bool = False):
         if property_id == PROPERTY_DISPLAY_AREA and self.display_area:
             area = self.display_area
             return display_area_value(area.top_left, area.top_right, area.bottom_left)
         if property_id == PROPERTY_DISPLAY_ID and (self.display_id or self.reported_display_id):
             return string_value(self.display_id or self.reported_display_id)
-        if property_id == PROPERTY_MODEL:
+        if property_id == PROPERTY_MODEL and not subscribe:
             return string_value(MODEL_NAME)
         if property_id in PROPERTY_ZERO_WORDS:
             return word_value(0)
-        if property_id == PROPERTY_USER_PRESENCE and subscribe:
-            return presence_value(self.hub.presence, self.hub.presence_since_us or 0)
+        if property_id == PROPERTY_USER_PRESENCE and subscribe and self.presence.value is not None:
+            return self.presence.value_block()
         return None
 
     def connect(self, connection: PipeConnection, request) -> CommandResponse:
@@ -606,6 +750,8 @@ class PrpService:
                                    connect=device_connect_response(self.serial, 0,
                                                                    self.advertised_streams))
         connection.subscription = subscription
+        subscription.command = connection
+        subscription.field_of_use = request.connect.field_of_use
         licenses = len(request.connect.licenses)
         log.info("connect from pid %d with %d license(s), subscription %d",
                  request.connect.process_id, licenses, subscription.subscription_id)
@@ -620,6 +766,7 @@ class PrpService:
             if kind == FRAME_BRIDGE_HELLO:
                 writer.write(encode_frame(FRAME_PIPES, encode_names(self.pipe_names)))
                 await writer.drain()
+                self.bridges.add(writer)
                 log.info("bridge %s attached", peer)
                 while True:
                     kind, payload = await read_frame(reader)
@@ -628,6 +775,9 @@ class PrpService:
                         log.info("bridge reports primary monitor %s", self.reported_display_id)
             elif kind == FRAME_PIPE_OPEN:
                 client_pid, pipe = decode_pipe_open(payload)
+                if not self.tracker_attached:
+                    log.info("refusing pid %d on %s: no tracker", client_pid, pipe)
+                    return
                 await PipeConnection(self, reader, writer, client_pid, pipe).run()
             else:
                 raise ProtocolError(f"unexpected first relay frame {kind}")
@@ -636,10 +786,22 @@ class PrpService:
         except ProtocolError as exc:
             log.warning("closing relay connection %s: %s", peer, exc)
         finally:
+            self.bridges.discard(writer)
             writer.close()
 
     async def serve(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT):
         return await asyncio.start_server(self.handle, host, port)
+
+    async def close(self, server, timeout_s: float = 2.0) -> None:
+        """Disconnect every client and bridge, then stop listening."""
+        self.detach_tracker()
+        for writer in list(self.bridges):
+            writer.close()
+        server.close()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout_s)
+        except asyncio.TimeoutError:
+            log.warning("relay connections still open after %.1f s", timeout_s)
 
 
 async def _main(args) -> None:
@@ -648,6 +810,9 @@ async def _main(args) -> None:
     clock = wine_clock(args.wine_clock)
     service = PrpService(hub, args.name, clock=clock, display_area=args.display_area,
                          display_id=args.display_id, gaze_hub=gaze_hub)
+    if args.synthetic:
+        service.attach_tracker()
+        service.publish_presence(clock(), gaze.PLATMOD_PRESENT)
     server = await service.serve(args.host, args.port)
     log.info("PRP service on %s, pipes %s", server.sockets[0].getsockname()[:2], service.pipe_names)
     producer = (asyncio.create_task(publish_synthetic(hub, clock=clock, gaze_hub=gaze_hub))

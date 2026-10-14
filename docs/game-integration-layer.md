@@ -195,8 +195,9 @@ bytes):
 - property 8 with `IS5_Large_Eyetracker_5`; the real reply differs only in an
   uninitialised padding byte;
 - properties 2 and 4 with 0;
-- property 0xB on subscribe only: 3 while the newest sample is valid, 2
-  otherwise, with the timestamp of the sample where that last changed;
+- property 0xB on subscribe only, from the device's presence stream, with
+  operation 2 notifications to subscribed clients
+  ([service-behaviour.md](service-behaviour.md));
 - command 6 with status 0 and the property id;
 - everything else with the refusal above.
 
@@ -221,10 +222,11 @@ Engine client still received 91 samples in 3 s.
   game on another monitor still needs `--display-id`.
 - `TrackWindow` itself was not run under Wine: the patched Wine 11.0 build has no
   display driver (`--without-x`), so no window can be created.
-- Property notifications: the service never pushes operation 2, so presence and
-  display changes after subscribing are not reported. The real encoding of a
-  notification was not captured.
-- The meaning of properties 2, 4 and 5 and of the "type" and capability bits in
-  `TrackerInfo`.
+- Notifications other than user presence (display area, calibration id) are
+  not pushed.
+- The "type" and capability bits in `TrackerInfo`. Properties 2, 4 and 5 are
+  power save active, device paused and exclusive mode (runtime enum strings and
+  the service's subscribe switch `0x1400f7a50`, static); all subscription
+  answers are in [service-behaviour.md](service-behaviour.md).
 - The layer's own log goes to `OutputDebugStringA` only when its logger is
   enabled (`0x18000b8f0`); the test client's capture saw nothing in any run.

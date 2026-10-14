@@ -34,6 +34,7 @@ MAX_HANDSHAKE_INFO = 0x100
 PIPE_CHUNK = 0x1000
 
 OPERATION_STREAM_PACKAGE = 1
+OPERATION_PROPERTY_NOTIFICATION = 2
 OPERATION_PROPERTY_GET = 5
 OPERATION_PROPERTY_GET_RESPONSE = 6
 OPERATION_COMMAND_REQUEST = 9
@@ -659,6 +660,17 @@ def encode_property_subscribe_response(response: PropertyResponse) -> bytes:
     writer.set(header, 2, COMMAND_PROPERTY_SUBSCRIBE)
     writer.set(writer.block(2), 1, response.property_id)
     writer.raw(response.block, response.region)
+    return writer.finish()
+
+
+def encode_property_notification(tag: int, property_id: int, block: bytes, region: bytes) -> bytes:
+    """Operation 2 on the subscription channel: {8, property} then the value as in operation 6.
+
+    Layout from the game DLL's serializer 0x18004f730 and decoder 0x180055780 (emulated).
+    """
+    writer = _message(tag, OPERATION_PROPERTY_NOTIFICATION)
+    writer.set(writer.block(2), 1, property_id)
+    writer.raw(block, region)
     return writer.finish()
 
 

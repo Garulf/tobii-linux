@@ -5,6 +5,7 @@ run against a real tracker: TTP on channel 0, startup, calibration and image
 frames as documented in its "Live observations" section.
 """
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import threading
 import time
@@ -27,6 +28,10 @@ class DeviceError(RuntimeError):
     pass
 
 
+class NoTrackerError(DeviceError):
+    pass
+
+
 @dataclass(frozen=True)
 class CameraCalibration:
     """Extrinsic of the selected camera record: translation and three angles."""
@@ -38,13 +43,31 @@ class TrackerSession:
     """Request/response and stream demultiplexing over one USB channel.
 
 `channel` is any object with write(bytes) and read(timeout_ms=...) -> bytes,
-such as usb_channel.USBChannel.
+such as usb_channel.USBChannel. `dead` becomes true once the device stopped
+answering or the transport failed; such a session is not asked for anything
+more (a tracker that stalls stays silent for the rest of its session).
 """
     def __init__(self, channel):
         self.channel = channel
         self.decoder = Decoder()
         self.request_id = 0
         self.pending_streams = []
+        self.dead = False
+        self.usb_device = {}
+
+    def read(self, timeout_ms):
+        try:
+            return self.channel.read(timeout_ms=timeout_ms)
+        except (OSError, RuntimeError):
+            self.dead = True
+            raise
+
+    def write(self, data):
+        try:
+            self.channel.write(data)
+        except (OSError, RuntimeError):
+            self.dead = True
+            raise
 
     def _next_id(self):
         self.request_id = (self.request_id + 1) & 0xFFFFFFFF
@@ -53,13 +76,13 @@ such as usb_channel.USBChannel.
     def _receive(self, timeout_s):
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            data = self.channel.read(timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)))
+            data = self.read(max(1, int((deadline - time.monotonic()) * 1000)))
             if data:
                 yield from self.decoder.feed(data)
 
     def call(self, build, timeout_s=REQUEST_TIMEOUT_S):
         message = build(self._next_id())
-        self.channel.write(message.encode())
+        self.write(message.encode())
         for reply in self._receive(timeout_s):
             if reply.kind == RESPONSE_KIND and reply.request_id == message.request_id:
                 status = response_status(reply)
@@ -68,6 +91,7 @@ such as usb_channel.USBChannel.
                 return reply
             if reply.kind == STREAM_DATA_KIND:
                 self.pending_streams.append(reply)
+        self.dead = True
         raise DeviceError(f'Command {message.command} timed out')
 
     def reply_values(self, reply):
@@ -113,7 +137,7 @@ such as usb_channel.USBChannel.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            data = self.channel.read(timeout_ms=max(1, int(remaining * 1000)))
+            data = self.read(max(1, int(remaining * 1000)))
             pending = self.decoder.feed(data) if data else []
             if data:
                 deadline = time.monotonic() + timeout_s
@@ -172,37 +196,70 @@ class ClockMapper:
         return min(device_us + self.offset, self.clock())
 
 
+class HeadPoseProcessor:
+    """Image frame to head-pose sample. The models load once; start() begins a tracker session.
+
+Each session restarts the tracking state and the output filters with that
+session's camera calibration, as the runtime builds a new algorithm instance
+when a device is added.
+"""
+    def __init__(self, model_directory, display_area):
+        from .face_tracking import FaceTracker
+        self.tracker = FaceTracker(model_directory)
+        self.display_area = display_area
+        self.output = None
+
+    def start(self, calibration):
+        from .head_pose_pipeline import HeadPoseOutput
+        self.tracker.reset()
+        self.output = HeadPoseOutput(calibration.translation, calibration.angles, self.display_area)
+
+    def __call__(self, frame):
+        import numpy as np
+        pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
+        result = self.tracker.process(pixels, frame.timestamp // 1000)
+        fit = result.fit['rigid_state'] if result.fit is not None else None
+        return self.output(fit, frame.timestamp)
+
+
 def head_pose_processor(session, model_directory, display_area, camera=0):
     """Camera calibration from a started session, then a function from image frame to head-pose sample."""
-    import numpy as np
-    from .face_tracking import FaceTracker
-    from .head_pose_pipeline import HeadPoseOutput
-    calibration = session.camera_calibration(camera)
-    output = HeadPoseOutput(calibration.translation, calibration.angles, display_area)
-    tracker = FaceTracker(model_directory)
-
-    def process(frame):
-        pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
-        result = tracker.process(pixels, frame.timestamp // 1000)
-        fit = result.fit['rigid_state'] if result.fit is not None else None
-        return output(fit, frame.timestamp)
-    return process
+    processor = HeadPoseProcessor(model_directory, display_area)
+    processor.start(session.camera_calibration(camera))
+    return processor
 
 
 def head_pose_samples(session, model_directory, display_area, camera=0, host_clock=None):
     """Frames from a started session through tracking, fitting and the output stages.
 
-With `host_clock` (a function returning microseconds), frames are read on a
-separate thread, frames that arrive during processing are skipped, and sample
-timestamps are moved onto that clock.
+Frames are always read on a separate thread and frames that arrive during
+processing are skipped: the tracker stops sending for good when its endpoint
+is not read for about a second. With `host_clock` (a function returning
+microseconds), sample timestamps are moved onto that clock.
 """
     process = head_pose_processor(session, model_directory, display_area, camera)
     session.subscribe_images()
-    frames = session.frames()
-    to_host = None
-    if host_clock is not None:
-        to_host = ClockMapper(host_clock)
-        frames = newest_frames(frames, on_receive=lambda frame: to_host.observe(frame.timestamp))
-    for frame in frames:
+    to_host = ClockMapper(host_clock) if host_clock is not None else None
+    on_receive = (lambda frame: to_host.observe(frame.timestamp)) if to_host is not None else None
+    for frame in newest_frames(session.frames(), on_receive=on_receive):
         sample = process(frame)
         yield sample if to_host is None else replace(sample, timestamp_us=to_host(sample.timestamp_us))
+
+
+@contextmanager
+def usb_session(index=0, channel=0):
+    """A started TrackerSession on the `index`th Eye Tracker 5 libusb sees; closed on exit."""
+    from .usb import USBContext
+    from .usb_channel import USBChannel
+    with USBContext() as context:
+        devices = context.probe()
+        if index >= len(devices):
+            raise NoTrackerError('No Eye Tracker 5 is visible to libusb' if not devices else
+                                 f'Tracker index {index} requested, {len(devices)} visible')
+        device = devices[index]
+        with context.open_transport(bus=device['bus'], address=device['address']) as transport:
+            with USBChannel(transport, channel) as usb_channel:
+                session = TrackerSession(usb_channel)
+                session.usb_device = device
+                session.initialize()
+                yield session

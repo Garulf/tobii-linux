@@ -213,6 +213,7 @@ int main(int argc, char **argv)
     const GazePoint *points;
     HWND window = NULL;
     int count = 0, index, tracking = 0, updates = 0, last_connected = -1, connected;
+    int last_present = -1, present;
     uint32_t pose_count, total_poses = 0, capability = HEAD_POSE_CAPABILITY;
     uint32_t point_count, total_points = 0;
     int64_t last_timestamp = 0, last_point_timestamp = 0;
@@ -325,6 +326,11 @@ int main(int argc, char **argv)
                    is_present() & 0xff, is_stream_supported(&capability) & 0xff,
                    (long long)qpc_us());
             last_connected = connected;
+        }
+        present = is_present() & 0xff;
+        if (present != last_present) {
+            printf("present %d qpc_us=%lld\n", present, (long long)qpc_us());
+            last_present = present;
         }
         pose_count = get_head_poses(&poses);
         for (index = 0; index < (int)pose_count; index++) {
