@@ -48,6 +48,14 @@ next steps; detailed evidence is linked below.
   recordings. Valid samples reached both client DLLs under patched Wine 11.0
   (361 of 361 in 10 s each) and the game integration layer (359 head poses in
   10 s, read 20 ms after the frame timestamp on median).
+- **Gaze, device side:** the tracker computes gaze on-chip (stream `0x500`,
+  40 columns) and stores the user's calibration itself; the runtime only
+  re-applies its host copy when the calibration ids differ, so the existing
+  Linux startup is complete. With a person following eight screen targets,
+  the device's combined gaze point on Linux is valid 94 to 96% of the time
+  with a median error of 48 to 51 px on 2560x1440, against 98.8% and 52 px
+  for Windows Stream Engine ([gaze device](gaze-device.md)). Host-side
+  processing and delivery to games are in progress.
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
