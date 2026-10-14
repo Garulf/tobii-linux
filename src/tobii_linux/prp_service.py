@@ -2,15 +2,18 @@
 
 A Windows bridge inside the Wine prefix (tools/prp_bridge) owns the named pipes
 and forwards each pipe connection over its own loopback TCP connection. This
-module speaks the service side of the PRP handshake and the head-pose subset of
-the session: connect, stream start/stop for stream 2, timesync, stream packages,
-and the property requests of the game integration layer (display area, display
-id, user presence). Relay framing and real-service comparison: docs/prp-bridge.md.
+module speaks the service side of the PRP handshake and the subset of the session
+the game DLL uses: connect, stream start/stop for head pose (stream 2) and, with a
+gaze hub, gaze point (3), responsive gaze point (29) and gaze origin (4),
+timesync, stream packages, and the property requests of the game integration
+layer (display area, display id, user presence). Relay framing and real-service
+comparison: docs/prp-bridge.md and docs/gaze-host.md.
 """
 
 import argparse
 import asyncio
 from dataclasses import dataclass
+import functools
 import itertools
 import logging
 import math
@@ -18,9 +21,11 @@ import struct
 import time
 import uuid
 
+from tobii_linux import gaze
 from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, decode_envelope, encode_envelope
 from tobii_linux.prp import encode_stream_packet
+from tobii_linux.ttp_fields import float32
 from tobii_linux.prp_session import (
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE,
     COMMAND_STREAM_START, COMMAND_STREAM_STOP, COMMAND_TIMESYNC, OPERATION_COMMAND_REQUEST,
@@ -50,6 +55,13 @@ INTERNAL_URL_SCHEME = "prp-internal://"
 STATUS_CONNECTION_FAILED = 3
 STATUS_NOT_SUBSCRIBED = 5
 STATUS_INVALID_PARAMETER = 8
+STATUS_INSUFFICIENT_LICENSE = 17
+GAZE_STREAMS = (gaze.PRP_GAZE_POINT, gaze.PRP_RESPONSIVE_GAZE_POINT, gaze.PRP_GAZE_ORIGIN)
+# The real service refused these with INSUFFICIENT_LICENSE to a client without license keys.
+LICENSED_STREAMS = (gaze.PRP_GAZE_DATA, gaze.PRP_EYE_OPENNESS)
+# Stream list of the real service's connect response, without the streams this service lacks.
+GAZE_SERVICE_STREAMS = (gaze.PRP_GAZE_DATA, gaze.PRP_GAZE_POINT, gaze.PRP_RESPONSIVE_GAZE_POINT,
+                        gaze.PRP_GAZE_ORIGIN, HEAD_POSE)
 # Generic error body: four zero words satisfy every fixed-size response branch of the
 # client decoder except connect (0x180055780, operation 10).
 ERROR_BODY_WORDS = 4
@@ -93,7 +105,8 @@ def wine_clock(name: str = "boottime"):
 service_clock_us = wine_clock()
 
 
-def device_connect_response(serial: str, license_count: int) -> ConnectResponse:
+def device_connect_response(serial: str, license_count: int,
+                            streams: tuple = (HEAD_POSE,)) -> ConnectResponse:
     """Connect response modelled on the real ET5 service's reply (albedo, build 1.37.4.0).
 
     Only the license-result count, firmware flag and stream list are known to be
@@ -106,7 +119,7 @@ def device_connect_response(serial: str, license_count: int) -> ConnectResponse:
         list_b=(1, 18, 2, 4, 16),
         list_c=(0, 1, 2, 0, 4, 5, 6, 7, 0, 0, 0, 11, 0, 0, 0, 15, 16, 17, 18, 0, 0, 21, 22, 0, 0),
         list_d=(9,),
-        streams=(HEAD_POSE,),
+        streams=streams,
         supported_commands=(COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
                             COMMAND_TIMESYNC),
         groups=((2, (17, 18)),),
@@ -134,14 +147,14 @@ def word_value(value: int) -> tuple[bytes, bytes]:
     return struct.pack("<II", 8, value), struct.pack("<I", 4)
 
 
-def presence_value(present: bool, since_us: int) -> tuple[bytes, bytes]:
+def presence_value(value: int, since_us: int) -> tuple[bytes, bytes]:
     """Property 0xB: time of the last presence change (high, low word), then the wire value.
 
     The real service answered two subscribes minutes apart with the same timestamp, so
     the time is that of the last change, not of the request.
     """
     block = struct.pack("<IIII", 0x10, since_us >> 32 & 0xFFFFFFFF, since_us & 0xFFFFFFFF,
-                        PRESENCE_PRESENT if present else PRESENCE_AWAY)
+                        value)
     return block, struct.pack("<I", 4)
 
 
@@ -192,17 +205,15 @@ def decode_pipe_open(payload: bytes) -> tuple[int, str]:
     return client_pid, names[0]
 
 
-# Head-pose sample distribution ------------------------------------------------------------
+# Sample distribution ------------------------------------------------------------------------
 
 
-class HeadPoseHub:
-    """Fan-out of HeadPoseSample values to every streaming subscription; never blocks producers."""
+class SampleHub:
+    """Fan-out of samples to every streaming subscription; never blocks producers."""
 
     def __init__(self, depth: int = 4):
         self.depth = depth
         self.queues: set[asyncio.Queue] = set()
-        self.present = False
-        self.presence_since_us: int | None = None
 
     def subscribe(self) -> asyncio.Queue:
         queue = asyncio.Queue(self.depth)
@@ -212,9 +223,7 @@ class HeadPoseHub:
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         self.queues.discard(queue)
 
-    def publish(self, sample: HeadPoseSample) -> None:
-        if self.presence_since_us is None or bool(sample.valid) != self.present:
-            self.present, self.presence_since_us = bool(sample.valid), sample.timestamp_us
+    def publish(self, sample) -> None:
         for queue in self.queues:
             if queue.full():
                 queue.get_nowait()
@@ -229,6 +238,42 @@ class HeadPoseHub:
             self.publish(sample)
 
 
+class HeadPoseHub(SampleHub):
+    """HeadPoseSample values and user presence.
+
+    Presence follows head-pose validity until the device's presence stream is
+    published with publish_presence; from then on it follows the device, mapped
+    as the runtime maps it (gaze.prp_presence).
+    """
+
+    def __init__(self, depth: int = 4):
+        super().__init__(depth)
+        self.present = False
+        self.presence = PRESENCE_AWAY
+        self.presence_since_us: int | None = None
+        self.device_presence = False
+
+    def _set_presence(self, value: int, timestamp_us: int) -> None:
+        if self.presence_since_us is None or value != self.presence:
+            self.presence, self.presence_since_us = value, timestamp_us
+            self.present = value == PRESENCE_PRESENT
+
+    def publish(self, sample: HeadPoseSample) -> None:
+        if not self.device_presence:
+            self._set_presence(PRESENCE_PRESENT if sample.valid else PRESENCE_AWAY,
+                               sample.timestamp_us)
+        super().publish(sample)
+
+    def publish_presence(self, timestamp_us: int, device_value: int) -> None:
+        """One device presence record (stream 0x504 column 2) on the service clock."""
+        self.device_presence = True
+        self._set_presence(gaze.prp_presence(gaze.platmod_presence(device_value)), timestamp_us)
+
+
+class GazeHub(SampleHub):
+    """gaze.GazeFrame values, one per device gaze message, on the service clock."""
+
+
 def synthetic_sample(timestamp_us: int, start_us: int) -> HeadPoseSample:
     """A slow head sweep: yaw and pitch sinusoids with a small positional drift."""
     seconds = (timestamp_us - start_us) / 1e6
@@ -238,12 +283,36 @@ def synthetic_sample(timestamp_us: int, start_us: int) -> HeadPoseSample:
     return HeadPoseSample(timestamp_us, True, position, (pitch, yaw, 0.0))
 
 
+def synthetic_gaze_frame(timestamp_us: int, start_us: int) -> gaze.GazeFrame:
+    """A gaze point tracing a slow figure eight over the display, both eyes valid."""
+    seconds = (timestamp_us - start_us) / 1e6
+    x = 0.5 + 0.35 * math.sin(2 * math.pi * seconds / 10.0)
+    y = 0.5 + 0.3 * math.sin(4 * math.pi * seconds / 10.0)
+    point = (float32(x), float32(y))
+    origin_left = tuple(float32(v) for v in (-32.0, 20.0, 620.0))
+    origin_right = tuple(float32(v) for v in (32.0, 20.0, 620.0))
+    guide_left = tuple(float32(v) for v in (0.55, 0.5, 0.45))
+    guide_right = tuple(float32(v) for v in (0.45, 0.5, 0.45))
+    device = gaze.DeviceGaze(
+        timestamp=timestamp_us, combined_point=point, combined_validity=1,
+        responsive_point=point, responsive_validity=1, left_gaze_point_2d=point,
+        right_gaze_point_2d=point, left_validity=0, right_validity=0,
+        left_origin_display=origin_left, right_origin_display=origin_right,
+        left_origin_display_validity=1, right_origin_display_validity=1,
+        left_position_guide=guide_left, right_position_guide=guide_right,
+        left_position_guide_validity=1, right_position_guide_validity=1)
+    return gaze.gaze_frame(device)
+
+
 async def publish_synthetic(hub: HeadPoseHub, period_s: float = REAL_SERVICE_PERIOD_S,
-                            clock=service_clock_us) -> None:
+                            clock=service_clock_us, gaze_hub: GazeHub | None = None) -> None:
     loop = asyncio.get_running_loop()
     start, first_tick = clock(), loop.time()
     for tick in itertools.count(1):
-        hub.publish(synthetic_sample(clock(), start))
+        now = clock()
+        hub.publish(synthetic_sample(now, start))
+        if gaze_hub is not None:
+            gaze_hub.publish(synthetic_gaze_frame(now, start))
         await asyncio.sleep(max(0.0, first_tick + tick * period_s - loop.time()))
 
 
@@ -253,6 +322,11 @@ def stream_package(sample: HeadPoseSample) -> bytes:
     pose = HeadPose(sample.timestamp_us, valid, tuple(sample.position_mm), (valid,) * 3,
                     tuple(sample.rotation_rad))
     return encode_stream_packet(pose, message_tag=0)
+
+
+def gaze_package(frame: gaze.GazeFrame, stream: int) -> bytes:
+    """Gaze stream package as the real service sends it: message tag 0, one record."""
+    return gaze.frame_packet(frame, stream, message_tag=0)
 
 
 # Command handling -----------------------------------------------------------------------
@@ -296,33 +370,34 @@ def error_response(tag: int, command: int, status: int) -> bytes:
 
 
 class Subscription:
-    """One client's subscription channel and its head-pose stream state."""
+    """One client's subscription channel and the streams it has started."""
 
     def __init__(self, subscription_id: int, connection: "PipeConnection"):
         self.subscription_id = subscription_id
         self.connection = connection
-        self.task = None
-        self.hub = self.queue = None
+        self.streams: dict[int, tuple] = {}
 
-    @property
-    def streaming(self) -> bool:
-        return self.task is not None
+    def streaming(self, stream: int) -> bool:
+        return stream in self.streams
 
-    def start(self, hub: HeadPoseHub) -> None:
-        if self.task is None:
-            self.hub, self.queue = hub, hub.subscribe()
-            self.task = asyncio.create_task(self._push())
+    def start(self, stream: int, hub: SampleHub, encode) -> None:
+        if stream not in self.streams:
+            queue = hub.subscribe()
+            self.streams[stream] = (hub, queue, asyncio.create_task(self._push(queue, encode)))
 
-    def stop(self) -> None:
-        if self.task is not None:
-            self.task.cancel()
-            self.hub.unsubscribe(self.queue)
-            self.task = None
+    def stop(self, stream: int) -> None:
+        if stream in self.streams:
+            hub, queue, task = self.streams.pop(stream)
+            task.cancel()
+            hub.unsubscribe(queue)
 
-    async def _push(self) -> None:
+    def stop_all(self) -> None:
+        for stream in list(self.streams):
+            self.stop(stream)
+
+    async def _push(self, queue: asyncio.Queue, encode) -> None:
         while True:
-            sample = await self.queue.get()
-            self.connection.send_stream(stream_package(sample))
+            self.connection.send_stream(encode(await queue.get()))
 
 
 class PipeConnection:
@@ -363,7 +438,7 @@ class PipeConnection:
                 await self.writer.drain()
         finally:
             if self.subscription is not None:
-                self.subscription.stop()
+                self.subscription.stop_all()
                 self.service.subscriptions.pop(self.subscription.subscription_id, None)
 
     async def handshake(self) -> None:
@@ -417,8 +492,9 @@ class PrpService:
 
     def __init__(self, hub: HeadPoseHub, name: str = DEFAULT_NAME, serial: str | None = None,
                  clock=service_clock_us, display_area: DisplayArea | None = None,
-                 display_id: str | None = None):
+                 display_id: str | None = None, gaze_hub: GazeHub | None = None):
         self.hub, self.name, self.clock = hub, name, clock
+        self.gaze_hub = gaze_hub
         self.serial = serial or name
         self.display_area, self.display_id = display_area, display_id
         self.reported_display_id: str | None = None
@@ -427,6 +503,19 @@ class PrpService:
         self.subscriptions: dict[int, Subscription] = {}
         self.ids = itertools.count(1)
         self.sent_packages = self.dropped_packages = 0
+
+    @property
+    def served_streams(self) -> dict:
+        """PRP stream id: (hub, package encoder) for every stream this service publishes."""
+        streams = {HEAD_POSE: (self.hub, stream_package)}
+        if self.gaze_hub is not None:
+            for stream in GAZE_STREAMS:
+                streams[stream] = (self.gaze_hub, functools.partial(gaze_package, stream=stream))
+        return streams
+
+    @property
+    def advertised_streams(self) -> tuple:
+        return GAZE_SERVICE_STREAMS if self.gaze_hub is not None else (HEAD_POSE,)
 
     @property
     def pipe_names(self) -> list[str]:
@@ -463,18 +552,23 @@ class PrpService:
         if subscription is None:
             return CommandResponse(request.tag, request.command, STATUS_CONNECTION_FAILED,
                                    request.stream)
-        if request.stream != HEAD_POSE:
-            return CommandResponse(request.tag, request.command, STATUS_NOT_SUPPORTED,
-                                   request.stream)
+        served = self.served_streams
+        if request.stream not in served:
+            status = (STATUS_INSUFFICIENT_LICENSE
+                      if self.gaze_hub is not None and request.stream in LICENSED_STREAMS
+                      and request.command == COMMAND_STREAM_START else STATUS_NOT_SUPPORTED)
+            return CommandResponse(request.tag, request.command, status, request.stream)
         if request.command == COMMAND_STREAM_START:
-            subscription.start(self.hub)
-            log.info("head pose stream started for subscription %d", subscription.subscription_id)
+            subscription.start(request.stream, *served[request.stream])
+            log.info("stream %d started for subscription %d", request.stream,
+                     subscription.subscription_id)
             return CommandResponse(request.tag, request.command, STATUS_OK, request.stream)
-        if not subscription.streaming:
+        if not subscription.streaming(request.stream):
             return CommandResponse(request.tag, request.command, STATUS_NOT_SUBSCRIBED,
                                    request.stream)
-        subscription.stop()
-        log.info("head pose stream stopped for subscription %d", subscription.subscription_id)
+        subscription.stop(request.stream)
+        log.info("stream %d stopped for subscription %d", request.stream,
+                 subscription.subscription_id)
         return CommandResponse(request.tag, request.command, STATUS_OK, request.stream)
 
     def answer_property(self, tag: int, property_id: int,
@@ -502,20 +596,22 @@ class PrpService:
         if property_id in PROPERTY_ZERO_WORDS:
             return word_value(0)
         if property_id == PROPERTY_USER_PRESENCE and subscribe:
-            return presence_value(self.hub.present, self.hub.presence_since_us or 0)
+            return presence_value(self.hub.presence, self.hub.presence_since_us or 0)
         return None
 
     def connect(self, connection: PipeConnection, request) -> CommandResponse:
         subscription = self.subscriptions.get(request.connect.subscription_client_id)
         if subscription is None:
             return CommandResponse(request.tag, COMMAND_CONNECT, STATUS_INVALID_PARAMETER,
-                                   connect=device_connect_response(self.serial, 0))
+                                   connect=device_connect_response(self.serial, 0,
+                                                                   self.advertised_streams))
         connection.subscription = subscription
         licenses = len(request.connect.licenses)
         log.info("connect from pid %d with %d license(s), subscription %d",
                  request.connect.process_id, licenses, subscription.subscription_id)
         return CommandResponse(request.tag, COMMAND_CONNECT, STATUS_OK,
-                               connect=device_connect_response(self.serial, licenses))
+                               connect=device_connect_response(self.serial, licenses,
+                                                               self.advertised_streams))
 
     async def handle(self, reader, writer) -> None:
         peer = writer.get_extra_info("peername")
@@ -548,12 +644,14 @@ class PrpService:
 
 async def _main(args) -> None:
     hub = HeadPoseHub()
+    gaze_hub = GazeHub() if args.synthetic and not args.no_gaze else None
     clock = wine_clock(args.wine_clock)
     service = PrpService(hub, args.name, clock=clock, display_area=args.display_area,
-                         display_id=args.display_id)
+                         display_id=args.display_id, gaze_hub=gaze_hub)
     server = await service.serve(args.host, args.port)
     log.info("PRP service on %s, pipes %s", server.sockets[0].getsockname()[:2], service.pipe_names)
-    producer = asyncio.create_task(publish_synthetic(hub, clock=clock)) if args.synthetic else None
+    producer = (asyncio.create_task(publish_synthetic(hub, clock=clock, gaze_hub=gaze_hub))
+                if args.synthetic else None)
     async with server:
         await server.serve_forever()
     if producer:
@@ -561,12 +659,15 @@ async def _main(args) -> None:
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description="Serve PRP head pose to a Wine pipe bridge.")
+    parser = argparse.ArgumentParser(description="Serve PRP head pose and gaze to a Wine pipe bridge.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--name", default=DEFAULT_NAME, help="device name in tobii-prp://<name>")
     parser.add_argument("--synthetic", action="store_true",
-                        help="publish a synthetic head sweep instead of tracker output")
+                        help="publish a synthetic head sweep and gaze figure eight instead of "
+                             "tracker output")
+    parser.add_argument("--no-gaze", action="store_true",
+                        help="with --synthetic, serve head pose only, as before gaze support")
     parser.add_argument("--display-area", type=parse_display_area,
                         help="top-left, top-right and bottom-left display corners in mm, "
                              "x,y,z each, comma-separated (tobii_get_display_area)")

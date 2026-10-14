@@ -1,6 +1,7 @@
 /*
  * Game integration test client: drives Star Citizen's tobii_gameintegration_x64.dll
- * through its exported C functions the way a game would, and prints head poses.
+ * through its exported C functions the way a game would, and prints head poses and
+ * gaze points.
  *
  * Usage: tgi_test_client.exe <dll> [first|window|rectangle|displays|<tracker url>] [seconds]
  * "first" (default) tracks the first tracker GetTrackerInfos reports, "window"
@@ -13,7 +14,10 @@
  * Every exported call goes through the DLL's lazily created "TGI C API" instance
  * (0x180005300). Signatures and structures were recovered statically, see
  * docs/game-integration-layer.md. OutputDebugString text of this process (the
- * layer's own log) is printed as "debug" lines.
+ * layer's own log) is printed as "debug" lines. GetGazePoints returns the layer's
+ * buffer of valid gaze points as (2x - 1, 1 - 2y) of the Stream Engine point, observed
+ * on Windows and Wine; callback 0x18000a0a0 drops invalid points and points 0.75 or
+ * more from the display centre on either axis.
  */
 #include <windows.h>
 #include <stdint.h>
@@ -26,6 +30,12 @@ typedef struct {
     float position_mm[3];
     int64_t timestamp_us;
 } HeadPose;
+
+typedef struct {
+    int64_t timestamp_us;
+    float x;
+    float y;
+} GazePoint;
 
 typedef struct {
     int32_t type;
@@ -48,6 +58,7 @@ typedef BOOL (*GetTrackerInfoCall)(TrackerInfo *info);
 typedef BOOL (*IsStreamSupportedCall)(const uint32_t *capability);
 typedef uint32_t (*GetHeadPosesCall)(const HeadPose **poses);
 typedef BOOL (*GetLatestHeadPoseCall)(HeadPose *pose);
+typedef uint32_t (*GetGazePointsCall)(const GazePoint **points);
 
 #define HEAD_POSE_CAPABILITY 2u
 #define TRACKER_INFO_STRINGS 6
@@ -199,10 +210,12 @@ int main(int argc, char **argv)
     const TrackerInfo *infos = NULL;
     TrackerInfo tracked = {0};
     const HeadPose *poses;
+    const GazePoint *points;
     HWND window = NULL;
     int count = 0, index, tracking = 0, updates = 0, last_connected = -1, connected;
     uint32_t pose_count, total_poses = 0, capability = HEAD_POSE_CAPABILITY;
-    int64_t last_timestamp = 0;
+    uint32_t point_count, total_points = 0;
+    int64_t last_timestamp = 0, last_point_timestamp = 0;
     ULONGLONG deadline, next_track = 0;
     BoolCall is_api_initialized, is_connected, is_present;
     VoidCall update, update_tracker_infos, stop_tracking, shutdown_api;
@@ -215,6 +228,7 @@ int main(int argc, char **argv)
     GetTrackerInfoCall get_tracker_info;
     IsStreamSupportedCall is_stream_supported;
     GetHeadPosesCall get_head_poses;
+    GetGazePointsCall get_gaze_points;
     BOOL infos_ready = FALSE;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -249,6 +263,7 @@ int main(int argc, char **argv)
     get_tracker_info = need("GetTrackerInfo");
     is_stream_supported = need("IsStreamSupported");
     get_head_poses = need("GetHeadPoses");
+    get_gaze_points = need("GetGazePoints");
 
     printf("api_initialized %d\n", is_api_initialized() & 0xff);
     update_tracker_infos();
@@ -324,6 +339,16 @@ int main(int argc, char **argv)
                    poses[index].rotation_deg[2], poses[index].position_mm[0],
                    poses[index].position_mm[1], poses[index].position_mm[2]);
         }
+        point_count = get_gaze_points(&points);
+        for (index = 0; index < (int)point_count; index++) {
+            if (points[index].timestamp_us <= last_point_timestamp)
+                continue;
+            last_point_timestamp = points[index].timestamp_us;
+            total_points++;
+            printf("gaze timestamp_us=%lld qpc_us=%lld x=%.6f y=%.6f\n",
+                   (long long)points[index].timestamp_us, (long long)qpc_us(), points[index].x,
+                   points[index].y);
+        }
         Sleep(16);
     }
     if (get_tracker_info(&tracked) & 0xff)
@@ -332,7 +357,8 @@ int main(int argc, char **argv)
     shutdown_api();
     if (window)
         DestroyWindow(window);
-    printf("summary head_poses=%u updates=%d tracking=%d connected=%d seconds=%.1f\n",
-           total_poses, updates, tracking, last_connected, seconds);
-    return total_poses > 0 ? 0 : 1;
+    printf("summary head_poses=%u gaze_points=%u updates=%d tracking=%d connected=%d "
+           "seconds=%.1f\n", total_poses, total_points, updates, tracking, last_connected,
+           seconds);
+    return total_poses > 0 || total_points > 0 ? 0 : 1;
 }

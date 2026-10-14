@@ -1,14 +1,15 @@
 /*
- * Head-pose test client: loads a Tobii Stream Engine DLL, creates a device from an
- * explicit tobii-prp:// URL, or from the first one the DLL's own discovery reports
- * when <url> is "discover", subscribes head pose and prints samples.
+ * Head-pose and gaze test client: loads a Tobii Stream Engine DLL, creates a device
+ * from an explicit tobii-prp:// URL, or from the first one the DLL's own discovery
+ * reports when <url> is "discover", subscribes head pose and gaze point and prints
+ * samples.
  *
  * Usage: prp_test_client.exe <dll> <url|discover> [seconds] [field_of_use]
  * <dll> is tobii_stream_engine.dll (named exports) or Star Citizen's
  * tobii_gameintegration_x64.dll 9.0.3.25, whose embedded Stream Engine entry points
  * are not exported and are called at their static addresses (docs/prp-bridge.md).
- * Output: one line per event; "head" lines carry the sample, the Stream Engine
- * system clock and the local QueryPerformanceCounter time in microseconds.
+ * Output: one line per event; "head" and "gaze" lines carry the sample, the Stream
+ * Engine system clock and the local QueryPerformanceCounter time in microseconds.
  */
 #include <windows.h>
 #include <stdint.h>
@@ -24,8 +25,15 @@ typedef struct {
     float rotation_xyz[3];
 } HeadPose;
 
+typedef struct {
+    int64_t timestamp_us;
+    int32_t validity;
+    float position_xy[2];
+} GazePoint;
+
 typedef void (*UrlCallback)(const char *url, void *user);
 typedef void (*HeadCallback)(const HeadPose *pose, void *user);
+typedef void (*GazeCallback)(const GazePoint *point, void *user);
 typedef void (*LogFunction)(void *context, int level, const char *text);
 typedef struct {
     void *context;
@@ -38,6 +46,8 @@ typedef int (*DeviceCreate)(void *api, const char *url, int field_of_use, void *
 typedef int (*DeviceDestroy)(void *device);
 typedef int (*HeadSubscribe)(void *device, HeadCallback callback, void *user);
 typedef int (*HeadUnsubscribe)(void *device);
+typedef int (*GazeSubscribe)(void *device, GazeCallback callback, void *user);
+typedef int (*GazeUnsubscribe)(void *device);
 typedef int (*ProcessCallbacks)(void *device);
 typedef int (*SystemClock)(void *api, int64_t *time_us);
 typedef int (*UpdateTimesync)(void *device);
@@ -49,7 +59,7 @@ typedef const char *(*ErrorMessage)(int error);
 
 static void *api;
 static SystemClock system_clock;
-static int head_count;
+static int head_count, gaze_count, valid_gaze_count;
 static LARGE_INTEGER frequency;
 
 static int64_t qpc_us(void)
@@ -76,6 +86,20 @@ static void on_head(const HeadPose *pose, void *user)
     fflush(stdout);
 }
 
+static void on_gaze(const GazePoint *point, void *user)
+{
+    int64_t clock_us = 0;
+    (void)user;
+    system_clock(api, &clock_us);
+    gaze_count++;
+    valid_gaze_count += point->validity != 0;
+    printf("gaze timestamp_us=%lld system_clock_us=%lld qpc_us=%lld validity=%d "
+           "position=%.6f,%.6f\n",
+           (long long)point->timestamp_us, (long long)clock_us, (long long)qpc_us(),
+           point->validity, point->position_xy[0], point->position_xy[1]);
+    fflush(stdout);
+}
+
 /* Game DLL build identity (PE TimeDateStamp, SizeOfImage) and entry RVAs, found statically. */
 #define GAME_DLL_TIMESTAMP 0x661d6182u
 #define GAME_DLL_IMAGE_SIZE 0x664000u
@@ -88,7 +112,8 @@ static const struct {
     {"tobii_enumerate_local_device_urls", 0xcd20}, {"tobii_device_create", 0xd1c0},       {"tobii_device_destroy", 0xd740},
     {"tobii_device_process_callbacks", 0xda50}, {"tobii_update_timesync", 0xdef0},
     {"tobii_get_device_info", 0xe310},     {"tobii_head_pose_subscribe", 0xfd80},
-    {"tobii_head_pose_unsubscribe", 0xfe20},
+    {"tobii_head_pose_unsubscribe", 0xfe20}, {"tobii_gaze_point_subscribe", 0xf920},
+    {"tobii_gaze_point_unsubscribe", 0xf9b0},
 };
 
 static HMODULE module;
@@ -160,6 +185,9 @@ int main(int argc, char **argv)
     UpdateTimesync update_timesync;
     HeadSubscribe head_subscribe;
     HeadUnsubscribe head_unsubscribe;
+    GazeSubscribe gaze_subscribe;
+    GazeUnsubscribe gaze_unsubscribe;
+    int gaze_subscribed = 0;
     ProcessCallbacks process_callbacks;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -188,6 +216,8 @@ int main(int argc, char **argv)
     update_timesync = need("tobii_update_timesync");
     head_subscribe = need("tobii_head_pose_subscribe");
     head_unsubscribe = need("tobii_head_pose_unsubscribe");
+    gaze_subscribe = need("tobii_gaze_point_subscribe");
+    gaze_unsubscribe = need("tobii_gaze_point_unsubscribe");
     process_callbacks = need("tobii_device_process_callbacks");
 
     if (report("api_create", api_create(&api, NULL, &logger)))
@@ -207,6 +237,8 @@ int main(int argc, char **argv)
             for (index = 0; index < DEVICE_INFO_STRINGS; index++)
                 printf("device_info[%d] %.255s\n", index, info + index * DEVICE_INFO_STRING);
         report("update_timesync", update_timesync(device));
+        gaze_subscribed = report("gaze_point_subscribe",
+                                 gaze_subscribe(device, on_gaze, NULL)) == 0;
         if (report("head_pose_subscribe", head_subscribe(device, on_head, NULL)) == 0) {
             deadline = GetTickCount64() + (ULONGLONG)(seconds * 1000);
             while (GetTickCount64() < deadline) {
@@ -220,9 +252,12 @@ int main(int argc, char **argv)
             }
             report("head_pose_unsubscribe", head_unsubscribe(device));
         }
+        if (gaze_subscribed)
+            report("gaze_point_unsubscribe", gaze_unsubscribe(device));
         report("device_destroy", device_destroy(device));
     }
     report("api_destroy", api_destroy(api));
-    printf("summary head_samples=%d process_calls=%d seconds=%.1f\n", head_count, calls, seconds);
-    return head_count > 0 ? 0 : 1;
+    printf("summary head_samples=%d gaze_samples=%d valid_gaze_samples=%d process_calls=%d "
+           "seconds=%.1f\n", head_count, gaze_count, valid_gaze_count, calls, seconds);
+    return head_count > 0 && (!gaze_subscribed || gaze_count > 0) ? 0 : 1;
 }

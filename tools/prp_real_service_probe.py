@@ -4,9 +4,9 @@
 Performs the client side of the named-pipe handshake on the command and
 subscription channels as the game DLL does (docs/service-transport.md), sends
 connect, optional timesync rounds, optional property gets (operation 5, read
-only, as the game integration layer sends them), stream start for head pose (PRP stream 2),
-records every pipe message with local QueryPerformanceCounter time, then sends
-stream stop and closes. It never sends calibration, settings or firmware
+only, as the game integration layer sends them), stream start for head pose (PRP stream 2)
+or the streams selected with --stream, records every pipe message with local
+QueryPerformanceCounter time, then sends stream stop and closes. It never sends calibration, settings or firmware
 commands. Output is JSONL on stdout.
 
 Requires 64-bit Windows Python with src/ on sys.path (prp.py, prp_session.py).
@@ -25,7 +25,8 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from tobii_linux.prp import ProtocolError, decode_envelope, decode_head_body  # noqa: E402
+from tobii_linux.prp import (  # noqa: E402
+    ProtocolError, decode_envelope, decode_gaze_body, decode_head_body)
 from tobii_linux.prp_session import (  # noqa: E402
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
     COMMAND_TIMESYNC, SERVER_PIPE_PREFIX, SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL,
@@ -53,6 +54,7 @@ WAIT_OBJECT_0 = 0
 INVALID_HANDLE = C.c_void_p(-1).value
 READ_CHUNK = 0x1000
 HEAD_POSE_STREAM = 2
+GAZE_POINT_STREAMS = (3, 29)
 
 kernel32 = C.WinDLL("kernel32", use_last_error=True) if sys.platform == "win32" else None
 
@@ -359,17 +361,29 @@ def notifications(reader, seconds):
 
 
 def stream_package(packet):
-    """Parse operation 1 head-pose packages; other operations are reported raw."""
+    """Parse operation 1 packages: head pose and gaze points decoded, every package kept raw."""
     payload = decode_envelope(packet)
     words = struct.unpack_from("<7I", payload)
-    if words[0] != 12 or words[2] != 1 or words[5] != HEAD_POSE_STREAM:
+    if words[0] != 12 or words[2] != 1:
         return {"operation": words[2], "raw": packet.hex()}
-    body = payload[28:28 + 52]
-    pose = decode_head_body(body)
-    return {"message_tag": words[1], "stream": words[5], "timestamp": pose.timestamp,
-            "position_valid": pose.position_valid, "position": list(pose.position),
-            "rotation_valid": list(pose.rotation_valid), "rotation": list(pose.rotation),
-            "trailer": payload[80:].hex()}
+    body_size = struct.unpack_from("<I", payload, 28)[0]
+    body = payload[28:28 + body_size]
+    package = {"message_tag": words[1], "stream": words[5], "body_size": body_size,
+               "trailer": payload[28 + body_size:].hex(), "raw": packet.hex()}
+    if words[5] == HEAD_POSE_STREAM and body_size == 52:
+        pose = decode_head_body(body)
+        package.update(timestamp=pose.timestamp, position_valid=pose.position_valid,
+                       position=list(pose.position), rotation_valid=list(pose.rotation_valid),
+                       rotation=list(pose.rotation))
+    elif words[5] in GAZE_POINT_STREAMS and body_size == 24:
+        point = decode_gaze_body(body)
+        package.update(timestamp=point.timestamp, valid=point.valid, x=point.x, y=point.y)
+    elif body_size >= 12:
+        high, low = struct.unpack_from("<II", body, 4)
+        package.update(timestamp=high << 32 | low,
+                       words=[f"{word:08x}" for word in struct.unpack_from(
+                           f"<{body_size // 4}I", body)])
+    return package
 
 
 def image_components():
@@ -444,10 +458,14 @@ def worker(args):
             notifications(packages, 1.0)
             subscribe_properties(command, commands, session, args.subscribe_property,
                                  COMMAND_PROPERTY_UNSUBSCRIBE)
-        tag = session.next_command_tag()
-        command.send_packet(encode_stream_request(tag, COMMAND_STREAM_START, HEAD_POSE_STREAM))
-        start = commands.response(tag, 5.0)
-        emit("stream_start_response", status=start.status, value=start.value)
+        started = []
+        for stream in args.stream:
+            tag = session.next_command_tag()
+            command.send_packet(encode_stream_request(tag, COMMAND_STREAM_START, stream))
+            start = commands.response(tag, 5.0)
+            emit("stream_start_response", stream=stream, status=start.status, value=start.value)
+            if start.status == 0:
+                started.append(stream)
         count = 0
         for received_at, packet in packages.packets(args.seconds):
             parsed = stream_package(packet)
@@ -455,10 +473,11 @@ def worker(args):
             emit("stream_package", client_received_us=received_at, **parsed)
         if COMMAND_TIMESYNC in connect.connect.supported_commands:
             timesync(state, session, 4)
-        tag = session.next_command_tag()
-        command.send_packet(encode_stream_request(tag, COMMAND_STREAM_STOP, HEAD_POSE_STREAM))
-        stop = commands.response(tag, 5.0)
-        emit("stream_stop_response", status=stop.status, value=stop.value)
+        for stream in started:
+            tag = session.next_command_tag()
+            command.send_packet(encode_stream_request(tag, COMMAND_STREAM_STOP, stream))
+            stop = commands.response(tag, 5.0)
+            emit("stream_stop_response", stream=stream, status=stop.status, value=stop.value)
         late = sum(1 for _ in packages.packets(0.5))
         emit("summary", packages=count, packages_after_stop=late, seconds=args.seconds)
     finally:
@@ -479,8 +498,11 @@ def main():
     parser.add_argument("--subscribe-property", type=lambda text: int(text, 0), action="append",
                         default=[], help="property id to subscribe with command 5 and "
                                          "unsubscribe with command 6 afterwards (repeatable)")
+    parser.add_argument("--stream", type=lambda text: int(text, 0), action="append",
+                        help="PRP stream id to start and record (repeatable, default 2)")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.stream = args.stream or [HEAD_POSE_STREAM]
     if not 0 < args.seconds <= 30:
         parser.error("seconds must be in (0, 30]")
     if args.worker:
@@ -493,6 +515,7 @@ def main():
                "--seconds", str(args.seconds), "--field-of-use", str(args.field_of_use)]
     command += [f"--property={property_id}" for property_id in args.property]
     command += [f"--subscribe-property={property_id}" for property_id in args.subscribe_property]
+    command += [f"--stream={stream}" for stream in args.stream]
     try:
         return subprocess.run(command, timeout=args.seconds + 30).returncode
     except subprocess.TimeoutExpired:

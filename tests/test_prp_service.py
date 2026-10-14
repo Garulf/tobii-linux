@@ -9,12 +9,14 @@ import asyncio
 import struct
 import unittest
 
+from tobii_linux import gaze
 from tobii_linux.head_pose_pipeline import HeadPoseSample
-from tobii_linux.prp import HEAD_POSE, decode_envelope, decode_head_body, encode_envelope
+from tobii_linux.prp import HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body, encode_envelope
 from tobii_linux.prp_service import (
     FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_REPLY_PIPE,
-    DisplayArea, HeadPoseHub, PrpService, parse_display_area, decode_names, encode_frame, encode_pipe_open,
-    error_response, property_error, read_frame, request_header, stream_package)
+    GAZE_SERVICE_STREAMS, DisplayArea, GazeHub, HeadPoseHub, PrpService, parse_display_area,
+    decode_names, encode_frame, encode_pipe_open, error_response, gaze_package, property_error,
+    read_frame, request_header, stream_package, synthetic_gaze_frame)
 from tobii_linux.prp_session import (
     COMMAND_PROPERTY_UNSUBSCRIBE, PROPERTY_DISPLAY_AREA,
     PROPERTY_DISPLAY_ID, decode_display_area, decode_property_response,
@@ -117,6 +119,17 @@ GAME_DISPLAY_AREA_REQUEST = bytes.fromhex(
 GAME_PRESENCE_SUBSCRIBE_REQUEST = bytes.fromhex(
     "545052502c000000785052500c00000004000000090000000400000008000000050000000400000008000000"
     "0b0000000400000000000000")
+# Gaze session against the real service (gaze-host/gaze-probe-fou1.jsonl): stream start
+# and stop responses by tag, after connect with tag 1, for streams 3, 29, 4, 6, 5, 33, 2.
+REAL_GAZE_STREAM_RESPONSES = {
+    (2, COMMAND_STREAM_START, 3): "0000000003000000040000000800000003000000",
+    (3, COMMAND_STREAM_START, 29): "000000000300000004000000080000001d000000",
+    (4, COMMAND_STREAM_START, 4): "0000000003000000040000000800000004000000",
+    (5, COMMAND_STREAM_START, 6): "1100000003000000040000000800000006000000",
+    (6, COMMAND_STREAM_START, 5): "0200000003000000040000000800000005000000",
+    (7, COMMAND_STREAM_START, 33): "1100000003000000040000000800000021000000",
+    (8, COMMAND_STREAM_STOP, 3): "0000000004000000040000000800000003000000",
+}
 REAL_SUBSCRIPTION_INFO = bytes.fromhex("080000000000")
 REAL_TIMESYNC_INFO = bytes.fromhex("000000000000")
 CLIENT_PID = 0x1234
@@ -534,3 +547,99 @@ class WineClockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GazeServiceTests(ServiceTests):
+    async def asyncSetUp(self):
+        self.hub, self.gaze_hub = HeadPoseHub(), GazeHub()
+        self.service = PrpService(self.hub, "ET5-TEST", clock=lambda: FIXED_CLOCK_US,
+                                  gaze_hub=self.gaze_hub)
+        self.server = await self.service.serve("127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        self.channels = []
+
+    def test_device_presence_replaces_head_pose_validity(self):
+        hub = HeadPoseHub()
+        hub.publish(HeadPoseSample(10, True, (0.0,) * 3, (0.0,) * 3))
+        self.assertEqual(hub.presence, 3)
+        hub.publish_presence(20, 1)
+        hub.publish(HeadPoseSample(30, True, (0.0,) * 3, (0.0,) * 3))
+        self.assertEqual((hub.presence, hub.presence_since_us, hub.present), (2, 20, False))
+        hub.publish_presence(40, 2)
+        hub.publish_presence(50, 2)
+        self.assertEqual((hub.presence, hub.presence_since_us), (3, 40))
+        hub.publish_presence(60, 7)
+        self.assertEqual(hub.presence, 1)
+
+    async def test_connect_lists_the_real_service_gaze_streams(self):
+        *_, packet = await self.session()
+        self.assertEqual(decode_command_response(packet).connect.streams, GAZE_SERVICE_STREAMS)
+
+    async def test_stream_responses_match_the_real_service(self):
+        command, *_ = await self.session()
+        for (tag, request, stream), block in REAL_GAZE_STREAM_RESPONSES.items():
+            with self.subTest(tag=tag, stream=stream):
+                command.send_packet(encode_stream_request(tag, request, stream))
+                packet = await command.packet()
+                expected = bytes.fromhex(
+                    "5450525030000000645052500c000000" + f"{tag:02x}000000"
+                    + "0a000000040000000c000000" + block + "0400000000000000")
+                self.assertEqual(packet, expected)
+
+    async def test_gaze_streams_push_each_frame_until_stopped(self):
+        command, subscription, _, tags, _, _ = await self.session()
+        streams = (gaze.PRP_GAZE_POINT, gaze.PRP_RESPONSIVE_GAZE_POINT, gaze.PRP_GAZE_ORIGIN)
+        for stream in streams:
+            command.send_packet(encode_stream_request(tags.next_command_tag(),
+                                                      COMMAND_STREAM_START, stream))
+            self.assertEqual(decode_command_response(await command.packet()).status, 0)
+        frame = synthetic_gaze_frame(FIXED_CLOCK_US + 9, FIXED_CLOCK_US)
+        self.gaze_hub.publish(frame)
+        packages = {struct.unpack_from("<I", decode_envelope(p), 20)[0]: p
+                    for p in [await subscription.packet() for _ in streams]}
+        self.assertEqual(packages, {stream: gaze_package(frame, stream) for stream in streams})
+        point = decode_gaze_body(decode_envelope(packages[gaze.PRP_GAZE_POINT])[28:52])
+        self.assertEqual((point.timestamp, point.valid, (point.x, point.y)),
+                         (FIXED_CLOCK_US + 9, True, frame.device.combined_point))
+        for stream in streams:
+            command.send_packet(encode_stream_request(tags.next_command_tag(),
+                                                      COMMAND_STREAM_STOP, stream))
+            self.assertEqual(decode_command_response(await command.packet()).status, 0)
+        self.assertEqual(self.gaze_hub.queues, set())
+
+    async def test_head_pose_and_gaze_streams_are_independent(self):
+        command, subscription, _, tags, _, _ = await self.session()
+        for stream in (HEAD_POSE, gaze.PRP_GAZE_POINT):
+            command.send_packet(encode_stream_request(tags.next_command_tag(),
+                                                      COMMAND_STREAM_START, stream))
+            await command.packet()
+        command.send_packet(encode_stream_request(tags.next_command_tag(), COMMAND_STREAM_STOP,
+                                                  HEAD_POSE))
+        await command.packet()
+        self.hub.publish(HeadPoseSample(FIXED_CLOCK_US, True, (0.0, 0.0, 600.0), (0.0, 0.0, 0.0)))
+        frame = synthetic_gaze_frame(FIXED_CLOCK_US, FIXED_CLOCK_US)
+        self.gaze_hub.publish(frame)
+        self.assertEqual(await subscription.packet(), gaze_package(frame, gaze.PRP_GAZE_POINT))
+        with self.assertRaises(asyncio.TimeoutError):
+            await subscription.packet(timeout=0.2)
+
+    async def test_gaze_disconnect_releases_streams(self):
+        command, subscription, _, tags, _, _ = await self.session()
+        command.send_packet(encode_stream_request(tags.next_command_tag(), COMMAND_STREAM_START,
+                                                  gaze.PRP_GAZE_POINT))
+        await command.packet()
+        command.close()
+        subscription.close()
+        for _ in range(50):
+            if not self.gaze_hub.queues:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual(self.gaze_hub.queues, set())
+
+    async def test_stream_requests_for_other_streams_and_before_start(self):
+        command, _, _, tags, _, _ = await self.session()
+        command.send_packet(encode_stream_request(tags.next_command_tag(), COMMAND_STREAM_START, 7))
+        self.assertEqual(decode_command_response(await command.packet()).status, 2)
+        command.send_packet(encode_stream_request(tags.next_command_tag(), COMMAND_STREAM_STOP,
+                                                  gaze.PRP_GAZE_POINT))
+        self.assertEqual(decode_command_response(await command.packet()).status, 5)

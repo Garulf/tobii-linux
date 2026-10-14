@@ -4,7 +4,9 @@ Head pose from the Linux driver reaches Star Citizen's Tobii DLL under Wine
 through two pieces:
 
 - `src/tobii_linux/prp_service.py`: a Linux asyncio service that speaks the
-  service side of the platform runtime protocol (PRP) for head pose.
+  service side of the platform runtime protocol (PRP) for head pose and, with a
+  gaze hub, gaze point, responsive gaze point and gaze origin
+  ([gaze-host.md](gaze-host.md)).
 - `tools/prp_bridge/prp_bridge.c`: a small Windows program run in the game's
   Wine prefix. It owns the Tobii named pipes and relays every pipe message to
   the service over loopback TCP.
@@ -38,6 +40,8 @@ Evidence labels:
 | Game integration layer through its C exports ([game-integration-layer.md](game-integration-layer.md)): scan, `TrackTracker`, `GetHeadPoses` | works, 330 head poses per 10 s run (every package), two runs per bridge session; `TrackRectangle` works only with `--display-id` | live (Wine 11.0 + patch) |
 | Same client against the real service | tracker found and connected; no head poses because nobody was in front of the tracker | live (Windows) |
 | Property replies (display area, display id, model, properties 2 and 4, user presence subscribe, refusals, unsubscribe) | byte-identical to the real service except one uninitialised padding byte in the model string | live (Windows), unit |
+| Gaze streams 3, 29 and 4 ([gaze-host.md](gaze-host.md)): packages, stream start/stop and the refusals of streams 5, 6 and 33 | byte-identical to the real service | live (Windows), unit |
+| Gaze points through both client DLLs and `GetGazePoints` of the game integration layer, synthetic service | every package delivered; the layer returns the same `(2x - 1, 1 - 2y)` as on Windows | live (Wine 11.0 + patch) |
 
 ## Architecture
 
@@ -136,7 +140,8 @@ pipe as a `tobii-ttp://` device.
 | property get (operation 5), property subscribe and unsubscribe (commands 5 and 6) | see [game-integration-layer.md](game-integration-layer.md#service-behaviour) | real service |
 | any other command | status 2 with a 16-byte zero body block | guess; the body size satisfies the client decoder's fixed-size branches (0x180055780, static) |
 
-Stream packages: operation 1, message tag 0, stream 2, one 52-byte head body,
+Stream packages: operation 1, message tag 0, stream 2, one 52-byte head body
+(gaze streams: [gaze-host.md](gaze-host.md)),
 one TPRP packet per pipe message, as the real service sends them.
 `HeadPoseSample.valid` drives all four validity flags. Packages for a client
 are dropped while more than 64 KiB are unsent on its TCP connection, so a
