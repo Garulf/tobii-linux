@@ -21,39 +21,71 @@ class CalibrationAborted(RuntimeError):
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Eye tracker calibration</title>
 <style>
-html,body{margin:0;height:100%;background:#202124;overflow:hidden;cursor:none;font-family:sans-serif}
+html,body{margin:0;height:100%;background:#202124;overflow:hidden;font-family:sans-serif;color:#e8eaed}
+body.running{cursor:none}
 #dot{position:absolute;width:60px;height:60px;margin:-30px 0 0 -30px;border-radius:50%;
 background:#f5f5f5;transform:scale(1);transition:transform 900ms ease-in,left 500ms,top 500ms;display:none}
 #dot::after{content:"";position:absolute;left:24px;top:24px;width:12px;height:12px;border-radius:50%;background:#d93025}
 #dot.small{transform:scale(0.35)}
 #dot.pop{transform:scale(0);transition:transform 250ms}
-#text{position:absolute;left:0;right:0;top:40%;text-align:center;color:#e8eaed;font-size:28px;cursor:default}
+#intro,#message{position:absolute;left:10%;right:10%;top:36%;text-align:center}
+#intro h1{font-size:34px;font-weight:normal;margin:0 0 18px}
+#intro p{font-size:22px;margin:8px 0}
+#status{font-size:26px;margin-top:28px;min-height:1.3em}
+#intro .hint{font-size:17px;color:#9aa0a6;margin-top:28px}
+#message{font-size:28px;display:none}
 </style></head>
-<body><div id="dot"></div><div id="text">Sit as for normal use. Press a key or click to start.<br>Esc stops the calibration.</div>
+<body tabindex="-1"><div id="dot"></div>
+<div id="intro"><h1>Let's calibrate for your eyes</h1>
+<p>Look at each dot until it disappears. Keep the screen at the same angle while it runs.</p>
+<p id="status"></p>
+<p class="hint">Press any key or click to start now. Esc stops the calibration.</p></div>
+<div id="message"></div>
 <script>
-const dot = document.getElementById('dot'), text = document.getElementById('text');
-let seq = -1, started = location.pathname === '/autostart', aborted = false;
+const COUNTDOWN_S = 3;
+const dot = document.getElementById('dot'), intro = document.getElementById('intro');
+const message = document.getElementById('message'), status = document.getElementById('status');
+let seq = -1, started = location.pathname === '/autostart', aborted = false, startNow = false;
+let fullscreenSince = null;
 function fullscreen() {
   return document.fullscreenElement != null ||
-    (window.innerWidth >= screen.width - 1 && window.innerHeight >= screen.height - 1);
+    (window.innerWidth >= screen.width - 2 && window.innerHeight >= screen.height - 2);
 }
 function ack(s) {
   fetch('/ack', {method: 'POST', body: JSON.stringify({seq: s, width: window.innerWidth,
     height: window.innerHeight, screen_width: screen.width, screen_height: screen.height,
-    fullscreen: fullscreen(), started: started, aborted: aborted})});
+    fullscreen: fullscreen(), started: started, aborted: aborted})}).catch(() => {});
 }
-function start() {
+function setText(element, text) { if (element.textContent !== text) element.textContent = text; }
+function requestStart() {
   if (!document.fullscreenElement && document.documentElement.requestFullscreen)
     document.documentElement.requestFullscreen().catch(() => {});
-  started = true;
+  startNow = true;
 }
-document.addEventListener('click', start);
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') { aborted = true; ack(seq); } else start();
-});
+function tick() {
+  if (started || aborted) return;
+  if (!fullscreen()) {
+    fullscreenSince = null;
+    setText(status, 'The page has to fill the screen: press F11 or click.');
+  } else {
+    fullscreenSince = fullscreenSince || performance.now();
+    const left = COUNTDOWN_S - Math.floor((performance.now() - fullscreenSince) / 1000);
+    if (startNow || left <= 0) { started = true; document.body.classList.add('running');
+                                 setText(status, 'Starting...'); ack(seq); return; }
+    setText(status, 'Starting in ' + left);
+  }
+  setTimeout(tick, 100);
+}
+function stop() {
+  aborted = true; ack(seq);
+  intro.style.display = 'none'; dot.style.display = 'none';
+  message.style.display = 'block'; setText(message, 'Calibration stopped.');
+}
+document.addEventListener('click', requestStart);
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape') stop(); else requestStart(); });
 function show(state) {
   if (state.phase === 'point') {
-    text.style.display = 'none';
+    intro.style.display = 'none'; message.style.display = 'none';
     dot.className = '';
     dot.style.display = 'block';
     dot.style.left = (state.x * window.innerWidth) + 'px';
@@ -63,12 +95,11 @@ function show(state) {
   } else if (state.phase === 'collected') {
     dot.className = 'pop';
     ack(state.seq);
-  } else {
-    dot.style.display = 'none';
-    text.style.display = 'block';
-    text.textContent = state.message;
+  } else if (state.phase === 'message') {
+    intro.style.display = 'none'; dot.style.display = 'none';
+    message.style.display = 'block'; setText(message, state.message);
     ack(state.seq);
-  }
+  } else ack(state.seq);
 }
 async function poll() {
   try {
@@ -78,9 +109,26 @@ async function poll() {
   } catch (e) {}
   setTimeout(poll, 50);
 }
-poll();
+window.focus(); document.body.focus();
+tick(); poll();
 </script></body></html>
 """
+
+
+FULLSCREEN_TOLERANCE_PX = 2
+
+
+def fills_screen(report):
+    """Whether the page covered the whole screen: fullscreen, or a kiosk window as large as the screen."""
+    if not report:
+        return False
+    if report.get('fullscreen'):
+        return True
+    try:
+        return (report['width'] >= report['screen_width'] - FULLSCREEN_TOLERANCE_PX
+                and report['height'] >= report['screen_height'] - FULLSCREEN_TOLERANCE_PX)
+    except (KeyError, TypeError):
+        return False
 
 
 class PageState:
@@ -118,9 +166,9 @@ class PageState:
             return self.acks[seq]
 
     def wait_started(self, timeout_s):
-        """Block until a fullscreen page reports that the user started the calibration."""
+        """Block until a page covering the screen reports that the calibration started."""
         with self.condition:
-            self._wait(lambda: bool(self.display and self.display.get('fullscreen') and self.display.get('started')),
+            self._wait(lambda: fills_screen(self.display) and bool(self.display.get('started')),
                        timeout_s, 'No fullscreen calibration page was started')
             return self.display
 
@@ -191,7 +239,7 @@ settle_s, the 200 ms the Tobii client waits for the saccade to end.
         self.server.server_close()
 
     def wait_for_display(self, timeout_s):
-        """Block until the user starts a fullscreen page (key or click); returns its reported size."""
+        """Block until a fullscreen page started (after its countdown, or a key or click); returns its report."""
         return self.page.wait_started(timeout_s)
 
     @property
@@ -206,7 +254,7 @@ settle_s, the 200 ms the Tobii client waits for the saccade to end.
     def show_point(self, index, x, y):
         seq = self.page.publish(phase='point', index=index, x=x, y=y)
         report = self.page.wait_ack(seq, self.step_timeout_s)
-        if not report.get('fullscreen'):
+        if not fills_screen(report):
             raise RuntimeError('The calibration page left fullscreen')
         time.sleep(self.settle_s)
 

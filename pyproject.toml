@@ -19,3 +19,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "tobii_linux.demo" = ["static/*"]
+"tobii_linux.setup" = ["static/*"]

@@ -585,6 +585,27 @@ class PageTests(unittest.TestCase):
             ui.close()
 
 
+class PageStartTests(unittest.TestCase):
+    def test_a_kiosk_window_as_large_as_the_screen_counts_as_fullscreen(self):
+        fills = calibration_page.fills_screen
+        self.assertTrue(fills({'fullscreen': False, 'width': 1707, 'height': 960,
+                               'screen_width': 1708, 'screen_height': 961}))
+        self.assertFalse(fills({'fullscreen': False, 'width': 1280, 'height': 900,
+                                'screen_width': 2560, 'screen_height': 1440}))
+        self.assertFalse(fills(None))
+
+    def test_page_started_by_its_countdown_without_the_fullscreen_flag(self):
+        ui = calibration_page.PageCalibrationUI(port=0, settle_s=0).start()
+        self.addCleanup(ui.close)
+        page = urllib.request.urlopen(ui.url).read()
+        self.assertIn(b'COUNTDOWN_S = 3', page)
+        report = {'seq': 0, 'fullscreen': False, 'started': True, 'width': 2560, 'height': 1440,
+                  'screen_width': 2560, 'screen_height': 1440}
+        request = urllib.request.Request(ui.url + 'ack', data=json.dumps(report).encode(), method='POST')
+        urllib.request.urlopen(request).read()
+        self.assertEqual(ui.wait_for_display(1)['width'], 2560)
+
+
 class FramedTransport:
     """Bulk transfers with the channel framing of usb_framing, for the traffic log."""
     def __init__(self, reads):

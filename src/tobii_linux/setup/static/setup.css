@@ -1,0 +1,120 @@
+/* Colours, type sizes and layout follow Tobii's configuration app (docs/setup-flow.md). */
+:root {
+  --background: #021419;
+  --headline: #d9f4ff;
+  --text: #bfd6e0;
+  --foreground: #afc4cd;
+  --accent: #008dbf;
+  --accent-hover: #00ace9;
+  --control: #004b66;
+  --control-hover: #018ec1;
+  --problem: #fdd663;
+  --explaining: clamp(22px, 2.6vh, 37px);
+  --headline-size: clamp(18px, 1.95vh, 28px);
+  --subtext: clamp(14px, 1.35vh, 19px);
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--headline);
+  font-family: "Segoe UI Light", "Segoe UI", system-ui, sans-serif;
+  font-weight: 300;
+  user-select: none;
+  outline: none;
+}
+
+body.calibrating { background: #000; }
+body.cursor-hidden, body.cursor-hidden * { cursor: none !important; }
+
+.screen { position: absolute; inset: 0; display: none; }
+.screen.active { display: block; }
+.screen.centred.active { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+
+p { margin: 0; }
+.explaining { font-size: var(--explaining); color: var(--headline); text-align: center; }
+.headline { font-size: var(--headline-size); color: var(--headline); text-align: center; margin-top: .4em; }
+.subtext { font-size: var(--subtext); color: var(--text); }
+.readout { font-size: var(--subtext); color: var(--foreground); margin-top: 1.4em; min-height: 1.4em; }
+
+button {
+  font: inherit;
+  font-size: clamp(13px, 1.15vh, 16px);
+  min-width: 120px;
+  min-height: 33px;
+  padding: 0 25px;
+  border: 0;
+  border-radius: 17px;
+  color: var(--headline);
+  background: var(--control);
+  cursor: pointer;
+  transition: background .1s;
+}
+button:hover { background: var(--control-hover); color: #fff; }
+button.primary { background: var(--accent); color: #fff; }
+button.primary:hover { background: var(--accent-hover); }
+button:disabled, button:disabled:hover { background: #2b3940; color: #637279; cursor: default; }
+.buttons { margin-top: 50px; display: flex; gap: 15px; justify-content: center; }
+.buttons.right { justify-content: flex-end; }
+
+.close {
+  position: absolute; top: 10px; right: 14px; z-index: 10;
+  min-width: 0; min-height: 0; width: 44px; height: 44px; padding: 0;
+  background: transparent; color: var(--foreground); font-size: 22px; border-radius: 22px;
+}
+.close:hover { background: rgba(255, 255, 255, .08); color: #fff; }
+
+.banner {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 9;
+  padding: 10px; text-align: center; font-size: var(--subtext);
+  background: #3b3000; color: var(--problem);
+}
+
+.spinner { width: 48px; height: 48px; position: relative; margin-bottom: 30px; }
+.spinner.large { position: absolute; left: 50%; top: 50%; margin: -24px 0 0 -24px; transform: scale(1.5); }
+.spinner i {
+  position: absolute; left: 21px; top: 2px; width: 6px; height: 6px; border-radius: 3px;
+  background: var(--foreground); transform-origin: 3px 22px; animation: spinner-fade 1.2s linear infinite;
+}
+@keyframes spinner-fade { 0% { opacity: 1; } 75%, 100% { opacity: .1; } }
+
+/* Display setup: Tobii's grid puts the text at the bottom of the second row (31 % down) and Done below it. */
+#display-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.display-text { position: absolute; left: 10%; right: 10%; top: 0; height: 31%; display: flex;
+                flex-direction: column; justify-content: flex-end; text-align: center; pointer-events: none; }
+.display-text .subtext { margin-top: .9em; }
+.display-buttons { position: absolute; left: 0; right: 0; top: 31%; height: 23%; display: flex;
+                   align-items: center; justify-content: center; }
+
+#display-save .subtext { margin-top: 1.2em; }
+
+/* Eye positioning: a faint track box of golden ratio in the middle, the eyes as circles inside it. */
+#positioning-upright { position: absolute; top: 9%; left: 0; right: 0; text-align: center; }
+#trackbox { position: absolute; left: 50%; top: 50%; background: rgba(255, 255, 255, .03); overflow: hidden; }
+.eye { position: absolute; border-radius: 50%; background: #fff; opacity: 0; will-change: left, top; }
+#welcome-one { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); opacity: 0; }
+#welcome-two, #positioning-hint { position: absolute; left: 0; right: 0; bottom: 40px; opacity: 0; }
+#positioning-status { position: absolute; left: 0; right: 0; bottom: 12%; text-align: center; min-height: 1.4em; }
+
+/* Calibration: black, the targets made of particles in the accent colour. */
+#targets, #calibration { overflow: hidden; }
+.target { position: absolute; width: 0; height: 0; opacity: 0; }
+.particle { position: absolute; border-radius: 50%; background: var(--accent); }
+#centre-dot { position: absolute; left: 50%; top: 50%; width: 15px; height: 15px; margin: -7.5px 0 0 -7.5px;
+              border-radius: 50%; background: var(--accent); transform: scale(0); }
+.overlay { position: absolute; left: 0; right: 0; top: 50%; margin-top: -120px; opacity: 0; }
+
+#calibration-failed .message, #profile .message { max-width: 760px; padding: 0 30px; }
+#calibration-failed .headline, #profile .headline { text-align: left; margin-bottom: 30px; }
+.tips { margin: 1em 0 0; padding-left: 1.2em; line-height: 1.6; }
+#profile label { display: block; margin-top: 2em; margin-bottom: .5em; }
+.profile-row { display: flex; gap: 50px; align-items: center; }
+#profile-name { width: 400px; font: inherit; font-size: 19px; padding: 6px 10px; color: #fff; background: #0b2a33;
+                border: 1px solid #1d4c5f; border-radius: 3px; outline: none; user-select: text; }
+#profile-name:focus { border-color: var(--accent); }
+.problem { color: var(--accent-hover); font-size: var(--subtext); min-height: 1.4em; margin-top: .6em; }
+
+#finished .headline { margin-top: .8em; color: var(--text); }
+#finished .subtext { margin-top: 1.2em; }

@@ -290,6 +290,10 @@ demo use it without writing anything to the device.
 
 ### The setup page
 
+`tobii-linux setup` ([setup flow](setup-flow.md)) runs this step inside the
+guided setup with Tobii's layout and asks before writing; the tool below
+remains for scripted use.
+
 ```sh
 python3 tools/display_setup.py setup [--edid FILE | --connector NAME] [--output display-area] [--apply] [--then-calibrate]
 ```
@@ -299,11 +303,15 @@ on port 8776 (open `http://localhost:8776/` fullscreen on the display the
 tracker is under; under WSL a Windows browser reaches it through mirrored
 networking) and waits for the user:
 
-- The page shows the intro text first; a click or key asks for fullscreen and
-  shows the lines. It reports its viewport, `devicePixelRatio` and the screen
-  size in device pixels; the canvas is drawn at device resolution. Done (or
-  Enter) is refused unless the page covers the whole screen, because line
-  positions are fractions of the page width.
+- The page asks "Where is your eye tracker?" only when the device holds no
+  display area (`display_setup.is_mapped`), as Tobii shows its intro only
+  while no monitor is mapped; "This display" or Enter continues. Otherwise it
+  goes straight to the lines with the instruction from
+  `display_setup.line_instructions`. It reports its viewport,
+  `devicePixelRatio` and the screen size in device pixels; the canvas is
+  drawn at device resolution. Done (or Enter) is refused unless the page
+  covers the whole screen (fullscreen, or a kiosk window as large as the
+  screen), because line positions are fractions of the page width.
 - Initial lines: `display_setup.initial_lines`, the factory's rules: the
   stored area decomposed with the device mounting (size replaced by the EDID
   size when `--edid` or `--connector` gives one), else an estimate from the
@@ -312,11 +320,15 @@ networking) and waits for the user:
 - The drawing follows the control's layout (tracker 150 px above the bottom,
   286/184 as wide as the line distance, dashed lines with side triangles and
   a downward arrowhead); the tracker is a plain rounded bar, not Tobii's
-  artwork. Dragging works as in the app, with the same limits. As a Linux
-  addition the arrow keys move the selected item by one device pixel (Shift:
-  ten), L, R and B select the left line, the right line or both, Enter
-  confirms and Esc cancels. The page shows the resulting size, diagonal and
-  tracker offset live.
+  artwork. Dragging works as in the app, with the same limits: pressing near
+  a line (the nearest one when both are close) below its top drags only that
+  line and selects it; pressing on the tracker, which is labelled "drag to
+  move both arrows", drags both. As a Linux addition the arrow keys move the
+  selected line, which starts as the left one and is drawn solid and blue,
+  by one device pixel (Shift: ten); Tab, L and R select a line, Enter
+  confirms and Esc or Cancel cancels. Earlier the page started with both
+  lines selected, so the keys moved both. The page shows the resulting size,
+  diagonal and tracker offset live.
 - On confirm, `display_setup.area_from_lines` computes size, offset and area
   as Done does; the tool saves `OUTPUT.setpm` (screenplane.setpm layout) and
   `OUTPUT.json` (the corners, `display_args` and the full `--display` option),
@@ -374,6 +386,10 @@ Setup page:
   device pixels (0.0234 of the width), the readout and the confirmed result
   agreed (554.8 x 312.3 mm, +4.75 mm), and the drawing was checked on
   screenshots.
+- After the 2026-10-14 fixes (`evidence/private/ui-fix/old-pages-check.mjs`,
+  2560 x 1440 and 1280 x 720): straight to the lines without the intro for a
+  mapped tracker, Shift+Right moved only the left line, Tab then Left only the
+  right line; screenshots `old-*-display-page*.png`.
 - Live, without a person (albedo, 2026-10-14 02:02,
   `evidence/private/display-setup/albedo/setup-check.cmd`, output in
   `evidence/private/display-setup/setup-check.out`): headless Edge on Windows

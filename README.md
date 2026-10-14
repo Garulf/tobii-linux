@@ -71,6 +71,17 @@ logs without a tracker ([demo](docs/demo.md)):
 PYTHONPATH=src python3 -m tobii_linux.demo
 ```
 
+`tobii-linux setup` walks through what Tobii's setup does on Windows, on one
+browser page it opens itself: the display setup when the tracker has none,
+the eye positioning check, the calibration and a named profile. It asks
+before writing a display setup and puts the previous calibration back when
+it is cancelled; `--simulate unmapped` tries the pages without a tracker
+([setup flow](docs/setup-flow.md)):
+
+```sh
+PYTHONPATH=src python3 -m tobii_linux.setup
+```
+
 ## Star Citizen under Wine
 
 Three pieces are needed:
@@ -152,7 +163,7 @@ evaluation), but no NixOS machine has run them yet.
 
 ## Documents
 
-- [Project status](docs/project-status.md), [browser demo](docs/demo.md)
+- [Project status](docs/project-status.md), [browser demo](docs/demo.md), [setup flow](docs/setup-flow.md), [display setup](docs/display-setup.md), [gaze calibration](docs/gaze-calibration.md)
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)

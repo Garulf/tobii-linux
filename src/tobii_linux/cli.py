@@ -129,10 +129,14 @@ def main():
     if sys.argv[1:2] == ['demo']:
         from .demo.app import main as demo
         return demo(sys.argv[2:], prog=f'{Path(sys.argv[0]).name} demo')
+    if sys.argv[1:2] == ['setup']:
+        from .setup.app import main as setup
+        return setup(sys.argv[2:], prog=f'{Path(sys.argv[0]).name} setup')
     parser = argparse.ArgumentParser(description='Native Eye Tracker 5 driver (experimental)')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('probe', help='Inspect standard USB descriptors without claiming interfaces')
     commands.add_parser('demo', help='Serve the live browser demo; see demo --help for its options')
+    commands.add_parser('setup', help='Guided display setup and calibration in the browser; see setup --help')
     headpose_parser = commands.add_parser(
         'headpose', help='Start the tracker and print head-pose samples as JSON lines')
     serve_parser = commands.add_parser(

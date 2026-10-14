@@ -45,6 +45,12 @@ FIXATION_WINDOW_MS = 300.0
 FIXATION_SPREAD = 0.03
 FIXATION_MIN_SAMPLES = 6
 FIXATION_TIMEOUT_S = 4.0
+SACCADE_S = 0.2
+ATTENTION_STALL_MS = 4000.0
+ATTENTION_NO_POP_MS = 10000.0
+USER_AWAY_MS = 500.0
+MAX_STALLED_RUNS = 5
+STAGES_STEP = 'targets'
 
 READ_COMMANDS = frozenset(gd.READ_ONLY | {Command.GET_DEVICE_STATUS, Command.GET_DISPLAY_AREA,
                                           Command.GET_DEVICE_INFO, Command.GET_ENABLED_EYE})
@@ -209,7 +215,22 @@ device, so a callback may block but must not use the device session.
         """The device computed and applied the calibration from all targets so far."""
 
     def restarting(self, attempt):
-        """A compute failed; the calibration starts again from the first target."""
+        """A compute failed or the targets were not looked at; the calibration starts again from the first target."""
+
+    def calibration_started(self, attempt):
+        """The device is ready for targets (after 1010 and 1060); may block for an introduction."""
+
+    def show_targets(self, stage, targets):
+        """Gaze-chosen order: show a stage's targets, [(index, x, y)], and return once they are drawn."""
+
+    def focus(self, index, focused):
+        """Gaze-chosen order: the user's gaze settled on target index (focused) or left it (not focused)."""
+
+    def computing(self, stage):
+        """The device computes the calibration from the targets so far (1070); stage_done follows."""
+
+    def check(self):
+        """Raise to stop the calibration (the user cancelled); called often while waiting for the gaze."""
 
 
 @dataclass(frozen=True)
@@ -310,6 +331,88 @@ sits beyond the track box is not reproduced.
         return (samples[-1].timestamp_us - last_valid) / 1000 > GAZE_LOST_MS
 
 
+class GazeFocus:
+    """Which target the gaze rests on, as DetermineFocusedCalibrationTarget decides it sample by sample.
+
+The closest candidate within the zone radius of FocusCheck gains focus; it
+moves to another target only once the current one has gone 150 ms without a
+sample on it; gaze outside every zone keeps the focus; 250 ms without valid
+gaze drops it. A stage of one target is focused by the first valid sample.
+"""
+
+    def __init__(self, check, stage_targets):
+        self.check = check
+        self.radius = check.zone_radius(stage_targets) if len(stage_targets) > 1 else None
+        self.focused = None
+        self.last_focus_us = None
+        self.last_valid_us = None
+
+    def observe(self, sample, candidates):
+        """candidates: {index: (x, y)} still to collect; returns the focused index or None."""
+        now = sample.timestamp_us
+        if sample.point is None:
+            if self.last_valid_us is not None and (now - self.last_valid_us) / 1000 > GAZE_LOST_MS:
+                self.focused = None
+            return self.focused
+        self.last_valid_us = now
+        if self.radius is None:
+            index = next(iter(candidates), None)
+        else:
+            indexes = list(candidates)
+            nearest = self.check.closest(sample.point, [candidates[i] for i in indexes], self.radius)
+            index = indexes[nearest] if nearest > -1 else None
+        if index is not None and index == self.focused:
+            self.last_focus_us = now
+        elif index is not None and (self.focused is None or (now - self.last_focus_us) / 1000 > FOCUS_CHANGE_MS):
+            self.focused, self.last_focus_us = index, now
+        return self.focused
+
+
+class AttentionWatch:
+    """CalibrationAssessor: whether the user stopped calibrating, which restarts the calibration.
+
+From the second stage on, every valid gaze sample is checked: after a gap of
+more than 500 ms (the user was away) both timers start again; otherwise the
+calibration is stalled when for 4 s neither the gaze moved to a waiting
+target nor a target was collected, or when for 10 s no target was collected.
+"""
+
+    def __init__(self):
+        self.last_sample_us = None
+        self.last_attention_us = None
+        self.last_pop_us = None
+
+    def observe(self, sample, looking_at_waiting_target):
+        if sample.point is None:
+            return
+        now = sample.timestamp_us
+        if self.last_sample_us is None or (now - self.last_sample_us) / 1000 > USER_AWAY_MS:
+            self.last_attention_us = self.last_pop_us = now
+        elif looking_at_waiting_target:
+            self.last_attention_us = now
+        self.last_sample_us = now
+
+    def popped(self):
+        if self.last_sample_us is not None:
+            self.last_pop_us = self.last_attention_us = self.last_sample_us
+
+    @property
+    def stalled(self):
+        if self.last_sample_us is None:
+            return False
+        since_pop = (self.last_sample_us - self.last_pop_us) / 1000
+        since_attention = (self.last_sample_us - self.last_attention_us) / 1000
+        return since_pop > ATTENTION_NO_POP_MS or (since_pop > ATTENTION_STALL_MS and since_attention > ATTENTION_STALL_MS)
+
+
+class _TargetsIgnored(Exception):
+    """The attention watch saw no progress: start the calibration again."""
+
+
+class _ComputeRefused(Exception):
+    """1070 answered PROTOCOL_OPERATION_FAILED, the app's "all points failed"."""
+
+
 @dataclass(frozen=True)
 class CalibrationOutcome:
     calibration: LocalCalibration
@@ -336,6 +439,14 @@ again" does. With `wait_for_fixation`, each collect waits until both eyes are
 valid and the gaze has been still for 300 ms (at most 4 s); this is a Linux
 addition, the app relies on its 200 ms saccade delay alone.
 
+With `choose_by_gaze` (and a `focus` check) the targets are shown and taken
+as the Tobii client does instead: every target of a stage is shown at once,
+the user picks the order by looking, and a target is collected 200 ms after
+the gaze settled on it (GazeFocus); data collected while the gaze moved away
+is discarded and the target stays. From the second stage on an AttentionWatch
+restarts the whole calibration when nothing happens, at most
+`max_stalled_runs` times (the app has no limit).
+
 The UI callbacks block (a target animates for about 1.5 s), so they run on a
 worker thread while this thread keeps reading the device. The device stops
 sending, and stops answering requests for the rest of the USB session, once a
@@ -346,7 +457,7 @@ subscribed.
 
     def __init__(self, session, ui=None, targets=INTERACTIVE_POINTS, stages=STAGES, previous=None,
                  focus=None, max_attempts=3, subscribe_gaze=True, log=None, restarts=2,
-                 wait_for_fixation=False):
+                 wait_for_fixation=False, choose_by_gaze=False, max_stalled_runs=MAX_STALLED_RUNS):
         self.session = session
         self.ui = ui or CalibrationUI()
         self.targets = tuple(targets)
@@ -360,7 +471,11 @@ subscribed.
         self.discarded = []
         self.restarts = restarts
         self.wait_for_fixation = wait_for_fixation
+        self.choose_by_gaze = choose_by_gaze and focus is not None
+        self.max_stalled_runs = max_stalled_runs
         self.compute_failures = []
+        self.stalled_runs = 0
+        self.step = STAGES_STEP
 
     def _call(self, step, build, timeout_s=COMMAND_TIMEOUT_S):
         self.log('command', step=step)
@@ -376,7 +491,8 @@ subscribed.
             raise CalibrationFailed('calibration start (1010)', error) from error
         step = 'calibration clear (1060)'
         try:
-            for attempt in range(self.restarts + 1):
+            attempt = 0
+            while True:
                 if attempt:
                     step = 'restart: calibration start (1010)'
                     self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_START))
@@ -385,36 +501,114 @@ subscribed.
                 if self.previous is not None:
                     step = 'apply previous calibration (1110)'
                     self._call(step, lambda rid: gd.calibration_apply(rid, self.previous.blob), TRANSFER_TIMEOUT_S)
-                failed_stage = None
-                for number, stage in enumerate(self.stages):
-                    for index in stage:
-                        step = f'target {index}'
-                        self._collect(number, stage, index)
-                    step = f'compute stage {number} (1070)'
-                    try:
-                        self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY),
-                                   COMPUTE_TIMEOUT_S)
-                    except Exception as error:
-                        if 'PROTOCOL_OPERATION_FAILED' not in str(error) or attempt == self.restarts:
-                            raise
-                        failed_stage = number
-                        break
-                    self._while_reading(self.ui.stage_done, number)
-                if failed_stage is None:
+                self._while_reading(self.ui.calibration_started, attempt)
+                step = STAGES_STEP
+                try:
+                    self._run_stages()
                     break
-                self._record_compute_failure(failed_stage, attempt)
+                except _ComputeRefused as refused:
+                    if attempt >= self.restarts + self.stalled_runs:
+                        step = self.step
+                        raise refused.__cause__ from None
+                    self._record_compute_failure(refused.args[0], attempt)
+                except _TargetsIgnored:
+                    self.stalled_runs += 1
+                    self.log('targets_ignored', attempt=attempt, runs=self.stalled_runs)
+                    if self.stalled_runs > self.max_stalled_runs:
+                        step = self.step
+                        raise CalibrationError('the targets were not looked at') from None
                 step = 'restart: calibration stop (1020)'
                 self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_STOP))
-                self._while_reading(self.ui.restarting, attempt + 1)
+                attempt += 1
+                self._while_reading(self.ui.restarting, attempt)
             step = 'calibration stop (1020)'
             self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_STOP))
         except BaseException as error:
             self._stop_after_failure()
             if isinstance(error, Exception):
-                raise CalibrationFailed(step, error) from error
+                raise CalibrationFailed(self.step if step == STAGES_STEP else step, error) from error
             raise
         self._unsubscribe()
         return self._outcome()
+
+    def _run_stages(self):
+        """Every stage once: collect its targets, then 1070; `step` names what runs, for error reports."""
+        watch = AttentionWatch()
+        for number, stage in enumerate(self.stages):
+            self.step = f'stage {number} targets'
+            if self.choose_by_gaze:
+                self._collect_by_gaze(number, stage, watch if number else None)
+            else:
+                for index in stage:
+                    self.step = f'target {index}'
+                    self._collect(number, stage, index)
+            self.step = f'compute stage {number} (1070)'
+            self._while_reading(self.ui.computing, number)
+            try:
+                self._call(self.step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY),
+                           COMPUTE_TIMEOUT_S)
+            except Exception as error:
+                if 'PROTOCOL_OPERATION_FAILED' not in str(error):
+                    raise
+                raise _ComputeRefused(number) from error
+            self._while_reading(self.ui.stage_done, number)
+
+    def _gaze_samples(self):
+        gaze_id = wire_stream_id(Stream.GAZE)
+        samples = [s for s in (gaze_sample(m) for m in self.session.pending_streams
+                               if m.kind == STREAM_DATA_KIND and m.command == gaze_id) if s is not None]
+        self.session.pending_streams.clear()
+        return sorted(samples, key=lambda s: s.timestamp_us)
+
+    def _collect_by_gaze(self, number, stage, watch):
+        """Show the stage's targets and collect each one the user looks at, in the order they choose."""
+        waiting = {index: self.targets[index] for index in stage}
+        self._while_reading(self.ui.show_targets, number, [(i, *self.targets[i]) for i in stage])
+        focus = GazeFocus(self.focus, list(waiting.values()))
+        self.session.pending_streams.clear()
+        while waiting:
+            self.ui.check()
+            self._read_once()
+            for sample in self._gaze_samples():
+                focused = focus.observe(sample, waiting)
+                if watch:
+                    watch.observe(sample, focused is not None)
+            if watch and watch.stalled:
+                raise _TargetsIgnored()
+            if focus.focused is None:
+                continue
+            index = focus.focused
+            if self._collect_focused(number, stage, index, waiting):
+                del waiting[index]
+                if watch:
+                    watch.popped()
+            focus.focused = None
+
+    def _collect_focused(self, number, stage, index, waiting):
+        """Wait for the saccade, collect (1030) and keep the data only if the gaze stayed; True when kept."""
+        x, y = self.targets[index]
+        self._while_reading(self.ui.focus, index, True)
+        until = time.monotonic() + SACCADE_S
+        while time.monotonic() < until:
+            self._read_once()
+        self.session.pending_streams.clear()
+        started = time.monotonic()
+        self._call(f'collect target {index} (1030)',
+                   lambda rid: gd.calibration_collect_2d(rid, x, y, Eye.BOTH), COLLECT_TIMEOUT_S)
+        self.log('collected', target=index, seconds=round(time.monotonic() - started, 3),
+                 stream_messages=len(self.session.pending_streams))
+        samples = self._gaze_samples()
+        candidates = list(waiting)
+        changed = number > 0 and self.focus.focus_changed(samples, [waiting[i] for i in candidates],
+                                                          candidates.index(index))
+        self.log('focus', target=index, samples=len(samples), changed=changed)
+        if not changed:
+            self._while_reading(self.ui.point_done, index, True)
+            return True
+        self.discarded.append((index, len(self.discarded) + 1))
+        self._call(f'discard target {index} (1080)', lambda rid: gd.calibration_discard_2d(rid, x, y, Eye.BOTH))
+        self._while_reading(self.ui.point_done, index, False)
+        return False
 
     def _record_compute_failure(self, stage, attempt):
         """Log the device's view of the collected targets (1120, read only) before restarting."""

@@ -6,13 +6,15 @@ the bottom edge. The user lines them up with the two marks on top of the real
 tracker below the screen, by dragging a line (moves that line) or the tracker
 picture (moves both). The line positions, as fractions of the screen width,
 give the monitor width and the tracker offset (display_setup.size_from_tracker_lines).
-Arrow keys fine-tune by one device pixel, Enter confirms, Esc cancels; Tobii's
-control has no keyboard handling, so the keys are a Linux addition.
+As a Linux addition the arrow keys nudge the selected line by one device pixel
+(Shift: ten), Tab, L and R select a line, Enter confirms and Esc cancels.
+The intro asking where the tracker is shows only when configure() says so,
+as Tobii shows it only while no monitor is mapped.
 
 Line positions are fractions of the page width, so the page has to cover the
-whole monitor: it asks for fullscreen on the first click or key and refuses to
-confirm otherwise. Under WSL a Windows browser reaches the page through
-mirrored networking at http://localhost:PORT/.
+whole monitor: a kiosk window as large as the screen counts, otherwise it asks
+for fullscreen on a click and refuses to confirm. Under WSL a Windows browser
+reaches the page through mirrored networking at http://localhost:PORT/.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -39,29 +41,33 @@ PAGE = """<!doctype html>
 <style>
 html,body{margin:0;height:100%;background:#1b1c1e;overflow:hidden;font-family:sans-serif;color:#e8eaed;user-select:none}
 canvas{position:absolute;left:0;top:0;width:100%;height:100%}
-#panel{position:absolute;left:8%;right:8%;top:7%;text-align:center}
-#text{font-size:clamp(16px,2.2vw,28px);line-height:1.45}
-#hint{font-size:clamp(12px,1.2vw,16px);color:#9aa0a6}
-#readout{margin-top:1.2em;font-size:clamp(13px,1.5vw,20px);color:#bdc1c6}
-#done{margin-top:1em;font-size:clamp(14px,1.3vw,18px);padding:8px 28px;
-background:#8ab4f8;color:#202124;border:0;border-radius:4px;cursor:pointer}
-#done:disabled{background:#5f6368;cursor:default}
+#panel{position:absolute;left:8%;right:8%;top:8%;text-align:center}
+h1{font-size:clamp(22px,2.4vw,34px);font-weight:normal;margin:0 0 .6em}
+#instruction{font-size:clamp(16px,1.6vw,24px);margin:0 0 .5em}
+#hint{font-size:clamp(13px,1.1vw,17px);color:#9aa0a6;margin:0}
+#readout{margin-top:1.1em;font-size:clamp(13px,1.2vw,18px);color:#bdc1c6;min-height:1.3em}
+#notice{margin-top:.6em;font-size:clamp(13px,1.2vw,18px);color:#fdd663;min-height:1.3em}
+#buttons{margin-top:1em}
+button{font-size:clamp(14px,1.2vw,18px);padding:8px 28px;margin:0 8px;border:0;border-radius:4px;cursor:pointer}
+#primary{background:#8ab4f8;color:#202124}
+#primary:disabled{background:#5f6368;cursor:default}
+#cancel{background:transparent;color:#e8eaed;border:1px solid #5f6368}
 </style></head>
-<body><canvas id="view"></canvas>
-<div id="panel"><div id="text">Where is your eye tracker?<br><span id="hint">If it is not attached below this display yet, attach it now.
-Then click or press a key to continue on this display.</span></div>
-<div id="readout"></div><button id="done" style="display:none">Done</button></div>
+<body tabindex="-1"><canvas id="view"></canvas>
+<div id="panel"><h1 id="title">Connecting to the eye tracker...</h1>
+<p id="instruction"></p><p id="hint"></p><div id="readout"></div><div id="notice"></div>
+<div id="buttons" hidden><button id="primary"></button><button id="cancel">Cancel</button></div></div>
 <script>
 const view = document.getElementById('view'), ctx = view.getContext('2d');
-const text = document.getElementById('text'), hint = document.getElementById('hint');
-const readout = document.getElementById('readout'), done = document.getElementById('done');
+const $ = (id) => document.getElementById(id);
 const auto = location.pathname === '/auto';
 const BOTTOM_MARGIN = 150, HIT = 24, ART_RATIO = 72.151 / 812.708;
-let config = null, left = 0, right = 1, phase = 'intro', drag = null, selected = 'both', hover = null;
+const SELECTED = '#8ab4f8', IDLE = '#bdc1c6';
+let config = null, left = 0, right = 1, phase = 'loading', drag = null, selected = 'left', hover = null;
 
 function fullscreen() {
   return document.fullscreenElement != null ||
-    (window.innerWidth >= screen.width - 1 && window.innerHeight >= screen.height - 1);
+    (window.innerWidth >= screen.width - 2 && window.innerHeight >= screen.height - 2);
 }
 function viewport() {
   const dpr = window.devicePixelRatio || 1;
@@ -69,8 +75,11 @@ function viewport() {
           screen_width: screen.width, screen_height: screen.height,
           screen_px: [Math.round(screen.width * dpr), Math.round(screen.height * dpr)], fullscreen: fullscreen()};
 }
-function setLeft(v) { v = Math.min(v, right - 0.05); left = Math.max(v, 0.02); }
-function setRight(v) { v = Math.max(v, left + 0.05); right = Math.min(v, 0.98); }
+function setText(id, text) { if ($(id).textContent !== text) $(id).textContent = text; }
+function screenTexts(title, instruction, hint) { setText('title', title); setText('instruction', instruction); setText('hint', hint); }
+function showButtons(primary) { $('buttons').hidden = !primary; if (primary) setText('primary', primary); }
+function setLeft(v) { left = Math.max(Math.min(v, right - 0.05), 0.02); }
+function setRight(v) { right = Math.min(Math.max(v, left + 0.05), 0.98); }
 function geometry() {
   const width = config.tracker_width_mm / (right - left);
   return {width: width, height: width / config.aspect, offset: ((left + right) / 2 - 0.5) * width};
@@ -80,35 +89,50 @@ function tracker() {
   const tw = span * w, th = tw * ART_RATIO, top = h - th - BOTTOM_MARGIN;
   return {x: ((left + right) / 2) * w - tw / 2, y: top, w: tw, h: th, lineTop: top + th / 4};
 }
-function drawLine(x, top, active) {
-  const h = window.innerHeight;
-  ctx.strokeStyle = active ? '#8ab4f8' : '#e8eaed'; ctx.fillStyle = '#8ab4f8'; ctx.lineWidth = 1;
-  ctx.setLineDash([5, 5]); ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, h); ctx.stroke(); ctx.setLineDash([]);
-  ctx.beginPath(); ctx.moveTo(x - 6, h - 10); ctx.lineTo(x, h); ctx.lineTo(x + 6, h - 10); ctx.stroke();
+function drawLine(x, top, isSelected, isHover) {
+  const h = window.innerHeight, colour = isSelected ? SELECTED : (isHover ? '#ffffff' : IDLE);
+  ctx.strokeStyle = colour; ctx.fillStyle = colour; ctx.lineWidth = isSelected ? 2 : 1;
+  if (!isSelected) ctx.setLineDash([5, 5]);
+  ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, h); ctx.stroke(); ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(x - 9, h - 14); ctx.lineTo(x, h); ctx.lineTo(x + 9, h - 14); ctx.closePath(); ctx.fill();
   const y = top + 30;
   ctx.beginPath(); ctx.moveTo(x - 24, y); ctx.lineTo(x - 10, y - 14); ctx.lineTo(x - 10, y + 14); ctx.fill();
   ctx.beginPath(); ctx.moveTo(x + 24, y); ctx.lineTo(x + 10, y - 14); ctx.lineTo(x + 10, y + 14); ctx.fill();
+}
+function drawTracker(t) {
+  const highlighted = hover === 'tracker' || (drag && drag.kind === 'tracker');
+  ctx.fillStyle = '#000'; ctx.strokeStyle = highlighted ? SELECTED : '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(t.x, t.y, t.w, t.h, Math.min(t.h / 2, 12)); ctx.fill(); ctx.stroke();
+  const label = 'Eye tracker: drag to move both arrows', inner = (right - left) * window.innerWidth - 60;
+  let size = Math.min(18, t.h * 0.3);
+  ctx.font = size + 'px sans-serif';
+  if (ctx.measureText(label).width > inner) size *= inner / ctx.measureText(label).width;
+  if (size < 10) return;
+  ctx.font = size + 'px sans-serif'; ctx.fillStyle = highlighted ? SELECTED : '#9aa0a6';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, t.x + t.w / 2, t.y + t.h * 0.62);
 }
 function draw() {
   const dpr = window.devicePixelRatio || 1;
   view.width = Math.round(window.innerWidth * dpr); view.height = Math.round(window.innerHeight * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-  if (phase !== 'lines' || !config) return;
-  const t = tracker(), r = Math.min(t.h / 2, 12);
-  ctx.fillStyle = '#000'; ctx.strokeStyle = (hover === 'tracker' || selected === 'both') ? '#8ab4f8' : '#fff';
-  ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(t.x, t.y, t.w, t.h, r); ctx.fill(); ctx.stroke();
-  drawLine(left * window.innerWidth, t.lineTop, hover === 'left' || selected === 'left');
-  drawLine(right * window.innerWidth, t.lineTop, hover === 'right' || selected === 'right');
-  const g = geometry(), v = viewport();
-  readout.innerHTML = `Display ${g.width.toFixed(1)} x ${g.height.toFixed(1)} mm (${(Math.hypot(g.width, g.height) / 25.4).toFixed(1)} in),
-    tracker ${g.offset >= 0 ? g.offset.toFixed(1) + ' mm right of' : (-g.offset).toFixed(1) + ' mm left of'} centre` +
-    (v.fullscreen ? '' : '<br>Not fullscreen: press F11 or click to enter fullscreen before confirming');
-  done.disabled = !v.fullscreen;
+  if (phase !== 'lines') return;
+  const t = tracker();
+  drawTracker(t);
+  for (const side of ['left', 'right'])
+    drawLine((side === 'left' ? left : right) * window.innerWidth, t.lineTop, selected === side, hover === side);
+  const g = geometry();
+  setText('readout', `Screen ${g.width.toFixed(0)} x ${g.height.toFixed(0)} mm (${(Math.hypot(g.width, g.height) / 25.4).toFixed(1)} in), ` +
+    (Math.abs(g.offset) < 0.5 ? 'eye tracker centred' :
+     `eye tracker ${Math.abs(g.offset).toFixed(0)} mm ${g.offset > 0 ? 'right' : 'left'} of centre`));
+  setText('notice', fullscreen() ? '' : 'This page has to fill the screen: press F11 or click anywhere.');
+  $('primary').disabled = !fullscreen();
 }
 function target(x, y) {
   const w = window.innerWidth, t = tracker();
-  if (y >= t.lineTop && Math.abs(x - left * w) <= HIT) return 'left';
-  if (y >= t.lineTop && Math.abs(x - right * w) <= HIT) return 'right';
+  const near = ['left', 'right'].map((side) => ({side: side, d: Math.abs(x - (side === 'left' ? left : right) * w)}))
+    .filter((c) => c.d <= HIT && y >= t.lineTop).sort((a, b) => a.d - b.d);
+  if (near.length) return near[0].side;
   if (x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h) return 'tracker';
   return null;
 }
@@ -116,14 +140,25 @@ function enterFullscreen() {
   if (!document.fullscreenElement && document.documentElement.requestFullscreen)
     document.documentElement.requestFullscreen().catch(() => {});
 }
-async function loadLines() {
+async function loadConfig() {
   const v = viewport();
-  config = await (await fetch(`/setup?sw=${v.screen_px[0]}&sh=${v.screen_px[1]}`, {cache: 'no-store'})).json();
+  for (;;) {
+    try { return await (await fetch(`/setup?sw=${v.screen_px[0]}&sh=${v.screen_px[1]}`, {cache: 'no-store'})).json(); }
+    catch (e) { await new Promise((r) => setTimeout(r, 500)); }
+  }
+}
+function showIntro() {
+  phase = 'intro';
+  screenTexts('Where is your eye tracker?', 'If it is not attached below this display yet, attach it now.',
+              'Then choose This display, or press Enter.');
+  showButtons('This display');
+}
+function showLines() {
   phase = 'lines';
-  text.innerHTML = config.instructions + '<br><span id="hint">Drag a line to move it, drag the tracker picture to move both. ' +
-    'Arrow keys move the selected item by one pixel (Shift: ten); L, R and B select the left line, the right line or both. ' +
-    'Enter confirms, Esc cancels.</span>';
-  done.style.display = 'inline-block';
+  screenTexts('Line up the arrows with your eye tracker', config.instructions,
+              'Drag an arrow, or nudge the blue one with the Left and Right keys (Shift for bigger steps). ' +
+              'Tab picks the other arrow. Enter finishes, Esc cancels.');
+  showButtons('Done');
   const l0 = config.left, r0 = config.right, started = performance.now();
   function animate(now) {
     const p = Math.min(1, (now - started) / 1500), e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
@@ -139,14 +174,16 @@ async function post(body) {
 }
 async function confirm() {
   if (phase !== 'lines' || (!auto && !fullscreen())) return;
-  phase = 'confirmed'; done.style.display = 'none';
+  phase = 'confirmed'; showButtons(null); draw();
+  screenTexts('Saving...', '', '');
   const reply = await post({left: left, right: right});
-  text.textContent = reply.message || 'Done';
-  readout.textContent = reply.summary || '';
-  draw(); followUp(reply);
+  screenTexts(reply.message || 'Display setup saved', reply.summary || '', '');
+  setText('readout', ''); setText('notice', '');
+  followUp(reply);
 }
 async function followUp(reply) {
   if (reply.next_url) {
+    setText('hint', 'Starting the calibration...');
     for (;;) {
       await new Promise(r => setTimeout(r, 1000));
       try { await fetch(reply.next_url, {mode: 'no-cors', cache: 'no-store'}); location.href = reply.next_url; return; }
@@ -155,59 +192,64 @@ async function followUp(reply) {
   }
   for (;;) {
     await new Promise(r => setTimeout(r, 500));
-    try { const s = await (await fetch('/status', {cache: 'no-store'})).json(); if (s.message) { text.textContent = s.message; if (s.final) return; } }
+    try { const s = await (await fetch('/status', {cache: 'no-store'})).json(); if (s.message) { setText('hint', s.message); if (s.final) return; } }
     catch (e) { return; }
   }
 }
 async function cancel() {
-  phase = 'cancelled'; done.style.display = 'none'; draw();
-  text.textContent = 'Display setup cancelled. Nothing was changed.';
-  readout.textContent = '';
+  if (phase !== 'lines' && phase !== 'intro') return;
+  phase = 'cancelled'; showButtons(null); draw();
+  screenTexts('Display setup cancelled', 'Nothing was changed.', '');
+  setText('readout', ''); setText('notice', '');
   await post({cancelled: true});
 }
-function start() { enterFullscreen(); if (phase === 'intro') loadLines(); }
+function primary() { if (phase === 'intro') { enterFullscreen(); showLines(); } else confirm(); }
 view.addEventListener('mousedown', (e) => {
-  if (phase === 'intro') { start(); return; }
   enterFullscreen();
   if (phase !== 'lines') return;
   const w = window.innerWidth, hit = target(e.clientX, e.clientY);
   if (!hit) return;
-  selected = hit === 'tracker' ? 'both' : hit;
+  if (hit !== 'tracker') selected = hit;
   drag = {kind: hit, dl: left * w - e.clientX, dr: right * w - e.clientX};
+  draw();
 });
 window.addEventListener('mousemove', (e) => {
   if (phase !== 'lines') return;
   const w = window.innerWidth;
   if (drag) {
-    if (drag.kind === 'left' || drag.kind === 'tracker') setLeft((e.clientX + drag.dl) / w);
-    if (drag.kind === 'right' || drag.kind === 'tracker') setRight((e.clientX + drag.dr) / w);
+    if (drag.kind === 'tracker') {
+      const shift = Math.min(Math.max((e.clientX + drag.dl) / w, 0.02), 0.98 - (right - left)) - left;
+      left += shift; right += shift;
+    } else if (drag.kind === 'left') setLeft((e.clientX + drag.dl) / w);
+    else setRight((e.clientX + drag.dr) / w);
   }
   hover = drag ? drag.kind : target(e.clientX, e.clientY);
   view.style.cursor = hover ? 'ew-resize' : 'default';
   draw();
 });
-window.addEventListener('mouseup', () => { drag = null; });
+window.addEventListener('mouseup', () => { drag = null; draw(); });
 document.addEventListener('mouseleave', () => { drag = null; });
-done.addEventListener('click', confirm);
+$('primary').addEventListener('click', (e) => { e.stopPropagation(); primary(); });
+$('cancel').addEventListener('click', (e) => { e.stopPropagation(); cancel(); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { if (phase === 'lines' || phase === 'intro') cancel(); return; }
-  if (phase === 'intro') { start(); return; }
+  if (e.key === 'Escape') { cancel(); return; }
+  if (e.key === 'Enter') { e.preventDefault(); primary(); return; }
   if (phase !== 'lines') return;
-  const step = (e.shiftKey ? 10 : 1) / ((window.devicePixelRatio || 1) * window.innerWidth);
   const k = e.key.toLowerCase();
-  if (k === 'l') selected = 'left'; else if (k === 'r') selected = 'right'; else if (k === 'b') selected = 'both';
-  else if (e.key === 'Enter') { confirm(); return; }
+  if (e.key === 'Tab') { selected = selected === 'left' ? 'right' : 'left'; e.preventDefault(); }
+  else if (k === 'l') selected = 'left'; else if (k === 'r') selected = 'right';
   else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const step = (e.shiftKey ? 10 : 1) / ((window.devicePixelRatio || 1) * window.innerWidth);
     const d = e.key === 'ArrowLeft' ? -step : step;
-    if (selected === 'both') { if (d < 0) { setLeft(left + d); setRight(right + d); } else { setRight(right + d); setLeft(left + d); } }
-    else if (selected === 'left') setLeft(left + d); else setRight(right + d);
+    if (selected === 'left') setLeft(left + d); else setRight(right + d);
     e.preventDefault();
   } else return;
   draw();
 });
 window.addEventListener('resize', draw);
 document.addEventListener('fullscreenchange', draw);
-if (auto) start();
+window.focus(); document.body.focus();
+loadConfig().then((c) => { config = c; if (c.intro && !auto) showIntro(); else showLines(); });
 </script></body></html>
 """
 

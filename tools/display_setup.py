@@ -204,7 +204,7 @@ def setup(session, args):
              screen_px=screen_px)
         return {'left': lines.left, 'right': lines.right, 'aspect': lines.aspect,
                 'tracker_width_mm': mounting.width_mm, 'picture_proportion': ds.picture_proportion(mounting),
-                'instructions': 'Move the two lines to the marks on top of your eye tracker.'}
+                'instructions': ds.line_instructions(mounting), 'intro': not ds.is_mapped(device_area)}
 
     evaluate = evaluate_lines(device_area, mounting)
 

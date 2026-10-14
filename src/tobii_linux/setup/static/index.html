@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eye tracker setup</title>
+<link rel="stylesheet" href="/setup.css">
+</head>
+<body tabindex="-1">
+<button id="close" class="close" title="Cancel (Esc)" aria-label="Cancel">&#x2715;</button>
+<div id="fullscreen-banner" class="banner" hidden>This page has to fill the screen. Click anywhere or press F11.</div>
+
+<section id="connecting" class="screen centred">
+  <div class="spinner"></div>
+  <p class="explaining">Connecting to the eye tracker...</p>
+</section>
+
+<section id="busy" class="screen centred">
+  <div class="spinner"></div>
+  <p class="headline" id="busy-title"></p>
+</section>
+
+<section id="display" class="screen">
+  <canvas id="display-canvas"></canvas>
+  <div class="display-text">
+    <div id="display-intro">
+      <p class="explaining">Where is your eye tracker?</p>
+      <p class="headline">If you have not attached it to this display yet, now is the time.</p>
+    </div>
+    <div id="display-lines">
+      <p class="explaining" id="display-instruction"></p>
+      <p class="subtext">Drag an arrow, or move the white one with the arrow keys (Shift: faster).
+        Tab switches arrows. Drag the eye tracker to move both.</p>
+      <p class="readout" id="display-readout"></p>
+    </div>
+  </div>
+  <div class="display-buttons">
+    <button class="primary" id="this-display">This display</button>
+    <button class="primary" id="display-done">Done</button>
+  </div>
+</section>
+
+<section id="display-save" class="screen centred">
+  <p class="explaining">Save the new display setup?</p>
+  <p class="headline" id="display-save-summary"></p>
+  <p class="subtext">The eye tracker uses it to know where the screen is.</p>
+  <div class="buttons">
+    <button class="primary" id="display-save-yes">Save</button>
+    <button id="display-save-no">Keep the old one</button>
+  </div>
+</section>
+
+<section id="positioning" class="screen">
+  <p class="subtext" id="positioning-upright">Sit in an upright position in front of the screen.</p>
+  <div id="trackbox">
+    <div class="eye" id="eye-left"></div>
+    <div class="eye" id="eye-right"></div>
+    <p class="explaining" id="welcome-one">These are your eyes...</p>
+    <p class="headline" id="welcome-two">See how much you can move around.</p>
+    <p class="headline" id="positioning-hint"></p>
+  </div>
+  <p class="subtext" id="positioning-status"></p>
+</section>
+
+<section id="calibration" class="screen">
+  <div id="targets"></div>
+  <div id="centre-dot"></div>
+  <p class="explaining overlay" id="calibration-welcome">Let's calibrate for your eyes...</p>
+  <p class="explaining overlay" id="calibration-instruction">Look at each dot until it explodes!</p>
+  <div class="spinner large" id="calibration-spinner" hidden></div>
+</section>
+
+<section id="calibration-failed" class="screen centred">
+  <div class="message">
+    <p class="headline">Oops. No detection.</p>
+    <p class="subtext">The eye tracker could not see your eyes well enough. Let's try again, and maybe follow these tips:</p>
+    <ul class="subtext tips">
+      <li>Keep looking at each dot until it explodes.</li>
+      <li>If you wear glasses, give them a wipe.</li>
+      <li>Avoid bright, direct light on you or the eye tracker.</li>
+      <li>Relax, it's fine to blink.</li>
+    </ul>
+    <div class="buttons right">
+      <button class="primary" id="retry">Try again</button>
+      <button id="failed-cancel">Cancel</button>
+    </div>
+  </div>
+</section>
+
+<section id="profile" class="screen centred">
+  <div class="message">
+    <p class="headline">Calibration successful!</p>
+    <p class="subtext">It is kept as a profile, so you will not have to do this again. You can make more
+      profiles later, for example with and without glasses.</p>
+    <label class="subtext" for="profile-name">Profile name:</label>
+    <div class="profile-row">
+      <input id="profile-name" maxlength="15" autocomplete="off" spellcheck="false">
+      <button class="primary" id="profile-save">Save</button>
+    </div>
+    <p class="problem" id="profile-problem"></p>
+  </div>
+</section>
+
+<section id="finished" class="screen centred">
+  <p class="explaining" id="finished-title"></p>
+  <p class="headline" id="finished-text"></p>
+  <div class="buttons"><button class="primary" id="finished-close">Close</button></div>
+  <p class="subtext" id="finished-hint"></p>
+</section>
+
+<script src="/setup.js"></script>
+</body>
+</html>

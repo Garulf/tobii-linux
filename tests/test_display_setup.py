@@ -247,6 +247,14 @@ class LineSetupTests(unittest.TestCase):
         self.assertAlmostEqual(rejected.right - rejected.left, 184.0 / 376.3)
         self.assertAlmostEqual(rejected.aspect, 1.25)
 
+    def test_intro_only_without_a_stored_area(self):
+        self.assertTrue(ds.is_mapped(ALBEDO_AREA))
+        self.assertFalse(ds.is_mapped(None))
+        self.assertFalse(ds.is_mapped(ds.DisplayArea((0, 0, 0), (0, 0, 0), (0, 0, 0))))
+        self.assertIn('two marks', ds.line_instructions(ds.ET5_MOUNTING))
+        one_guide = ds.MountingGeometry(1, 184.0, 20.0, (0, 0, 0), (0, 0, 0))
+        self.assertIn('ends', ds.line_instructions(one_guide))
+
     def test_line_limits_follow_the_view_model(self):
         self.assertEqual(ds.clamp_lines(0.0, 1.0), (0.02, 0.98))
         self.assertEqual(ds.clamp_lines(0.5, 0.51), (0.5, 0.55))
@@ -315,6 +323,7 @@ class SetupPageTests(unittest.TestCase):
                     time.sleep(0.01)
                 url = next(json.loads(line)['url'] for line in output.getvalue().splitlines() if '"page"' in line)
                 config = json.loads(urllib.request.urlopen(url + 'setup?sw=2560&sh=1440', timeout=5).read())
+                self.assertFalse(config['intro'])
                 reply = self.post(url, {'left': config['left'], 'right': config['right']})
                 worker.join(10)
             self.assertEqual(outcome['status'], 0)

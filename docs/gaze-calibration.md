@@ -290,6 +290,16 @@ calibrator fails that test and the new one passes.
   error is raised as `CalibrationFailed`. Nothing is ever applied on failure.
   UI callbacks run on a worker thread while the calibrator keeps reading the
   device; they must not use the session themselves.
+- `Calibrator(..., choose_by_gaze=True)` with a `FocusCheck`: the app's
+  target handling (see [setup flow](setup-flow.md#calibration-calibrationprocessviewmodel-calibrationprocessview)).
+  `show_targets` shows a stage's targets at once, `GazeFocus` picks the one
+  the gaze rests on (zone, 150 ms, 250 ms rules), `focus` reports it, 200 ms
+  later 1030 collects, and the data is discarded (1080) when the gaze left.
+  From stage 2 an `AttentionWatch` (4 s without attention and progress, or
+  10 s without progress) stops (1020) and starts again (1010, 1060), at most
+  `max_stalled_runs` times. `calibration_started`, `computing` and `check`
+  (raise to cancel) are further callbacks; the fixed order above stays the
+  default.
 - `DryRunSession(session)`: forwards read commands (1100, 1120, 1310, 1430,
   1420, 1490, 3060, 3080, 3170) and reports every other command instead of
   sending it.
@@ -299,8 +309,12 @@ calibrator fails that test and the new one passes.
 `src/tobii_linux/calibration_page.py` serves the targets as a fullscreen web
 page (standard library only) and implements `CalibrationUI`: the page draws
 each target, shrinks it for 1.5 s while the user looks at it, acknowledges,
-and the calibrator waits the app's 200 ms before collecting. The page starts
-on a key press or click and Esc aborts (the run then sends 1020). Under WSL a
+and the calibrator waits the app's 200 ms before collecting. Once the page
+covers the screen (fullscreen, or a kiosk window as large as the screen, which
+the server also accepts from the reported sizes) it counts down 3 s and
+starts by itself, as Tobii's calibration needs no key; a key or click starts
+it at once and Esc aborts (the run then sends 1020). Its texts are written
+once and only the countdown digit changes. Under WSL a
 Windows browser reaches it at `http://localhost:8775/` through mirrored
 networking; on Linux any browser does. This was chosen over a Windows tkinter
 window because the page acknowledges every target, so collection never starts
@@ -325,10 +339,12 @@ the new calibration to `--after`. It prints the per-target quality from 1120
 and, per record of the new blob, each eye's distance from the target in
 pixels. After a failure it prints the device id and the restore command.
 
-Differences from the Windows app, all inferences about effect: targets within
-a stage are shown in a fixed order rather than chosen by the user's gaze; the
-focus test does not enlarge the zone for users beyond the track box; there is
-no eye positioning screen; the result is not added to a profile store.
+Differences from the Windows app, all inferences about effect: here targets
+within a stage are shown in a fixed order rather than chosen by the user's
+gaze; the focus test does not enlarge the zone for users beyond the track
+box; there is no eye positioning screen; the result is not added to a profile
+store. `tobii-linux setup` ([setup flow](setup-flow.md)) has all of these
+except the zone enlargement.
 
 ## Checks
 
@@ -388,8 +404,8 @@ scripts (`calibration-live.cmd` ran once, see above; it now also writes
   `windows_gaze_targets.py` with the new calibration (read only), and gives the
   tracker back to Windows. Results go to `calibration-live\`.
 - `calibration-diagnostic.cmd`: the minimal check, `gaze_calibration_probe.py
-  collect --page` with a raw USB log: the page shows the centre dot, the
-  person presses a key and looks at it; the tool sends 1220, 1010, 1060, one
+  collect --page` with a raw USB log: the page counts down 3 s (or starts on
+  a key), shows the centre dot and the person looks at it; the tool sends 1220, 1010, 1060, one
   1030 (0.5, 0.5, 3) and waits up to 15 s plus 20 s for a late reply while
   reading continuously, then 1020 and 1230. Results go to
   `calibration-diagnostic\`.

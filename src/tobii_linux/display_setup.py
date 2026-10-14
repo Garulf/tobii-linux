@@ -218,6 +218,18 @@ class LineSetup:
     source: str
 
 
+def is_mapped(device_area) -> bool:
+    """Whether the device holds a display area, the Linux counterpart of Tobii's persisted monitor id."""
+    return device_area is not None and device_area.width_mm > 0 and device_area.height_mm > 0
+
+
+def line_instructions(mounting=ET5_MOUNTING) -> str:
+    """What the user lines the arrows up with: the guide marks, or a one-guide tracker's ends (G6 small)."""
+    if mounting.guides == 1:
+        return 'Move the two arrows so they point at the ends of your eye tracker.'
+    return 'Move the two arrows so they point at the two marks on top of your eye tracker.'
+
+
 def initial_lines(mounting=ET5_MOUNTING, device_area=None, size_hint=None, screen_px=None) -> LineSetup:
     """MovingLinesScreenPlaneSetupFactory.CreateMovingLinesScreenPlaneSetup.
 
@@ -226,7 +238,7 @@ the decomposed size (DisplaySetupStorage), and the offset comes from the area.
 Otherwise the width is the hint, if its aspect matches the screen's pixels, or
 376.3 mm, the aspect is the screen's, and the tracker starts centred.
 """
-    if device_area is not None and device_area.width_mm > 0 and device_area.height_mm > 0:
+    if is_mapped(device_area):
         stored = decompose_display_area(device_area, mounting)
         size = tuple(size_hint) if size_hint and all(size_hint) else stored.size_mm
         left, right = clamp_lines(*tracker_lines(size, stored.tracker_offset_mm, mounting.width_mm))
