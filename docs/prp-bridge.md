@@ -129,6 +129,11 @@ the name unchanged, so these two pipes need no discovery. Do not choose a name
 starting with `TOBII-`: the legacy discovery routine would also report the bare
 pipe as a `tobii-ttp://` device.
 
+With `cli serve --tet-tcp` the service announces only `streamengineservices`
+instead, and the bridge relays it like any other pipe: the service then
+speaks SESP on it, not PRP ([sesp.md](sesp.md)). The bridge itself is
+unchanged.
+
 ## Service behaviour
 
 | Step | Service answer | Basis |

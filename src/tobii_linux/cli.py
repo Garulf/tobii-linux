@@ -55,10 +55,15 @@ whenever the link is not streaming.
         loop.call_soon_threadsafe(callback, *arguments)
 
     gaze_hub = service.gaze_hub
+    tet_tcp = service.tet_tcp is not None
     feed = ServiceFeed(sample=lambda sample: soon(service.hub.publish, sample),
                        gaze=None if gaze_hub is None else (lambda frame: soon(gaze_hub.publish, frame)),
                        presence=lambda time_us, value: soon(service.publish_presence, time_us, value),
-                       started=lambda calibration_id: soon(service.attach_tracker, calibration_id))
+                       started=lambda calibration_id: soon(service.attach_tracker, calibration_id),
+                       device=(lambda replies: soon(service.attach_device, replies)) if tet_tcp else None,
+                       device_stream=((lambda message, time_us: soon(service.publish_device_stream,
+                                                                     message, time_us))
+                                      if tet_tcp else None))
 
     def on_state(state, detail):
         soon(service.detach_tracker)
@@ -95,9 +100,11 @@ service process and the bridge's control connection stay up.
         hub = HeadPoseHub()
         gaze_hub = None if args.no_gaze else GazeHub()
         service = PrpService(hub, args.name, clock=clock, display_area=display_area(args),
-                             display_id=args.display_id, gaze_hub=gaze_hub)
+                             display_id=args.display_id, gaze_hub=gaze_hub, tet_tcp=args.tet_tcp,
+                             compensate_sesp_position=args.sesp_positions == 'prp')
         server = await service.serve(args.host, args.port)
-        logging.info('PRP service on %s:%d, pipes %s', args.host, args.port, service.pipe_names)
+        logging.info('%s service on %s:%d, pipes %s', 'tet-tcp' if args.tet_tcp else 'PRP',
+                     args.host, args.port, service.pipe_names)
 
         link = service_link(service, loop, processor, clock,
                             lambda: usb_session(args.index, args.channel))
@@ -149,6 +156,14 @@ def main():
                                    'and later, raw older Wine and every Proton')
     serve_parser.add_argument('--no-gaze', action='store_true',
                               help='Serve head pose only, without subscribing the gaze stream')
+    serve_parser.add_argument('--tet-tcp', action='store_true',
+                              help='Serve the route that needs no Wine patch instead of the PRP pipes: '
+                                   'gaze on TCP 127.0.0.1:4455, head pose over the bridge\'s '
+                                   'streamengineservices pipe (experimental)')
+    serve_parser.add_argument('--sesp-positions', choices=('prp', 'windows'), default='prp',
+                              help='With --tet-tcp: send head positions the game layer turns into '
+                                   'the PRP route\'s positions (prp, default), or unchanged as '
+                                   'the Windows service does (windows)')
     args = parser.parse_args()
     try:
         return {'probe': probe, 'headpose': headpose, 'serve': serve}[args.command](args)

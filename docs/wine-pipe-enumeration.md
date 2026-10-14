@@ -336,10 +336,11 @@ the game process. Under that constraint:
   request, kind `0x51`, command 1000 (protocol upgrade), in the framing
   `src/tobii_linux/ttp.py` decodes. `device_create` opens such URLs with the
   in-process platform module instead of PRP
-  ([service-transport.md](service-transport.md#discovery)). A native TTP
-  service on that port would need no bridge and no Wine change, but whether
-  that module provides head pose for such a device, and what it asks of the
-  device, is unknown and would need its own investigation.
+  ([service-transport.md](service-transport.md#discovery)). That module gets
+  head pose from the fixed-name pipe `streamengineservices`, which needs no
+  listing; `cli serve --tet-tcp` serves the route with the unchanged bridge
+  (emulated under unpatched Wine 8.0, not yet live: [tet-tcp.md](tet-tcp.md),
+  [sesp.md](sesp.md)).
 - **`\\.\pipe\ETDefaultPIPE`**: the default enumeration never called it
   (no request reached a listener on that pipe in the same run).
 

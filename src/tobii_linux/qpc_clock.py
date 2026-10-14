@@ -255,3 +255,35 @@ class QpcClockFollower:
     def forget(self, bridge) -> None:
         self.classifiers.pop(bridge, None)
         self.verdicts.pop(bridge, None)
+
+
+class CounterMapping:
+    """Service-clock microseconds as the game's QueryPerformanceCounter microseconds.
+
+    PRP clients learn the offset by timesync; routes without timesync (SESP head
+    pose, tet-tcp gaze) need timestamps already on the game's counter. When the
+    service clock reads the Linux clock behind the counter, the two are equal up
+    to the clock's own switch offset. Otherwise (an unanchored counter) the
+    offset is the smallest recent difference between the clock at receipt of a
+    bridge report and the counter it carried. Without any report the counter is
+    assumed to be the service clock's source, as with --wine-clock set to it.
+    """
+
+    def __init__(self, clock: ServiceClock, recent: int = RECENT_REPORTS,
+                 tolerance_us: int = ABSOLUTE_TOLERANCE_US):
+        self.clock, self.tolerance_us = clock, tolerance_us
+        self.samples: deque[QpcSample] = deque(maxlen=recent)
+
+    def observe(self, sample: QpcSample) -> None:
+        self.samples.append(sample)
+
+    def offset_us(self) -> int:
+        """Service clock minus game counter."""
+        source = self.clock.source
+        delays = [sample.delay_us(source) for sample in self.samples if source in sample.host_us]
+        if not delays or abs(min(delays)) <= self.tolerance_us:
+            return self.clock.offset_us
+        return self.clock.offset_us + min(delays)
+
+    def __call__(self, service_us: int) -> int:
+        return service_us - self.offset_us()

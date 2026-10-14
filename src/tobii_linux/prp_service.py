@@ -23,13 +23,15 @@ import math
 import struct
 import uuid
 
-from tobii_linux import gaze
+from tobii_linux import gaze, sesp
 from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, decode_envelope, encode_envelope
 from tobii_linux.prp import encode_stream_packet
 from tobii_linux.qpc_clock import (
-    AUTO, DEFAULT_SOURCE, WINE_CLOCKS, ClockSwitch, QpcClockFollower, QpcSample, ServiceClock,
-    decode_qpc_report)
+    AUTO, DEFAULT_SOURCE, WINE_CLOCKS, ClockSwitch, CounterMapping, QpcClockFollower, QpcSample,
+    ServiceClock, decode_qpc_report)
+from tobii_linux.sesp_service import SespServer
+from tobii_linux.tet_tcp_service import DeviceReplies, TetTcpService
 from tobii_linux.ttp_fields import float32
 from tobii_linux.prp_session import (
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE,
@@ -248,6 +250,37 @@ def decode_pipe_open(payload: bytes) -> tuple[int, str]:
     if version != RELAY_VERSION or len(names) != 1:
         raise ProtocolError("unsupported pipe open frame")
     return client_pid, names[0]
+
+
+class RelayPipe:
+    """One relayed pipe connection as SESP sees it: whole pipe messages in, messages out."""
+
+    def __init__(self, reader, writer, pipe: str):
+        self.reader, self.writer, self.pipe = reader, writer, pipe
+
+    async def message(self) -> bytes:
+        kind, payload = await read_frame(self.reader)
+        if kind != FRAME_MESSAGE:
+            raise ProtocolError("expected a relayed pipe message")
+        log.debug("%s <- %s", self.pipe, payload.hex())
+        return payload
+
+    def open_reply(self, name: str) -> None:
+        self.writer.write(encode_frame(FRAME_REPLY_PIPE, encode_names([name])))
+
+    def send(self, message: bytes) -> None:
+        if not self.writer.is_closing():
+            log.debug("%s -> %s", self.pipe, message.hex())
+            self.writer.write(encode_frame(FRAME_MESSAGE, message))
+
+    async def drain(self) -> None:
+        await self.writer.drain()
+
+    def pending_bytes(self) -> int:
+        return self.writer.transport.get_write_buffer_size()
+
+    def close(self) -> None:
+        self.writer.close()
 
 
 # Sample distribution ------------------------------------------------------------------------
@@ -589,13 +622,29 @@ class BridgeLink:
 
 
 class PrpService:
-    """Shared state: pipe names, subscription ids and the sample hub."""
+    """Shared state: pipe names, subscription ids and the sample hub.
+
+    With `tet_tcp` the service serves the patch-free route instead of the PRP
+    pipes: gaze and presence on TCP 127.0.0.1:4455 (`tet_tcp_port`) and head
+    pose over the `streamengineservices` pipe (docs/tet-tcp.md). Timestamps on
+    that route are the game's QueryPerformanceCounter microseconds (`game_time`).
+    """
 
     def __init__(self, hub: HeadPoseHub, name: str = DEFAULT_NAME, serial: str | None = None,
                  clock=service_clock_us, display_area: DisplayArea | None = None,
-                 display_id: str | None = None, gaze_hub: GazeHub | None = None):
+                 display_id: str | None = None, gaze_hub: GazeHub | None = None,
+                 tet_tcp: bool = False, tet_tcp_port: int | None = None,
+                 compensate_sesp_position: bool = True):
         self.hub, self.name, self.clock = hub, name, clock
         self.clock_follower = QpcClockFollower(clock) if isinstance(clock, ServiceClock) else None
+        self.game_time = CounterMapping(clock) if isinstance(clock, ServiceClock) else (lambda us: us)
+        self.tet_tcp = self.sesp = None
+        if tet_tcp:
+            ports = {} if tet_tcp_port is None else {"port": tet_tcp_port}
+            self.tet_tcp = TetTcpService(self.game_time, **ports)
+            self.sesp = SespServer(hub, self.game_time, self.legacy_display_area,
+                                   compensate_sesp_position)
+        self.sesp_pipes: set[RelayPipe] = set()
         self.gaze_hub = gaze_hub
         self.serial = serial or name
         self.display_area, self.display_id = display_area, display_id
@@ -632,9 +681,13 @@ class PrpService:
         self.tracker_attached = False
         for connection in list(self.connections):
             connection.close()
+        for pipe in list(self.sesp_pipes):
+            pipe.close()
         for subscription in list(self.subscriptions.values()):
             subscription.stop_all()
         self.presence.clear()
+        if self.tet_tcp is not None:
+            asyncio.get_running_loop().create_task(self.tet_tcp.detach())
 
     def publish_presence(self, timestamp_us: int, platmod_value: int) -> None:
         """One platmod presence record on the service clock; pushes operation 2 when due."""
@@ -666,9 +719,26 @@ class PrpService:
 
         The client opens TOBIIPRP-<name> when a pipe listing shows it and <name>
         otherwise (0x18004e8a0); prp-internal:// URLs name their pipe directly.
+        The tet-tcp route needs only the fixed SESP pipe.
         """
+        if self.sesp is not None:
+            return [sesp.PIPE_NAME]
         return [SERVER_PIPE_PREFIX + self.name, self.name, self.subscription_pipe,
                 self.timesync_pipe]
+
+    def legacy_display_area(self) -> DisplayArea | None:
+        """The display area the game's legacy module got from the device, else the configured one."""
+        device_area = self.tet_tcp.device.display_area() if self.tet_tcp is not None else None
+        return device_area or self.display_area
+
+    def attach_device(self, device: DeviceReplies) -> None:
+        """Device replies and subscribed streams of the session that just started (tet-tcp route)."""
+        if self.tet_tcp is not None:
+            asyncio.create_task(self.tet_tcp.attach(device))
+
+    def publish_device_stream(self, message, service_us: int) -> None:
+        if self.tet_tcp is not None:
+            self.tet_tcp.publish(message, service_us)
 
     def handshake_info(self, connection: PipeConnection) -> HandshakeInfo:
         """Ids and URLs as the real service sent them: URLs only on the command channel."""
@@ -787,15 +857,25 @@ class PrpService:
                 if not self.tracker_attached:
                     log.info("refusing pid %d on %s: no tracker", client_pid, pipe)
                     return
+                if self.sesp is not None and pipe == sesp.PIPE_NAME:
+                    await self.serve_sesp(RelayPipe(reader, writer, pipe), client_pid)
+                    return
                 await PipeConnection(self, reader, writer, client_pid, pipe).run()
             else:
                 raise ProtocolError(f"unexpected first relay frame {kind}")
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
-        except ProtocolError as exc:
+        except (ProtocolError, sesp.SespError) as exc:
             log.warning("closing relay connection %s: %s", peer, exc)
         finally:
             writer.close()
+
+    async def serve_sesp(self, pipe: RelayPipe, client_pid: int) -> None:
+        self.sesp_pipes.add(pipe)
+        try:
+            await self.sesp.serve(pipe, client_pid)
+        finally:
+            self.sesp_pipes.discard(pipe)
 
     async def serve_bridge(self, bridge: BridgeLink, reader) -> None:
         """Control connection: display id and QueryPerformanceCounter reports until it closes."""
@@ -837,7 +917,9 @@ class PrpService:
                      ", ".join(f"{key} {value}" for key, value in report.details.items()))
         if self.clock_follower is None:
             return
-        decision = self.clock_follower.observe(bridge, QpcSample(report.micros, host_us))
+        sample = QpcSample(report.micros, host_us)
+        self.game_time.observe(sample)
+        decision = self.clock_follower.observe(bridge, sample)
         verdict = decision.verdict
         if verdict.clock != bridge.verdict_clock:
             bridge.verdict_clock = verdict.clock
@@ -879,6 +961,8 @@ class PrpService:
     async def close(self, server, timeout_s: float = 2.0) -> None:
         """Disconnect every client and bridge, then stop listening."""
         self.detach_tracker()
+        if self.tet_tcp is not None:
+            await self.tet_tcp.detach()
         for writer in list(self.bridges):
             writer.close()
         server.close()

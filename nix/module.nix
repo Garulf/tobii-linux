@@ -12,7 +12,7 @@ let
     "--name" cfg.headPoseService.deviceName
   ] ++ lib.optionals (cfg.headPoseService.displayId != null) [
     "--display-id" cfg.headPoseService.displayId
-  ];
+  ] ++ lib.optionals cfg.headPoseService.tetTcp [ "--tet-tcp" ];
 in {
   options.hardware.tobii-eye-tracker-5 = {
     enable = lib.mkEnableOption
@@ -56,6 +56,15 @@ in {
         type = lib.types.str;
         default = "ET5-LINUX";
         description = "Device name the game sees as tobii-prp://<name>.";
+      };
+      tetTcp = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Serve the route that works with an unpatched Wine or Proton instead
+          of the PRP pipes: gaze on TCP 127.0.0.1:4455 and head pose over the
+          bridge's streamengineservices pipe. Experimental; see docs/tet-tcp.md.
+        '';
       };
     };
   };

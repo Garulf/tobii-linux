@@ -204,6 +204,22 @@ class GazeAndImageStreamsTests(unittest.TestCase):
         commands = [m.command for m in device.log]
         self.assertEqual(commands, [1220, 1220, 1220], 'a silent session is not asked to unsubscribe')
 
+    def test_device_stream_messages_are_forwarded_with_their_host_time(self):
+        presence = presence_message(898743954739, 2)
+        script = [gaze_message(PAYLOADS['both']), presence, image_message()]
+        device = ScriptedTracker(script, after=3)
+        published, forwarded = [], []
+        any_order = streams.DeviceClockWatch(rewind_us=1 << 62)
+        with GazeAndImageStreams(driver.TrackerSession(device), HostClock(), published.append,
+                                 lambda t, v: None, silence_timeout_s=0.2, device_clock=any_order,
+                                 on_device_stream=lambda m, t: forwarded.append((m, t))) as live:
+            next(live.newest_frames())
+            live.reader.stop()
+            streams_subscribed = live.wire_streams
+        self.assertEqual([m.payload for m, _ in forwarded], [PAYLOADS['both'], presence.payload])
+        self.assertEqual(forwarded[0][1], published[0].timestamp_us)
+        self.assertEqual(streams_subscribed, frozenset({0x500, 0x501, 0x504}))
+
     def test_stopping_unsubscribes_every_stream(self):
         device = ScriptedTracker([image_message()] * 3, after=3)
         with GazeAndImageStreams(driver.TrackerSession(device), HostClock(), lambda frame: None,

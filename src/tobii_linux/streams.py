@@ -89,6 +89,7 @@ DECODERS = {Stream.IMAGE: image_frame, Stream.GAZE: gaze_frame, Stream.PRESENCE:
 class StreamItem:
     stream: int
     value: object
+    message: object = None
 
 
 class StreamReader:
@@ -183,7 +184,7 @@ A dead session is not asked: its device no longer answers.
         self.received[stream] += 1
         decoder = DECODERS.get(stream)
         if decoder is None:
-            return StreamItem(stream, message)
+            return StreamItem(stream, message, message)
         try:
             value = decoder(message)
         except ProtocolError as error:
@@ -193,7 +194,7 @@ A dead session is not asked: its device no longer answers.
         if value is None:
             self.dropped[stream] += 1
             return None
-        return StreamItem(stream, value)
+        return StreamItem(stream, value, message)
 
     def items(self, silence_timeout_s=SILENCE_TIMEOUT_S):
         """Decoded items as they arrive until stop() is called.
@@ -275,16 +276,19 @@ newest_frames() yields only the newest image frame, dropping frames that
 arrive while the consumer is busy; image_time maps their device timestamps
 onto `host_clock`. Gaze and images use separate clock mappers, so head pose
 timing is the same as without gaze. A device clock that jumps back ends the
-session with DeviceError.
+session with DeviceError. `on_device_stream(message, host_us)`, when given,
+also receives each gaze and presence message as the device sent it, with its
+time on `host_clock`.
 """
     def __init__(self, session, host_clock, on_gaze, on_presence=None,
                  silence_timeout_s=SILENCE_TIMEOUT_S, suspend_watch=None, stop_event=None,
-                 device_clock=None):
+                 device_clock=None, on_device_stream=None):
         streams = (Stream.GAZE, Stream.IMAGE) + ((Stream.PRESENCE,) if on_presence is not None else ())
         self.reader = StreamReader(session, streams, optional=(Stream.PRESENCE,),
                                    suspend_watch=suspend_watch, stop_event=stop_event)
         self.host_clock = host_clock
         self.on_gaze, self.on_presence = on_gaze, on_presence
+        self.on_device_stream = on_device_stream
         self.image_time = ClockMapper(host_clock)
         self.gaze_time = ClockMapper(host_clock)
         self.device_clock = device_clock if device_clock is not None else DeviceClockWatch()
@@ -318,15 +322,26 @@ session with DeviceError.
                     yield item.value
                 elif item.stream == Stream.GAZE:
                     self.device_clock.observe(item.value.timestamp_us)
-                    self.on_gaze(item.value.with_timestamp(self._device_time(item.value.timestamp_us)))
+                    host_us = self._device_time(item.value.timestamp_us)
+                    self.on_gaze(item.value.with_timestamp(host_us))
+                    self._forward(item.message, host_us)
                 elif item.stream == Stream.PRESENCE:
-                    self.on_presence(self._device_time(item.value.timestamp_us),
-                                     gaze.platmod_presence(item.value.value))
+                    host_us = self._device_time(item.value.timestamp_us)
+                    self.on_presence(host_us, gaze.platmod_presence(item.value.value))
+                    self._forward(item.message, host_us)
         except DeviceError:
             self.reader.session.dead = True
             raise
         finally:
             self.finished.set()
+
+    def _forward(self, message, host_us):
+        if self.on_device_stream is not None:
+            self.on_device_stream(message, host_us)
+
+    @property
+    def wire_streams(self):
+        return frozenset(wire_stream_id(stream) for stream in self.reader.subscribed)
 
     def newest_frames(self):
         return newest_frames(self._images(), on_receive=lambda frame: self.image_time.observe(frame.timestamp))
@@ -346,12 +361,18 @@ class ServiceFeed:
     """Where one service session delivers its output; every callback must be thread safe.
 
 `started(calibration_id)` runs once the streams are subscribed, before the first
-item, with the device's calibration id (None when it reports none).
+item, with the device's calibration id (None when it reports none). With
+`device(replies)` the session first reads the device replies tet-tcp clients
+get (tet_tcp_service.DeviceReplies), passed with the subscribed streams before
+`started`; `device_stream(message, host_us)` then receives every raw gaze and
+presence message.
 """
     sample: object
     gaze: object = None
     presence: object = None
     started: object = None
+    device: object = None
+    device_stream: object = None
 
 
 def serve_tracker(session, processor, host_clock, feed, stop, suspend_watch=None):
@@ -363,10 +384,17 @@ raises DeviceError and the like when the tracker fails or goes silent.
 """
     processor.start(session.camera_calibration())
     calibration_id = device_calibration_id(session)
+    replies = None
+    if feed.device is not None:
+        from .tet_tcp_service import DeviceReplies
+        replies = DeviceReplies.capture(session)
     gaze_callback = feed.gaze if feed.gaze is not None else (lambda frame: None)
     with GazeAndImageStreams(session, host_clock, gaze_callback, feed.presence,
-                             suspend_watch=suspend_watch, stop_event=threading.Event()) as streams:
+                             suspend_watch=suspend_watch, stop_event=threading.Event(),
+                             on_device_stream=feed.device_stream) as streams:
         stopper = StopRelay(stop, streams.reader.stop)
+        if replies is not None:
+            feed.device(replace(replies, streams=streams.wire_streams))
         if feed.started is not None:
             feed.started(calibration_id)
         try:

@@ -242,3 +242,57 @@ del ServiceTests
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TetTcpReplugTests(unittest.IsolatedAsyncioTestCase):
+    """cli.service_link with --tet-tcp: the device's own replies, and port 4455 only while it streams."""
+    until = ReplugTests.until
+    open_session = ReplugTests.open_session
+    clock = staticmethod(ReplugTests.clock)
+
+    async def asyncSetUp(self):
+        self.service = PrpService(HeadPoseHub(), "ET5-TEST", clock=self.clock, tet_tcp=True,
+                                  tet_tcp_port=0)
+        self.server = await self.service.serve("127.0.0.1", 0)
+        self.device = None
+        self.link = cli.service_link(self.service, asyncio.get_running_loop(), FakeProcessor(),
+                                     self.clock, self.open_session)
+        self.link.backoff = Backoff(first_s=0.02, max_s=0.05)
+        self.worker = threading.Thread(target=self.link.run)
+
+    async def asyncTearDown(self):
+        self.link.stop()
+        if self.worker.is_alive():
+            await asyncio.get_running_loop().run_in_executor(None, self.worker.join, 5.0)
+        await self.service.close(self.server)
+
+    async def ask(self, request):
+        from tobii_linux.ttp import Decoder
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.service.tet_tcp.port_bound)
+        writer.write(request.encode())
+        decoder, replies = Decoder(), []
+        while not replies:
+            replies = decoder.feed(await asyncio.wait_for(reader.read(65536), 2.0))
+        writer.close()
+        return replies[0]
+
+    async def test_replies_come_from_the_session_and_the_port_follows_the_tracker(self):
+        device = self.device = StreamingDevice()
+        self.worker.start()
+        await self.until(lambda: self.service.tet_tcp.port_bound is not None)
+        before = len(device.log)
+        unlock = await self.ask(tc.header_only_request(41, tc.Command.UNLOCK_PPU))
+        self.assertEqual((unlock.request_id, unlock.command, unlock.word4), (41, 1600, 0))
+        self.assertTrue(unlock.payload)
+        status = await self.ask(tc.header_only_request(42, tc.Command.GET_DEVICE_STATUS))
+        self.assertEqual((status.request_id, status.word4), (42, 0))
+        self.assertEqual(len(device.log), before, 'clients never reach the tracker')
+        captured = {m.command for m in device.log}
+        self.assertTrue({tc.Command.GET_DEVICE_INFO, tc.Command.GET_DISPLAY_AREA} <= captured)
+        self.assertEqual(self.service.tet_tcp.device.streams, frozenset({0x500, 0x501, 0x504}))
+
+        self.device.unplugged, self.device = True, None
+        await self.until(lambda: self.service.tet_tcp.port_bound is None)
+        self.device = StreamingDevice()
+        await self.until(lambda: self.service.tet_tcp.port_bound is not None)
+        self.assertEqual((self.link.sessions, self.link.failures), (2, 1))

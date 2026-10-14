@@ -10,7 +10,8 @@ have to line up when the game starts:
    create Wine named pipes ([prp-bridge.md](prp-bridge.md)).
 3. **A Wine or Proton build with the named-pipe listing patch**, because Star
    Citizen's Tobii layer only tracks trackers it finds by listing `\\.\pipe\*`
-   ([wine-pipe-enumeration.md](wine-pipe-enumeration.md)).
+   ([wine-pipe-enumeration.md](wine-pipe-enumeration.md)). The experimental
+   [patch-free route](#without-a-patched-wine) drops this piece.
 
 `tobii-linux-wine-run` takes care of the first two. Put it in front of the
 command that starts the game:
@@ -268,6 +269,36 @@ start kept the prefix busy).
 
 Stock Wine, wine-staging and Proton cannot list `\\.\pipe\*` for the game's
 Tobii DLL, and nothing outside the game process can change that without
-replacing at least the wineserver. The details, and a route that needs no Wine
-change but a different service protocol, are in
-[wine-pipe-enumeration.md](wine-pipe-enumeration.md#without-a-wine-patch).
+replacing at least the wineserver
+([wine-pipe-enumeration.md](wine-pipe-enumeration.md#without-a-wine-patch)).
+The same DLL also finds a tracker on TCP `127.0.0.1:4455` and then gets head
+pose from the fixed-name pipe `streamengineservices`, which needs no listing
+([tet-tcp.md](tet-tcp.md), [sesp.md](sesp.md)). Start the service with
+`--tet-tcp` and launch the game exactly as above, with the stock runner:
+
+```sh
+tobii-linux serve --tet-tcp --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
+tobii-linux-wine-run %command%          # Steam with stock Proton
+```
+
+On NixOS set `headPoseService.tetTcp = true`. The bridge is the same program;
+the service tells it to serve only `streamengineservices` and itself listens on
+port 4455 while the tracker runs.
+
+Status, by evidence:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Discovery, device creation, head-pose and gaze streams of the unmodified DLL | `tet-tcp://127.0.0.1` found; head pose and gaze flow | emulated (Wine): Debian Wine 8.0, recorded ET5 replies and gaze, synthetic head pose |
+| Game integration layer, `TrackTracker` | head pose about 31 a second, gaze, presence; capabilities as on the PRP route | emulated (Wine) |
+| Timestamps on the game's clock | yes, without timesync | emulated (Wine) |
+| Window tracking (`TrackWindow`, `TrackRectangle`) | no monitor on this route | emulated (Wine) |
+| Codec against Tobii's own SESP code | 60 of 60 cases | emulated |
+| Service with a session that ends and starts again | port and replies follow the session | unit |
+| Real tracker, stock Wine 9.0, GE-Proton, real Windows SESP service | not run | live (Wine), live (Windows): staged in `evidence/private/sesp/live/` |
+| Star Citizen | not run | |
+
+Use the PRP route with a patched runner when one is available: it has run live
+end to end and supports window tracking. Use `--tet-tcp` when the runner
+cannot be patched (stock Proton through Steam, a distribution Wine), knowing
+it has not yet run with the real tracker.

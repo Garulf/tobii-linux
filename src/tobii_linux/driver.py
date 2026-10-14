@@ -54,6 +54,7 @@ more (a tracker that stalls stays silent for the rest of its session).
         self.pending_streams = []
         self.dead = False
         self.usb_device = {}
+        self.startup_replies = {}
 
     def read(self, timeout_ms):
         try:
@@ -80,19 +81,29 @@ more (a tracker that stalls stays silent for the rest of its session).
             if data:
                 yield from self.decoder.feed(data)
 
-    def call(self, build, timeout_s=REQUEST_TIMEOUT_S):
+    def _request(self, build, timeout_s):
         message = build(self._next_id())
         self.write(message.encode())
         for reply in self._receive(timeout_s):
             if reply.kind == RESPONSE_KIND and reply.request_id == message.request_id:
-                status = response_status(reply)
-                if status:
-                    raise DeviceError(f'Command {message.command} failed: {status_name(status)}')
-                return reply
+                return message, reply
             if reply.kind == STREAM_DATA_KIND:
                 self.pending_streams.append(reply)
-        self.dead = True
-        raise DeviceError(f'Command {message.command} timed out')
+        return message, None
+
+    def exchange(self, build, timeout_s=REQUEST_TIMEOUT_S):
+        """The device's reply to one request whatever its status; None when none arrives in time."""
+        return self._request(build, timeout_s)[1]
+
+    def call(self, build, timeout_s=REQUEST_TIMEOUT_S):
+        message, reply = self._request(build, timeout_s)
+        if reply is None:
+            self.dead = True
+            raise DeviceError(f'Command {message.command} timed out')
+        status = response_status(reply)
+        if status:
+            raise DeviceError(f'Command {message.command} failed: {status_name(status)}')
+        return reply
 
     def reply_values(self, reply):
         return [value(field) for field in fields(reply.payload)]
@@ -105,10 +116,15 @@ more (a tracker that stalls stays silent for the rest of its session).
         self.call(lambda rid: open_realm_response(rid, (integers[0], integers[1]), digest, extra))
 
     def initialize(self):
-        """Protocol upgrade then unlock_ppu, opening the realm it requests (0x1402bc2b0)."""
-        self.call(protocol_upgrade)
-        unlock = [v for v in self.reply_values(self.call(
-            lambda rid: header_only_request(rid, Command.UNLOCK_PPU))) if isinstance(v, int)]
+        """Protocol upgrade then unlock_ppu, opening the realm it requests (0x1402bc2b0).
+
+The two replies stay in `startup_replies` (command: Message) for clients that
+start the same way.
+"""
+        upgrade = self.call(protocol_upgrade)
+        unlock_reply = self.call(lambda rid: header_only_request(rid, Command.UNLOCK_PPU))
+        self.startup_replies = {Command.PROTOCOL_UPGRADE: upgrade, Command.UNLOCK_PPU: unlock_reply}
+        unlock = [v for v in self.reply_values(unlock_reply) if isinstance(v, int)]
         if len(unlock) >= 3 and unlock[0] and not unlock[2]:
             self.open_realm(unlock[1], UNLOCK_REALM_KEY)
 

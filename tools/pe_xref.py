@@ -6,8 +6,11 @@
   strings TEXT...           string addresses and rip-relative lea references
   peek {s,f,d,i,q} ADDR...  read a C string, 4 floats, 2 doubles, 4 uint32 or 8 qwords
   rtti COL                  class name for a complete-object locator address
+
+PE_XREF_BINARY selects another PE image (for example the game DLL or ses_windows.dll).
 """
 import bisect
+import os
 import re
 import struct
 import sys
@@ -67,7 +70,7 @@ class Image:
 def main(argv):
     if len(argv) < 2:
         raise SystemExit(__doc__)
-    image, command, values = Image(), argv[0], argv[1:]
+    image, command, values = Image(Path(os.environ.get('PE_XREF_BINARY', BINARY))), argv[0], argv[1:]
     if command == 'function':
         for value in values:
             found = image.function(int(value, 16))
