@@ -5,11 +5,11 @@
     systems = [ "x86_64-linux" "aarch64-linux" ];
     forAllSystems = nixpkgs.lib.genAttrs systems;
   in {
-    packages = forAllSystems (system: let pkgs = import nixpkgs { inherit system; }; in rec {
-      models = pkgs.runCommand "tobii-linux-models" { } ''
-        mkdir -p $out
-        cp -r ${./models/tobii-et5}/. $out/
-      '';
+    packages = forAllSystems (system: let
+      pkgs = import nixpkgs { inherit system; };
+      lib = pkgs.lib;
+      repoModels = ./models/tobii-et5;
+    in rec {
       default = pkgs.python3Packages.buildPythonApplication {
         pname = "tobii-linux";
         version = "0.1.0";
@@ -19,7 +19,7 @@
           fileset = pkgs.lib.fileset.unions [ ./pyproject.toml ./src ./tests ];
         };
         build-system = [ pkgs.python3Packages.setuptools ];
-        dependencies = [ pkgs.python3Packages.numpy pkgs.python3Packages.openvino ];
+        dependencies = with pkgs.python3Packages; [ numpy openvino ];
         makeWrapperArgs = [
           "--set-default TOBII_LIBUSB_PATH ${pkgs.libusb1}/lib/libusb-1.0.so"
           "--set-default TOBII_LINUX_MODELS ${models}"
@@ -34,6 +34,11 @@
           mainProgram = "tobii-linux";
         };
       };
+    } // lib.optionalAttrs (builtins.pathExists repoModels) {
+      modelsFromRepo = pkgs.runCommand "tobii-linux-models-from-repo" { } ''
+        mkdir -p $out
+        cp -r ${repoModels}/. $out/
+      '';
     });
     nixosModules.default = import ./nix/module.nix self;
     checks = forAllSystems (system: let

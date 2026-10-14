@@ -7,7 +7,8 @@ from pathlib import Path
 from .prp_service import DEFAULT_NAME, DEFAULT_PORT, WINE_CLOCKS
 from .usb import USBContext, USBError
 
-DEFAULT_MODELS = Path(os.environ.get('TOBII_LINUX_MODELS', Path(__file__).resolve().parents[2]/'models/tobii-et5'))
+REPO_MODELS = Path(__file__).resolve().parents[2]/'models/tobii-et5'
+DEFAULT_MODELS = Path(os.environ.get('TOBII_LINUX_MODELS') or (REPO_MODELS if REPO_MODELS.is_dir() else default_models_dir()))
 
 
 def probe(_):

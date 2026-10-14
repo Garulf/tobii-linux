@@ -47,9 +47,11 @@ Probe for the tracker (no interface is claimed):
 PYTHONPATH=src python3 -m tobii_linux.cli probe
 ```
 
-Experimental head-pose session. It needs NumPy and OpenVINO, the models in
-`models/tobii-et5`, and the display area in millimetres in Stream Engine's
-corner order (top-left, top-right, bottom-left):
+Experimental head-pose session. It needs NumPy and OpenVINO, Tobii's models,
+and the display area in millimetres in Stream Engine's corner order (top-left,
+top-right, bottom-left).
+
+Then start the session:
 
 ```sh
 PYTHONPATH=src python3 -m tobii_linux.cli headpose \

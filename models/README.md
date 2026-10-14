@@ -15,4 +15,4 @@ The [complete catalog](tobii-et5/catalog.json) includes source/output hashes and
 
 Source: the Tobii installation on `albedo`, `C:/ProgramData/Tobii/Tobii Platform Runtime/IS5LEYETRACKER5/dependencies`.
 
-These assets are separate from the current Python/Nix package source selection. Full preprocessing, pose fitting and end-to-end tracking are still under reconstruction.
+Full preprocessing, pose fitting and end-to-end tracking are still under reconstruction.
