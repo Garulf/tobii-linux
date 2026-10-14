@@ -33,9 +33,9 @@ synthetic inputs; those checks are listed in the linked documents.
 | Wine pipe bridge | `tools/prp_bridge/` | The game DLL and `tobii_stream_engine.dll` receive tracker samples under Wine |
 | Wine pipe listing | `patches/wine/` | Needed for service discovery; tested on Wine 11.0 and master |
 
-On recorded live frames the Linux pipeline puts the head at 691 mm against
-694 mm from the Windows runtime moments earlier; lateral position and angles
-differ by up to 15 mm and 3 degrees, which is not yet explained
+With a person holding still, the Linux pipeline and the Windows runtime agree
+within 2 mm in position and 0.4 degrees in rotation, and those samples reach
+the game DLL's head-tracking API under Wine
 ([tracking loop](docs/face-tracking.md#fitting-coordinates-live-comparison)).
 
 ## Use
@@ -59,6 +59,16 @@ It prints one JSON line per camera frame. Frames saved by
 `tools/linux_session_probe.py --until frames` can be replayed offline with
 `tools/replay_frames.py <log> <frames-dir>`.
 
+A browser demo shows the camera with the face landmarks, head pose, the
+tracker's gaze and the device status from one tracker session. It serves
+http://localhost:8765/ and also runs in WSL2, where a Windows browser reaches it
+through mirrored networking; `--replay-frames` and `--replay-gaze` play recorded
+logs without a tracker ([demo](docs/demo.md)):
+
+```sh
+PYTHONPATH=src python3 -m tobii_linux.demo
+```
+
 ## Star Citizen under Wine
 
 Three pieces are needed:
@@ -75,8 +85,10 @@ Three pieces are needed:
      --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
    ```
 
-   Pass `--wine-clock raw` when the game's Wine is 10.16 or older. The
-   bridge tells the service which monitor is primary inside the prefix; if
+   It serves the tracker's gaze from the same session as well; `--no-gaze`
+   serves head pose only. Pass `--wine-clock raw` when the game's Wine is
+   10.16 or older. The bridge tells the service which monitor is primary
+   inside the prefix; if
    the game runs on another monitor, pass that monitor's id with
    `--display-id` ([game integration layer](docs/game-integration-layer.md)).
 3. The bridge, started in the game's Wine prefix before the game:
@@ -121,7 +133,7 @@ evaluation), but no NixOS machine has run them yet.
 
 ## Documents
 
-- [Project status](docs/project-status.md)
+- [Project status](docs/project-status.md), [browser demo](docs/demo.md)
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)

@@ -174,6 +174,12 @@ mapped onto the service clock with the smallest receipt delay over the last
 64 frames, and never later than the current service time
 (`driver.ClockMapper`).
 
+The same session also subscribes the gaze stream (`0x500`) and publishes every
+gaze message, never dropped, to the gaze hub as
+`gaze.gaze_frame(gaze.gaze_message(message))` restamped onto the service clock
+with its own `ClockMapper` (`streams.GazeAndImageStreams`), so head-pose timing
+is unchanged. `--no-gaze` serves head pose only, as before.
+
 Live on albedo (tracker attached to WSL2 with usbipd, `cli serve` as root,
 bridge and test client under Wine 11.0 with the pipe-listing patch,
 `PRP_URL=discover`, `PRP_EXTERNAL_SERVICE=1`, 10 s per client):

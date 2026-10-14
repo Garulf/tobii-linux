@@ -172,6 +172,23 @@ class ClockMapper:
         return min(device_us + self.offset, self.clock())
 
 
+def head_pose_processor(session, model_directory, display_area, camera=0):
+    """Camera calibration from a started session, then a function from image frame to head-pose sample."""
+    import numpy as np
+    from .face_tracking import FaceTracker
+    from .head_pose_pipeline import HeadPoseOutput
+    calibration = session.camera_calibration(camera)
+    output = HeadPoseOutput(calibration.translation, calibration.angles, display_area)
+    tracker = FaceTracker(model_directory)
+
+    def process(frame):
+        pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
+        result = tracker.process(pixels, frame.timestamp // 1000)
+        fit = result.fit['rigid_state'] if result.fit is not None else None
+        return output(fit, frame.timestamp)
+    return process
+
+
 def head_pose_samples(session, model_directory, display_area, camera=0, host_clock=None):
     """Frames from a started session through tracking, fitting and the output stages.
 
@@ -179,12 +196,7 @@ With `host_clock` (a function returning microseconds), frames are read on a
 separate thread, frames that arrive during processing are skipped, and sample
 timestamps are moved onto that clock.
 """
-    import numpy as np
-    from .face_tracking import FaceTracker
-    from .head_pose_pipeline import HeadPoseOutput
-    calibration = session.camera_calibration(camera)
-    output = HeadPoseOutput(calibration.translation, calibration.angles, display_area)
-    tracker = FaceTracker(model_directory)
+    process = head_pose_processor(session, model_directory, display_area, camera)
     session.subscribe_images()
     frames = session.frames()
     to_host = None
@@ -192,8 +204,5 @@ timestamps are moved onto that clock.
         to_host = ClockMapper(host_clock)
         frames = newest_frames(frames, on_receive=lambda frame: to_host.observe(frame.timestamp))
     for frame in frames:
-        pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
-        result = tracker.process(pixels, frame.timestamp // 1000)
-        fit = result.fit['rigid_state'] if result.fit is not None else None
-        sample = output(fit, frame.timestamp)
+        sample = process(frame)
         yield sample if to_host is None else replace(sample, timestamp_us=to_host(sample.timestamp_us))

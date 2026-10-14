@@ -210,10 +210,17 @@ fed; until then presence still follows head-pose validity.
 `PrpService(..., gaze_hub=...)` serves streams 3, 29 and 4, answers 6 and 33
 with status 17 and others with 2, and lists 6, 3, 29, 4, 2 in the connect
 response. Without a gaze hub it behaves as before. `--synthetic` publishes a
-gaze figure eight beside the head sweep (`--no-gaze` turns it off). Feeding live
-gaze needs the driver to subscribe stream `0x500` and publish
-`gaze.gaze_frame(gaze.gaze_message(message)).with_timestamp(host_time)`; that
-wiring belongs with the device session and is not done here.
+gaze figure eight beside the head sweep (`--no-gaze` turns it off).
+
+`tobii_linux.cli serve` feeds live gaze: `streams.GazeAndImageStreams`
+subscribes `0x500` beside the image stream in the same session and publishes
+`gaze.gaze_frame(gaze.gaze_message(message)).with_timestamp(host_time)` for every
+message the runtime would keep, with device time mapped by its own
+`driver.ClockMapper`; head pose keeps its own mapper and newest-frame dropping.
+`cli serve --no-gaze` serves head pose only. Presence (`0x504`) is not fed to
+`HeadPoseHub.publish_presence`: every capture so far reports device value 0
+(unknown), even with a person in front, and feeding it would replace the
+head-pose-based presence the game layer currently relies on.
 
 ## Checks
 
@@ -284,7 +291,9 @@ equal the raw column 28 figures; any remaining gap to Windows is in the device.
 - Whether licensed clients get streams 6 and 33 from the real service; the
   game layer requests 6 only when 29 fails.
 - The encoding of the operation 2 presence notification; none was captured.
-- Live gaze through `cli serve`: the driver does not yet subscribe `0x500`.
+- Live gaze through `cli serve` with the game: wired and unit tested, not yet
+  run against a game under Wine with a real tracker.
+- Why the device's presence stream reads 0 with a person in front.
 - What sets the device settings word `+0x188`; the ET5 behaviour is inferred
   from the two observations above, not from the setter.
 - Columns 14, 17 and 20 and the parser's column capacity.

@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eye Tracker 5 on Linux</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 16C6 9 11 6 16 6s10 3 14 10c-4 7-9 10-14 10S6 23 2 16z' fill='%230f172a' stroke='%2338bdf8' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%2338bdf8'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/demo.css">
+  <script src="/static/demo.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M2 16C6 9 11 6 16 6s10 3 14 10c-4 7-9 10-14 10S6 23 2 16z"/><circle cx="16" cy="16" r="5"/></svg>
+      <div>
+        <h1>tobii-linux</h1>
+        <span>Eye Tracker 5 live view</span>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-view="camera" class="active">Camera</button>
+      <button role="tab" data-view="pose">Head pose</button>
+      <button role="tab" data-view="gaze">Gaze</button>
+      <button role="tab" data-view="status">Status</button>
+    </nav>
+    <div class="vitals">
+      <span class="vital"><b id="vitalCamera">0</b> fps camera</span>
+      <span class="vital"><b id="vitalGaze">0</b> Hz gaze</span>
+      <span id="pill" class="pill warn">Connecting</span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden>
+    <strong id="bannerTitle"></strong>
+    <span id="bannerText"></span>
+  </div>
+
+  <main>
+    <section id="view-camera" class="view active" role="tabpanel">
+      <div class="grid camera-grid">
+        <div class="card media-card">
+          <div class="card-head">
+            <h2>Camera</h2>
+            <div class="toggles">
+              <label><input type="checkbox" id="optBox" checked> Face box</label>
+              <label><input type="checkbox" id="optMesh" checked> Mesh</label>
+              <label><input type="checkbox" id="optLandmarks" checked> Landmarks</label>
+              <label><input type="checkbox" id="optMirror"> Mirror</label>
+            </div>
+          </div>
+          <div class="canvas-wrap square">
+            <canvas id="cameraCanvas" width="840" height="840"></canvas>
+            <span id="cameraTag" class="canvas-tag">waiting</span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Tracking</h2>
+          <dl class="stats">
+            <dt>Tracker state</dt><dd><span id="trackState" class="state-dot">-</span></dd>
+            <dt>Landmark quality</dt>
+            <dd><div class="meter"><div id="qualityBar"></div></div><span id="qualityText" class="num">-</span></dd>
+            <dt>Quality gate</dt><dd id="gateText">-</dd>
+            <dt>Camera frames</dt><dd><span id="rateCamera" class="num">-</span> fps</dd>
+            <dt>Processed</dt><dd><span id="rateProcessed" class="num">-</span> fps</dd>
+            <dt>Processing time</dt><dd><span id="procMs" class="num">-</span> ms</dd>
+            <dt>Dropped frames</dt><dd><span id="droppedFrames" class="num">-</span></dd>
+            <dt>Image updates</dt><dd><span id="imageRate" class="num">-</span> per second</dd>
+          </dl>
+          <h3>Head pose</h3>
+          <div class="mini-pose">
+            <div><span>x</span><b id="miniX" class="num">-</b></div>
+            <div><span>y</span><b id="miniY" class="num">-</b></div>
+            <div><span>z</span><b id="miniZ" class="num">-</b></div>
+            <div><span>pitch</span><b id="miniPitch" class="num">-</b></div>
+            <div><span>yaw</span><b id="miniYaw" class="num">-</b></div>
+            <div><span>roll</span><b id="miniRoll" class="num">-</b></div>
+          </div>
+          <p id="headPoseNote" class="note"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-pose" class="view" role="tabpanel">
+      <div class="grid pose-grid">
+        <div class="card">
+          <div class="card-head">
+            <h2>Fitted face in the scene</h2>
+            <span id="poseBadge" class="badge">no pose</span>
+          </div>
+          <div class="canvas-wrap square">
+            <canvas id="scene" width="720" height="720" class="draggable"></canvas>
+          </div>
+          <p class="note">The fitted face mesh at the reported head pose, with the display and the tracker, in
+            display coordinates. Drag to orbit, scroll to zoom, double-click to reset.</p>
+        </div>
+        <div class="card">
+          <h2>Position and rotation</h2>
+          <div class="tiles">
+            <div class="tile x"><span>X</span><b id="poseX" class="num">-</b><small>mm</small></div>
+            <div class="tile y"><span>Y</span><b id="poseY" class="num">-</b><small>mm</small></div>
+            <div class="tile z"><span>Z</span><b id="poseZ" class="num">-</b><small>mm</small></div>
+            <div class="tile x"><span>Pitch</span><b id="posePitch" class="num">-</b><small>deg</small></div>
+            <div class="tile y"><span>Yaw</span><b id="poseYaw" class="num">-</b><small>deg</small></div>
+            <div class="tile z"><span>Roll</span><b id="poseRoll" class="num">-</b><small>deg</small></div>
+          </div>
+          <p class="note">The head-pose sample games receive: position in millimetres and rotation about x (pitch),
+            y (yaw) and z (roll), in the coordinate system of the display area given with <code>--display</code>:
+            origin at the display centre, x right, y up, z towards the user.</p>
+          <dl class="stats compact">
+            <dt>Valid samples</dt><dd><span id="poseValidShare" class="num">-</span></dd>
+            <dt>Sample time</dt><dd><span id="poseTime" class="num">-</span></dd>
+          </dl>
+        </div>
+        <div class="card wide">
+          <div class="card-head">
+            <h2>Position, last 10 s</h2>
+            <div class="legend"><i class="x"></i>x <i class="y"></i>y <i class="z"></i>z <span class="muted">mm</span></div>
+          </div>
+          <canvas id="plotPosition" class="plot lanes"></canvas>
+          <div class="card-head">
+            <h2>Rotation, last 10 s</h2>
+            <div class="legend"><i class="x"></i>pitch <i class="y"></i>yaw <i class="z"></i>roll <span class="muted">deg</span></div>
+          </div>
+          <canvas id="plotRotation" class="plot lanes"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-gaze" class="view" role="tabpanel">
+      <div class="grid gaze-grid">
+        <div class="card">
+          <div class="card-head">
+            <h2>Gaze point</h2>
+            <button id="fullscreenButton" class="primary">Fullscreen gaze dot</button>
+          </div>
+          <div class="screen-wrap"><canvas id="gazePreview"></canvas></div>
+          <div class="controls">
+            <label>Smoothing <input type="range" id="optSmoothing" min="0" max="400" step="10" value="90">
+              <span id="smoothingText" class="num">90 ms</span></label>
+            <label><input type="checkbox" id="optTrail" checked> Trail</label>
+            <label><input type="checkbox" id="optRaw"> Raw samples</label>
+          </div>
+          <p class="note">Points are normalised to the display area. The fullscreen view maps them onto the
+            browser window, so it is only accurate when the browser is fullscreen on the monitor that
+            <code>--display</code> describes (the primary monitor).</p>
+        </div>
+        <div class="card">
+          <h2>Eyes</h2>
+          <table class="eyes">
+            <thead><tr><th></th><th>Left</th><th>Right</th></tr></thead>
+            <tbody>
+              <tr><th>Validity</th><td id="leftValid">-</td><td id="rightValid">-</td></tr>
+              <tr><th>Gaze point</th><td id="leftPoint" class="num">-</td><td id="rightPoint" class="num">-</td></tr>
+              <tr><th>Pupil</th><td id="leftPupil" class="num">-</td><td id="rightPupil" class="num">-</td></tr>
+              <tr><th>Openness</th><td id="leftOpen" class="num">-</td><td id="rightOpen" class="num">-</td></tr>
+              <tr><th>Gaze origin</th><td id="leftOrigin" class="num">-</td><td id="rightOrigin" class="num">-</td></tr>
+            </tbody>
+          </table>
+          <h3>Combined</h3>
+          <dl class="stats compact">
+            <dt>Source</dt><dd id="gazeSource">-</dd>
+            <dt>Point</dt><dd><span id="gazePoint" class="num">-</span></dd>
+            <dt>Valid</dt><dd><span id="gazeValidShare" class="num">-</span></dd>
+            <dt>Rate</dt><dd><span id="gazeRate" class="num">-</span> Hz</dd>
+            <dt>Presence</dt><dd id="gazePresence">-</dd>
+          </dl>
+          <div class="card-head spaced">
+            <h3>Pupil diameter, last 10 s</h3>
+            <div class="legend"><i class="x"></i>left <i class="z"></i>right <span class="muted">mm</span></div>
+          </div>
+          <canvas id="plotPupil" class="plot small"></canvas>
+        </div>
+        <div class="card wide">
+          <details>
+            <summary>All gaze stream columns</summary>
+            <table id="columnsTable" class="columns"><tbody></tbody></table>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-status" class="view" role="tabpanel">
+      <div class="grid status-grid">
+        <div class="card">
+          <h2>Connection</h2>
+          <dl class="stats" id="connectionList"></dl>
+        </div>
+        <div class="card">
+          <h2>Device</h2>
+          <dl class="stats" id="deviceList"></dl>
+        </div>
+        <div class="card">
+          <h2>Streams</h2>
+          <table class="streams">
+            <thead><tr><th>Stream</th><th>Rate</th><th>Total</th></tr></thead>
+            <tbody id="streamRows"></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Session</h2>
+          <dl class="stats" id="sessionList"></dl>
+        </div>
+        <div class="card wide">
+          <h2>Errors</h2>
+          <ul id="errorList" class="errors"><li class="muted">None</li></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="gazeStage" class="gaze-stage" hidden>
+    <canvas id="stageCanvas"></canvas>
+    <div id="stageHint" class="stage-hint">Esc exits &middot; T trail &middot; R raw samples &middot; [ and ] smoothing</div>
+  </div>
+</body>
+</html>

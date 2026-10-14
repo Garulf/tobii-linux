@@ -22,9 +22,14 @@ def display_area(args):
     return DisplayArea(*(tuple(args.display[i:i + 3]) for i in (0, 3, 6)))
 
 
-def tracker_samples(args, host_clock=None):
-    """Head-pose samples from the first matching tracker until it stops sending frames."""
+def tracker_samples(args, host_clock=None, on_gaze=None):
+    """Head-pose samples from the first matching tracker until it stops sending frames.
+
+With `on_gaze`, the gaze stream is read in the same session and each gaze frame
+is passed to it on the service clock (see streams.head_pose_and_gaze).
+"""
     from .driver import TrackerSession, head_pose_samples
+    from .streams import head_pose_and_gaze
     from .usb_channel import USBChannel
     area = display_area(args)
     with USBContext() as context:
@@ -36,7 +41,10 @@ def tracker_samples(args, host_clock=None):
             with USBChannel(transport, args.channel) as channel:
                 session = TrackerSession(channel)
                 session.initialize()
-                yield from head_pose_samples(session, args.models, area, host_clock=host_clock)
+                if on_gaze is None:
+                    yield from head_pose_samples(session, args.models, area, host_clock=host_clock)
+                else:
+                    yield from head_pose_and_gaze(session, args.models, area, host_clock, on_gaze)
 
 
 def headpose(args):
@@ -50,18 +58,22 @@ def headpose(args):
 def serve(args):
     import asyncio
     import logging
-    from .prp_service import HeadPoseHub, PrpService, wine_clock
+    from .prp_service import GazeHub, HeadPoseHub, PrpService, wine_clock
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     clock = wine_clock(args.wine_clock)
 
     async def run():
+        loop = asyncio.get_running_loop()
         hub = HeadPoseHub()
+        gaze_hub = None if args.no_gaze else GazeHub()
         service = PrpService(hub, args.name, clock=clock, display_area=display_area(args),
-                             display_id=args.display_id)
+                             display_id=args.display_id, gaze_hub=gaze_hub)
         server = await service.serve(args.host, args.port)
         logging.info('PRP service on %s:%d, pipes %s', args.host, args.port, service.pipe_names)
+        on_gaze = None if gaze_hub is None else (
+            lambda frame: loop.call_soon_threadsafe(gaze_hub.publish, frame))
         async with server:
-            await hub.feed_iterator(tracker_samples(args, host_clock=clock))
+            await hub.feed_iterator(tracker_samples(args, host_clock=clock, on_gaze=on_gaze))
         raise RuntimeError('The tracker stopped sending frames')
 
     asyncio.run(run())
@@ -69,13 +81,17 @@ def serve(args):
 
 
 def main():
+    if sys.argv[1:2] == ['demo']:
+        from .demo.app import main as demo
+        return demo(sys.argv[2:], prog=f'{Path(sys.argv[0]).name} demo')
     parser = argparse.ArgumentParser(description='Native Eye Tracker 5 driver (experimental)')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('probe', help='Inspect standard USB descriptors without claiming interfaces')
+    commands.add_parser('demo', help='Serve the live browser demo; see demo --help for its options')
     headpose_parser = commands.add_parser(
         'headpose', help='Start the tracker and print head-pose samples as JSON lines')
     serve_parser = commands.add_parser(
-        'serve', help='Serve tracker head pose to Windows games through the Wine pipe bridge')
+        'serve', help='Serve tracker head pose and gaze to Windows games through the Wine pipe bridge')
     for session in (headpose_parser, serve_parser):
         session.add_argument('--display', type=float, nargs=9, required=True,
                              metavar=('TLX', 'TLY', 'TLZ', 'TRX', 'TRY', 'TRZ', 'BLX', 'BLY', 'BLZ'),
@@ -92,6 +108,8 @@ def main():
     serve_parser.add_argument('--wine-clock', choices=WINE_CLOCKS, default='boottime',
                               help="Clock behind the game's Wine QueryPerformanceCounter: "
                                    'boottime for Wine 10.17 and later, raw for older')
+    serve_parser.add_argument('--no-gaze', action='store_true',
+                              help='Serve head pose only, without subscribing the gaze stream')
     args = parser.parse_args()
     try:
         return {'probe': probe, 'headpose': headpose, 'serve': serve}[args.command](args)
