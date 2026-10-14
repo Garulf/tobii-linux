@@ -224,10 +224,10 @@ def is_mapped(device_area) -> bool:
 
 
 def line_instructions(mounting=ET5_MOUNTING) -> str:
-    """What the user lines the arrows up with: the guide marks, or a one-guide tracker's ends (G6 small)."""
+    """ScreenPlaneSetup_FullScreenMessage_Instructions, or InstructionsG6Small for a one-guide tracker."""
     if mounting.guides == 1:
-        return 'Move the two arrows so they point at the ends of your eye tracker.'
-    return 'Move the two arrows so they point at the two marks on top of your eye tracker.'
+        return 'Move the lines to the sides of your eye tracker.'
+    return 'Move the lines to the marks on top of your eye tracker.'
 
 
 def initial_lines(mounting=ET5_MOUNTING, device_area=None, size_hint=None, screen_px=None) -> LineSetup:

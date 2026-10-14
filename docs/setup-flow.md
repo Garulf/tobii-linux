@@ -140,12 +140,12 @@ tracker answers, so it is never blank. Steps:
 1. **Display setup** (`--display auto`: only when the device holds no
    display area, as Tobii's intro rule). The intro asks where the tracker is
    (only then), "This display" or Enter moves the tracker into place and the
-   lines slide in. Linux additions: the left arrow starts selected (white,
-   solid, with a light band), the arrow keys move only the selected one by a
-   device pixel (Shift: ten), Tab, L and R switch, dragging the tracker moves
-   both; a small readout shows the screen size and tracker offset. Done (or
-   Enter) needs the page to cover the screen (fullscreen, or a kiosk window
-   as large as the screen). An unchanged area writes nothing. A changed one
+   lines slide in. The screen is Tobii's, drawn from its XAML (see
+   [display setup](display-setup.md#the-on-screen-step-static)), without the
+   Tobii logo. Invisible Linux additions: the arrow keys nudge the last used
+   line by a device pixel (Shift: ten) and show it in the hover colour; Tab,
+   L and R pick a line. Done (or Enter) needs the page to cover the screen
+   (fullscreen, or a kiosk window as large as the screen). An unchanged area writes nothing. A changed one
    asks "Save the new display setup?" unless `--save-display` was given;
    the old area is saved to `$XDG_DATA_HOME/tobii-linux/backups/` first.
    Tobii's separate "Sit in an upright position" screen becomes a line at the
@@ -187,8 +187,8 @@ page reports its size, the screen size and fullscreen state with every event.
 Differences from Tobii, all deliberate: one page instead of separate
 windows; no monitor switching (the browser window is on one display); no
 aspect-ratio warning; the display area is only written after the user
-confirms (or `--save-display`); the size readout and keyboard handling on the
-display step; the "Good" line on the positioning screen; the restart limit;
+confirms (or `--save-display`); keyboard nudging on the display step and
+no Tobii logo; the "Good" line on the positioning screen; the restart limit;
 the previous calibration put back on cancel (Tobii's runtime restores it
 from `calibration.setpm` when the services start); the proximity modifier of
 the focus zone and the 3 s extra delay before "Are you there?" at the very

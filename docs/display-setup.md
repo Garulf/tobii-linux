@@ -232,6 +232,43 @@ guide (G6 small): to its sides. A Done button (the default button, so Enter)
 confirms. When the step opens, the lines slide in from 0.01 outside their
 positions over 1.5 s.
 
+Look (XAML of `ScreenPlaneSetupControl`, `DisplaySetupLineHandleView`,
+`EyeTracker5`, `EyeTracker5OnScreen`, `Screen`; colours and styles from
+`Tobii.EyeX.Branding` `colorsfonts.xaml` and `buttons.xaml`):
+
+- Background `#021419`. A 60 px header row holds the white Tobii logo at the
+  top left; a title bar puts a thin close X (`#AFC4CD`, white on hover) at the
+  top right. Below the header the grid has rows 0.35 : 1 : 1 : 2 and columns
+  1 : 3 : 1. The text sits at the bottom of row 1, Done in row 2 (with a 60 px
+  right margin, so 30 px left of centre), the lines' canvas fills row 3 and
+  clips to it.
+- Text: "Segoe UI Light", 37 px, `#D9F4FF` (`ConfigFullscreenExplainingText`);
+  the intro's second line 28 px (`ConfigFullscreenHeadlineText`).
+- Buttons (`ConfigButtonStyle`): a pill, at least 120 x 33 px, padding 25 px,
+  12 pt text, background `#004B66` drawn at 0.95 scale, `#018EC1` and 0.975
+  on hover, `#00BEFF` pressed, `#2B3940` with `#637279` text when disabled.
+- The tracker is the `EyeTracker5` vector drawing (white 2 px strokes on
+  black, scaled with it): the body, two lenses, the camera bump with its
+  lens, a centre mark and the two slanted guide marks whose lower ends are
+  exactly where the lines start.
+- A line handle is 60 px wide in three 20 px columns: a left-pointing filled
+  white triangle (0,30 14,16 14,44) in the first column, the 1 px dashed line
+  (dash 5) at x 30, a V arrowhead (M4,0 L10,10 L16,0, 1 px) at the bottom of
+  the screen, and a right-pointing triangle (14,30 0,16 0,44) starting at
+  x 40. The triangles sit at the vertical middle of the handle. Line and V
+  are `#AFC4CD`, white while the mouse is over the handle; the triangles are
+  always white. There is no selected or dragging look.
+- Intro: the `Screen` monitor icon (400 px wide, `#AFC4CD` body and stand,
+  black screen) at the top of the canvas and the flat `EyeTracker5OnScreen`
+  drawing (250 px wide) 222 px below the canvas top on its bezel. "This
+  display" moves the flat drawing to the tracker's place and size (1 s,
+  quadratic ease in and out) while the monitor fades out, then cross-fades
+  to the detailed drawing (0.5 s). The detailed tracker stays at that height
+  (the flat drawing's top minus a quarter of the tracker's height, or 150 px
+  above the bottom if that is higher up), then the text and Done fade in
+  (from 0.5 s over 1 s) and the lines slide in (1.5 s, WPF BackEase in and
+  out).
+
 Initial positions. From `MovingLinesScreenPlaneSetupFactory` (see "The
 wizard"): from the stored mapping when valid, otherwise centred with the
 EDID width or 376.3 mm.
@@ -317,18 +354,19 @@ networking) and waits for the user:
   size when `--edid` or `--connector` gives one), else an estimate from the
   EDID size (only if its aspect matches the screen's pixels) or 376.3 mm
   wide, centred, with the screen's pixel aspect.
-- The drawing follows the control's layout (tracker 150 px above the bottom,
-  286/184 as wide as the line distance, dashed lines with side triangles and
-  a downward arrowhead); the tracker is a plain rounded bar, not Tobii's
-  artwork. Dragging works as in the app, with the same limits: pressing near
-  a line (the nearest one when both are close) below its top drags only that
-  line and selects it; pressing on the tracker, which is labelled "drag to
-  move both arrows", drags both. As a Linux addition the arrow keys move the
-  selected line, which starts as the left one and is drawn solid and blue,
-  by one device pixel (Shift: ten); Tab, L and R select a line, Enter
-  confirms and Esc or Cancel cancels. Earlier the page started with both
-  lines selected, so the keys moved both. The page shows the resulting size,
-  diagonal and tracker offset live.
+- The screen is Tobii's (`setup/static/alignment.js`, shared with the setup
+  page): the layout, the `EyeTracker5` and intro drawings redrawn from their
+  XAML paths, the handles, colours, text, Done placement and the animations
+  listed above. Dragging works as in the app, with the same limits: pressing
+  near a line (the nearest one when both are close) below its top drags that
+  line; pressing on the tracker drags both. The Tobii logo is left out (it is
+  Tobii's mark, not ours), and a font close to Segoe UI Light is used where
+  that font is missing. As an invisible Linux addition the arrow keys nudge
+  the last used line (the left one at first) by one device pixel (Shift:
+  ten) and show it in the hover colour; Tab, L and R pick a line, Enter is
+  Done and Esc or the X cancels. Earlier versions started with both lines
+  selected, so the keys moved both, and added hint text, a size readout, a
+  highlight band and a plain rounded bar; all of that is gone.
 - On confirm, `display_setup.area_from_lines` computes size, offset and area
   as Done does; the tool saves `OUTPUT.setpm` (screenplane.setpm layout) and
   `OUTPUT.json` (the corners, `display_args` and the full `--display` option),

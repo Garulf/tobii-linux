@@ -251,9 +251,9 @@ class LineSetupTests(unittest.TestCase):
         self.assertTrue(ds.is_mapped(ALBEDO_AREA))
         self.assertFalse(ds.is_mapped(None))
         self.assertFalse(ds.is_mapped(ds.DisplayArea((0, 0, 0), (0, 0, 0), (0, 0, 0))))
-        self.assertIn('two marks', ds.line_instructions(ds.ET5_MOUNTING))
+        self.assertEqual(ds.line_instructions(ds.ET5_MOUNTING), 'Move the lines to the marks on top of your eye tracker.')
         one_guide = ds.MountingGeometry(1, 184.0, 20.0, (0, 0, 0), (0, 0, 0))
-        self.assertIn('ends', ds.line_instructions(one_guide))
+        self.assertIn('sides', ds.line_instructions(one_guide))
 
     def test_line_limits_follow_the_view_model(self):
         self.assertEqual(ds.clamp_lines(0.0, 1.0), (0.02, 0.98))

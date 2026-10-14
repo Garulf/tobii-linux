@@ -20,7 +20,7 @@ FULLSCREEN_TOLERANCE_PX = 2
 PAGE_GONE_S = 20.0
 CONTENT_TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
                  '.css': 'text/css; charset=utf-8'}
-STATIC_FILES = {'/': 'index.html', '/setup.js': 'setup.js', '/setup.css': 'setup.css'}
+STATIC_FILES = {'/': 'index.html', '/setup.js': 'setup.js', '/setup.css': 'setup.css', '/alignment.js': 'alignment.js'}
 
 
 class Cancelled(RuntimeError):

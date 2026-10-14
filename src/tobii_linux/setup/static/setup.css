@@ -60,11 +60,11 @@ button:disabled, button:disabled:hover { background: #2b3940; color: #637279; cu
 .buttons.right { justify-content: flex-end; }
 
 .close {
-  position: absolute; top: 10px; right: 14px; z-index: 10;
-  min-width: 0; min-height: 0; width: 44px; height: 44px; padding: 0;
-  background: transparent; color: var(--foreground); font-size: 22px; border-radius: 22px;
+  position: absolute; top: 0; right: 0; z-index: 10;
+  min-width: 0; min-height: 0; width: 35px; height: 30px; padding: 5px 5px 0 0;
+  background: transparent; color: var(--foreground); border-radius: 0;
 }
-.close:hover { background: rgba(255, 255, 255, .08); color: #fff; }
+.close:hover { background: transparent; color: #fff; }
 
 .banner {
   position: absolute; top: 0; left: 0; right: 0; z-index: 9;
@@ -79,14 +79,6 @@ button:disabled, button:disabled:hover { background: #2b3940; color: #637279; cu
   background: var(--foreground); transform-origin: 3px 22px; animation: spinner-fade 1.2s linear infinite;
 }
 @keyframes spinner-fade { 0% { opacity: 1; } 75%, 100% { opacity: .1; } }
-
-/* Display setup: Tobii's grid puts the text at the bottom of the second row (31 % down) and Done below it. */
-#display-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-.display-text { position: absolute; left: 10%; right: 10%; top: 0; height: 31%; display: flex;
-                flex-direction: column; justify-content: flex-end; text-align: center; pointer-events: none; }
-.display-text .subtext { margin-top: .9em; }
-.display-buttons { position: absolute; left: 0; right: 0; top: 31%; height: 23%; display: flex;
-                   align-items: center; justify-content: center; }
 
 #display-save .subtext { margin-top: 1.2em; }
 

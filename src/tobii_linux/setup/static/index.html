@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="/setup.css">
 </head>
 <body tabindex="-1">
-<button id="close" class="close" title="Cancel (Esc)" aria-label="Cancel">&#x2715;</button>
+<button id="close" class="close" title="Cancel (Esc)" aria-label="Cancel"><svg viewBox="0 0 60 60" width="25" height="25"><path d="M15,15 L45,45 M15,45 L45,15" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
 <div id="fullscreen-banner" class="banner" hidden>This page has to fill the screen. Click anywhere or press F11.</div>
 
 <section id="connecting" class="screen centred">
@@ -19,25 +19,7 @@
   <p class="headline" id="busy-title"></p>
 </section>
 
-<section id="display" class="screen">
-  <canvas id="display-canvas"></canvas>
-  <div class="display-text">
-    <div id="display-intro">
-      <p class="explaining">Where is your eye tracker?</p>
-      <p class="headline">If you have not attached it to this display yet, now is the time.</p>
-    </div>
-    <div id="display-lines">
-      <p class="explaining" id="display-instruction"></p>
-      <p class="subtext">Drag an arrow, or move the white one with the arrow keys (Shift: faster).
-        Tab switches arrows. Drag the eye tracker to move both.</p>
-      <p class="readout" id="display-readout"></p>
-    </div>
-  </div>
-  <div class="display-buttons">
-    <button class="primary" id="this-display">This display</button>
-    <button class="primary" id="display-done">Done</button>
-  </div>
-</section>
+<section id="display" class="screen"></section>
 
 <section id="display-save" class="screen centred">
   <p class="explaining">Save the new display setup?</p>
@@ -107,6 +89,7 @@
   <p class="subtext" id="finished-hint"></p>
 </section>
 
+<script src="/alignment.js"></script>
 <script src="/setup.js"></script>
 </body>
 </html>

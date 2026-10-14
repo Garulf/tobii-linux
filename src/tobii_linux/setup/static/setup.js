@@ -9,7 +9,6 @@ const SECTIONS = {connecting: 'connecting', busy: 'busy', display: 'display', 'd
                   profile: 'profile', finished: 'finished', cancelled: 'finished', error: 'finished'};
 const NOT_CANCELLABLE = new Set(['finished', 'cancelled', 'error']);
 const NEEDS_FULLSCREEN = new Set(['display', 'positioning', 'calibration']);
-const COLOURS = {line: '#afc4cd', highlight: '#ffffff', body: '#000000'};
 
 let current = {seq: -1, name: null};
 let live = {};
@@ -62,7 +61,7 @@ function showSection(name) {
 
 function updateFullscreenBanner() {
   $('fullscreen-banner').hidden = fullscreen() || !NEEDS_FULLSCREEN.has(current.name);
-  if (current.name === 'display') drawDisplay();
+  if (current.name === 'display') alignment.draw();
 }
 
 // Cursor: hidden during the calibration, and after 2 s without movement while positioning.
@@ -85,229 +84,15 @@ function makeSpinners() {
   }
 }
 
-// Display setup -------------------------------------------------------------------------------
+// Display setup: Tobii's alignment screen (alignment.js) ------------------------------------------
 
-const BOTTOM_MARGIN = 150, HANDLE_HALF_WIDTH = 30, TRACKER_RATIO = 72.151 / 812.708;
-const MARKS = [[150.8, 145.8], [407.37, 407.37], [662.2, 668.2]];
-const display = {config: null, left: 0, right: 1, phase: 'intro', selected: 'left', hover: null, drag: null,
-                 intro: null};
-
-function setLeft(value) { display.left = Math.max(Math.min(value, display.right - 0.05), 0.02); }
-function setRight(value) { display.right = Math.min(Math.max(value, display.left + 0.05), 0.98); }
-
-function trackerRect(left = display.left, right = display.right) {
-  const w = window.innerWidth, h = window.innerHeight;
-  const tw = (right - left) * display.config.picture_proportion * w, th = tw * TRACKER_RATIO;
-  const top = h - th - BOTTOM_MARGIN;
-  return {x: ((left + right) / 2) * w - tw / 2, y: top, w: tw, h: th, lineTop: top + th / 4};
-}
-
-function drawTracker(ctx, r, alpha = 1) {
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.strokeStyle = COLOURS.highlight; ctx.fillStyle = COLOURS.body; ctx.lineWidth = 2;
-  const bodyTop = r.y + r.h / 4;
-  ctx.beginPath(); ctx.roundRect(r.x, bodyTop, r.w, r.h * 0.75, Math.min(r.h * 0.3, 14)); ctx.fill(); ctx.stroke();
-  for (const [topX, bottomX] of MARKS) {
-    ctx.beginPath();
-    ctx.moveTo(r.x + r.w * topX / 812.708, r.y);
-    ctx.lineTo(r.x + r.w * bottomX / 812.708, bodyTop);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function drawLine(ctx, x, top, side) {
-  const h = window.innerHeight, selected = display.selected === side;
-  const colour = selected || display.hover === side ? COLOURS.highlight : COLOURS.line;
-  ctx.strokeStyle = colour; ctx.lineWidth = selected ? 2 : 1;
-  if (!selected) ctx.setLineDash([5, 5]);
-  ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, h - 1); ctx.stroke(); ctx.setLineDash([]);
-  ctx.lineWidth = selected ? 2 : 1;
-  ctx.beginPath(); ctx.moveTo(x - 6, h - 11); ctx.lineTo(x, h - 1); ctx.lineTo(x + 6, h - 11); ctx.stroke();
-  const middle = (top + h) / 2;
-  ctx.fillStyle = COLOURS.highlight;
-  ctx.beginPath(); ctx.moveTo(x - 30, middle); ctx.lineTo(x - 16, middle - 14); ctx.lineTo(x - 16, middle + 14); ctx.fill();
-  ctx.beginPath(); ctx.moveTo(x + 30, middle); ctx.lineTo(x + 16, middle - 14); ctx.lineTo(x + 16, middle + 14); ctx.fill();
-  if (selected) {
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.07)';
-    ctx.fillRect(x - HANDLE_HALF_WIDTH, top, HANDLE_HALF_WIDTH * 2, h - top);
-  }
-}
-
-function drawMonitorIcon(ctx, alpha) {
-  const w = 400, h = w * 109.5 / 143, x = (window.innerWidth - w) / 2, y = window.innerHeight * 0.54;
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.fillStyle = COLOURS.line;
-  ctx.beginPath(); ctx.roundRect(x, y, w, h * 0.78, 8); ctx.fill();
-  ctx.fillStyle = '#000'; ctx.fillRect(x + 10, y + 10, w - 20, h * 0.78 - 32);
-  ctx.fillStyle = COLOURS.line;
-  ctx.fillRect(x + w / 2 - 25, y + h * 0.78, 50, h * 0.14);
-  ctx.beginPath(); ctx.roundRect(x + w / 2 - 80, y + h * 0.92, 160, h * 0.08, 4); ctx.fill();
-  ctx.restore();
-  return {x: x + (w - 250) / 2, y: y + h * 0.78 - 22 - 250 * TRACKER_RATIO / 2, w: 250, h: 250 * TRACKER_RATIO};
-}
-
-function drawDisplay() {
-  const canvas = $('display-canvas'), ctx = canvas.getContext('2d'), dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.round(window.innerWidth * dpr); canvas.height = Math.round(window.innerHeight * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-  if (!display.config) return;
-  if (display.phase === 'intro' || display.phase === 'moving') {
-    const progress = display.phase === 'moving' ? display.intro : 0;
-    const flat = drawMonitorIcon(ctx, 1 - progress), target = trackerRect();
-    const ease = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-    const mix = (a, b) => a + (b - a) * ease;
-    drawTracker(ctx, {x: mix(flat.x, target.x), y: mix(flat.y, target.y), w: mix(flat.w, target.w),
-                      h: mix(flat.h, target.h)});
-    return;
-  }
-  const r = trackerRect();
-  drawTracker(ctx, r);
-  drawLine(ctx, display.left * window.innerWidth, r.lineTop, 'left');
-  drawLine(ctx, display.right * window.innerWidth, r.lineTop, 'right');
-  const config = display.config, width = config.tracker_width_mm / (display.right - display.left);
-  const height = width / config.aspect, offset = ((display.left + display.right) / 2 - 0.5) * width;
-  const diagonal = Math.hypot(width, height) / 25.4;
-  setText('display-readout', `Screen ${width.toFixed(0)} x ${height.toFixed(0)} mm (${diagonal.toFixed(1)} in), ` +
-    (Math.abs(offset) < 0.5 ? 'eye tracker centred' :
-      `eye tracker ${Math.abs(offset).toFixed(0)} mm ${offset > 0 ? 'right' : 'left'} of centre`));
-  $('display-done').disabled = !fullscreen() || display.phase !== 'lines';
-}
-
-function lineAt(x, y) {
-  if (display.phase !== 'lines') return null;
-  const w = window.innerWidth, r = trackerRect();
-  const near = ['left', 'right']
-    .map((side) => ({side: side, distance: Math.abs(x - display[side] * w)}))
-    .filter((candidate) => candidate.distance <= HANDLE_HALF_WIDTH && y >= r.lineTop)
-    .sort((a, b) => a.distance - b.distance);
-  if (near.length) return near[0].side;
-  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h ? 'tracker' : null;
-}
-
-function slideLinesIn() {
-  display.phase = 'sliding';
-  const l0 = display.config.left, r0 = display.config.right, start = performance.now();
-  const backEase = (t) => {
-    const c = 1.70158 * 1.525;
-    return t < 0.5 ? (Math.pow(2 * t, 2) * ((c + 1) * 2 * t - c)) / 2
-                   : (Math.pow(2 * t - 2, 2) * ((c + 1) * (t * 2 - 2) + c) + 2) / 2;
-  };
-  function frame(now) {
-    const t = Math.min(1, (now - start) / 1500), e = backEase(t);
-    display.left = l0 - 0.01 * (1 - e); display.right = r0 + 0.01 * (1 - e);
-    if (t < 1) { drawDisplay(); requestAnimationFrame(frame); return; }
-    display.left = l0; display.right = r0; display.phase = 'lines'; drawDisplay();
-  }
-  requestAnimationFrame(frame);
-}
-
-function showLines() {
-  $('display-intro').hidden = true; $('display-lines').hidden = false;
-  $('this-display').hidden = true; $('display-done').hidden = false;
-  for (const element of [$('display-lines'), $('display-done')])
-    fade(element, [{opacity: 0}, {opacity: 1}], {delay: 500, duration: 1000});
-  slideLinesIn();
-}
-
-function chooseThisDisplay() {
-  if (display.phase !== 'intro') return;
-  enterFullscreen();
-  $('this-display').disabled = true;
-  display.phase = 'moving';
-  const start = performance.now();
-  function frame(now) {
-    display.intro = Math.min(1, (now - start) / 1000);
-    drawDisplay();
-    if (display.intro < 1) requestAnimationFrame(frame); else showLines();
-  }
-  requestAnimationFrame(frame);
-}
-
-function renderDisplay(screenState) {
-  display.config = screenState;
-  display.left = screenState.left; display.right = screenState.right;
-  display.selected = 'left'; display.hover = null; display.drag = null;
-  setText('display-instruction', screenState.instructions);
-  $('this-display').disabled = false;
-  if (screenState.intro) {
-    display.phase = 'intro';
-    $('display-intro').hidden = false; $('display-lines').hidden = true;
-    $('this-display').hidden = false; $('display-done').hidden = true;
-    fade($('display-intro'), [{opacity: 0}, {opacity: 1}], {delay: 500, duration: 1000});
-    drawDisplay();
-  } else {
-    $('display-intro').hidden = true;
-    showLines();
-  }
-}
-
-function confirmLines() {
-  if (display.phase !== 'lines' || !fullscreen()) return;
-  display.phase = 'confirmed';
-  $('display-done').disabled = true;
-  act('done', {left: display.left, right: display.right});
-}
-
-function nudgeSelected(direction, large) {
-  const step = (large ? 10 : 1) / ((window.devicePixelRatio || 1) * window.innerWidth) * direction;
-  if (display.selected === 'left') setLeft(display.left + step); else setRight(display.right + step);
-  drawDisplay();
-}
-
-function displayKey(event) {
-  if (event.key === 'Enter') {
-    event.preventDefault();
-    if (display.phase === 'intro') chooseThisDisplay(); else confirmLines();
-    return;
-  }
-  if (display.phase !== 'lines') return;
-  const key = event.key.toLowerCase();
-  if (event.key === 'Tab') { display.selected = display.selected === 'left' ? 'right' : 'left'; event.preventDefault(); }
-  else if (key === 'l') display.selected = 'left';
-  else if (key === 'r') display.selected = 'right';
-  else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-    nudgeSelected(event.key === 'ArrowLeft' ? -1 : 1, event.shiftKey);
-    event.preventDefault();
-    return;
-  } else return;
-  drawDisplay();
-}
-
-$('display-canvas').addEventListener('mousedown', (event) => {
-  enterFullscreen();
-  const hit = lineAt(event.clientX, event.clientY);
-  if (!hit) return;
-  if (hit !== 'tracker') display.selected = hit;
-  const w = window.innerWidth;
-  display.drag = {kind: hit, toLeft: display.left * w - event.clientX, toRight: display.right * w - event.clientX};
-  drawDisplay();
+const alignment = new TrackerAlignment($('display'), {
+  canFinish: fullscreen,
+  onDone: (left, right) => act('done', {left: left, right: right}),
+  onThisDisplay: enterFullscreen,
 });
 
-window.addEventListener('mousemove', (event) => {
-  if (current.name === 'positioning') updateCursor();
-  if (current.name !== 'display' || !display.config) return;
-  const w = window.innerWidth, drag = display.drag;
-  if (drag && display.phase === 'lines') {
-    if (drag.kind === 'tracker') {
-      const span = display.right - display.left;
-      display.left = Math.min(Math.max((event.clientX + drag.toLeft) / w, 0.02), 0.98 - span);
-      display.right = display.left + span;
-    } else if (drag.kind === 'left') setLeft((event.clientX + drag.toLeft) / w);
-    else setRight((event.clientX + drag.toRight) / w);
-  }
-  display.hover = drag ? drag.kind : lineAt(event.clientX, event.clientY);
-  $('display-canvas').style.cursor = display.hover ? 'ew-resize' : 'default';
-  drawDisplay();
-});
-
-window.addEventListener('mouseup', () => { if (display.drag) { display.drag = null; drawDisplay(); } });
-document.addEventListener('mouseleave', () => { display.drag = null; });
-$('this-display').addEventListener('click', chooseThisDisplay);
-$('display-done').addEventListener('click', confirmLines);
+window.addEventListener('mousemove', () => { if (current.name === 'positioning') updateCursor(); });
 $('display-save-yes').addEventListener('click', () => act('save'));
 $('display-save-no').addEventListener('click', () => act('skip'));
 
@@ -531,7 +316,7 @@ $('close').addEventListener('click', (event) => { event.stopPropagation(); act('
 const RENDERERS = {
   connecting: (s) => ack(s.seq),
   busy: (s) => { setText('busy-title', s.title || ''); ack(s.seq); },
-  display: (s) => { renderDisplay(s); ack(s.seq); },
+  display: (s) => { alignment.show(s); ack(s.seq); },
   'display-save': (s) => { setText('display-save-summary', s.summary || ''); $('display-save-yes').focus(); ack(s.seq); },
   positioning: renderPositioning,
   calibration: renderCalibration,
@@ -553,7 +338,7 @@ function render(screenState, previous) {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') { if (!NOT_CANCELLABLE.has(current.name)) act('cancel'); return; }
-  if (current.name === 'display') { displayKey(event); return; }
+  if (current.name === 'display') { alignment.handleKey(event); return; }
   if (current.name === 'positioning') { enterFullscreen(); act('continue'); return; }
   if (event.key !== 'Enter') return;
   if (current.name === 'calibration-failed') act('retry');
