@@ -120,5 +120,11 @@ within 2 mm and 0.4 degrees (live, `evidence/private/e2e-person/`):
 | Linux through Wine, `tobii_stream_engine.dll` | (-27.1, 3.2, 623.2) | (11.37, 0.39, 2.27) | | |
 
 A Windows recording just before was taken while the person was still settling
-(-13 degrees of pitch) and is not comparable. Linux position noise is about
-twice the Windows figure; rotation noise is similar.
+(-13 degrees of pitch) and is not comparable.
+
+Frame-to-frame jitter (RMS of successive differences) is in the same range:
+Windows (0.016, 0.024, 0.088) mm and (0.061, 0.021, 0.033) degrees, the
+replayed Linux frames (0.021, 0.036, 0.157) mm and (0.023, 0.026, 0.016)
+degrees, and the Linux service run through Wine (0.006, 0.005, 0.028) mm. The
+recordings were taken one after another, so these figures mix tracker noise
+with the person's own movement and cannot rank the two implementations.
