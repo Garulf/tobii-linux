@@ -15,7 +15,8 @@ import struct
 
 from .ttp import ProtocolError
 from .ttp_commands import blob_field, request, string_field, uint32_field
-from .ttp_fields import StructHeader, array_fields, fixed42_field, triple_fixed42_fields
+from .ttp_fields import (StructHeader, array_fields, fixed16_field, fixed42_field, int32_field,
+                         struct_field, triple_fixed42_fields)
 
 
 class Eye(IntEnum):
@@ -186,6 +187,17 @@ def setting_file_payload(data: bytes) -> bytes:
     return data[SETTING_FILE_HEADER.size:]
 
 
+def setting_file(payload: bytes, kind: int = 1) -> bytes:
+    return SETTING_FILE_HEADER.pack(SETTING_FILE_VERSION, kind, len(payload)) + payload
+
+
+def calibration_setting(calibration: LocalCalibration) -> bytes:
+    """calibration.setpm bytes for a calibration, the inverse of parse_calibration_setting."""
+    if not calibration.blob:
+        raise ProtocolError('Calibration holds no blob')
+    return setting_file(CALIBRATION_ID.pack(calibration.calibration_id) + calibration.blob)
+
+
 def parse_calibration_setting(data: bytes) -> LocalCalibration:
     payload = setting_file_payload(data)
     if len(payload) <= CALIBRATION_ID.size:
@@ -236,3 +248,119 @@ def retrieve_calibration(session) -> bytes:
     if len(blobs) != 1:
         raise ProtocolError('Calibration reply must hold one blob')
     return bytes(blobs[0])
+
+
+STIMULUS_POINT_STRUCT = 13200
+STIMULUS_POSITION_STRUCT = 8002
+STIMULUS_POINT_ITEMS = 7
+
+
+class PointStatus(IntEnum):
+    """tobii_calibration_stimulus_point_status_t and tobii_calibration_point_status_t."""
+    FAILED_OR_INVALID = 0
+    VALID_BUT_NOT_USED = 1
+    VALID_AND_USED = 2
+
+
+@dataclass(frozen=True)
+class EyeQuality:
+    status: int
+    bias: float
+    precision: float
+
+
+@dataclass(frozen=True)
+class StimulusPoint:
+    """One record of the 1120 reply (struct 13200), copied in wire order by 0x1402b7830.
+
+Field names follow Stream Engine's tobii_calibration_stimulus_point_data_t
+(point, left status/bias/precision, right status/bias/precision). Bias is the
+distance from the target to the mean calibrated gaze point and precision its
+spread, both in normalized display units.
+"""
+    point: tuple
+    left: EyeQuality
+    right: EyeQuality
+
+
+def stimulus_points(values) -> tuple[StimulusPoint, ...]:
+    """Decode the reply values of 1120 (get_calibration_stimulus_pts)."""
+    if len(values) < 2 or not isinstance(values[0], StructHeader) or values[0].struct_id != 0x100:
+        raise ProtocolError('Stimulus points reply must start with an array header')
+    count = values[0].item_count - 1
+    if values[1] != STIMULUS_POINT_STRUCT or len(values) != 2 + count * 11:
+        raise ProtocolError('Unexpected stimulus points array')
+    points = []
+    for index in range(count):
+        record = values[2 + index * 11:2 + (index + 1) * 11]
+        if record[0] != StructHeader(STIMULUS_POINT_ITEMS, STIMULUS_POINT_STRUCT) \
+                or record[1] != StructHeader(3, STIMULUS_POSITION_STRUCT):
+            raise ProtocolError('Unexpected stimulus point record')
+        left, right = (EyeQuality(tracker_point_status(status), bias, precision)
+                       for status, bias, precision in (record[5:8], record[8:11]))
+        points.append(StimulusPoint(tuple(record[2:5]), left, right))
+    return tuple(points)
+
+
+def tracker_point_status(raw: int) -> PointStatus:
+    """0x1402b7830 keeps 0, 1 and 2 and turns any other device status into 0."""
+    return PointStatus(raw) if raw in (0, 1, 2) else PointStatus.FAILED_OR_INVALID
+
+
+def stimulus_points_payload(points) -> list:
+    """Reply fields of 1120 for the given records, in the layout stimulus_points reads."""
+    fields = array_fields(len(points), STIMULUS_POINT_STRUCT)
+    for p in points:
+        fields += [struct_field(STIMULUS_POINT_ITEMS, STIMULUS_POINT_STRUCT),
+                   struct_field(3, STIMULUS_POSITION_STRUCT)] + [fixed16_field(c) for c in p.point]
+        for eye in (p.left, p.right):
+            fields += [int32_field(eye.status), fixed16_field(eye.bias), fixed16_field(eye.precision)]
+    return fields
+
+
+@dataclass(frozen=True)
+class CalibrationPointData:
+    """tobii_calibration_point_data_t as tobii_calibration_parse (0x18007e9b0) reports it."""
+    point: tuple
+    left_status: PointStatus
+    left_mapping: tuple
+    right_status: PointStatus
+    right_mapping: tuple
+
+
+CALIBRATION_RECORD = struct.Struct('<2f2fi4x2fi4x')
+CALIBRATION_TRAILER = struct.Struct('<4xi')
+BLOB_STATUS = {-1: PointStatus.FAILED_OR_INVALID, 0: PointStatus.VALID_BUT_NOT_USED,
+               1: PointStatus.VALID_AND_USED}
+
+
+def calibration_points(blob: bytes) -> tuple[CalibrationPointData, ...]:
+    """The per-sample point table of a 1100 blob, read as Stream Engine's tobii_calibration_parse does.
+
+Word 0 of the blob is the offset of a trailer whose second word is the record
+count; each 40-byte record holds the target, then per eye the mapped gaze point
+and a status (-1 failed, 0 valid but unused, 1 valid and used).
+"""
+    if len(blob) < 8:
+        raise ProtocolError('Calibration blob is too short')
+    trailer = struct.unpack_from('<i', blob)[0]
+    if not 0 <= trailer <= len(blob) - CALIBRATION_TRAILER.size:
+        raise ProtocolError('Calibration trailer offset is outside the blob')
+    count = CALIBRATION_TRAILER.unpack_from(blob, trailer)[0]
+    first = trailer + CALIBRATION_TRAILER.size
+    if count < 0 or first + count * CALIBRATION_RECORD.size > len(blob):
+        raise ProtocolError('Calibration point table does not fit the blob')
+    records = []
+    for index in range(count):
+        x, y, lx, ly, ls, rx, ry, rs = CALIBRATION_RECORD.unpack_from(blob, first + index * CALIBRATION_RECORD.size)
+        records.append(CalibrationPointData(
+            (x, y), BLOB_STATUS.get(ls, PointStatus.FAILED_OR_INVALID), (lx, ly),
+            BLOB_STATUS.get(rs, PointStatus.FAILED_OR_INVALID), (rx, ry)))
+    return tuple(records)
+
+
+def blob_calibration_id(blob: bytes) -> int:
+    """Word 5 of a 1100 blob; on albedo it equals status key 7 and the calibration.setpm id."""
+    if len(blob) < 24:
+        raise ProtocolError('Calibration blob is too short')
+    return struct.unpack_from('<I', blob, 20)[0]

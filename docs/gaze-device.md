@@ -8,7 +8,8 @@ on-screen targets. Result: the Linux session already sends the device-side
 steps that matter for gaze, the user calibration lives on the device, and
 stream `0x500` from Linux is as valid and as accurate as Windows Stream Engine
 gaze. Host-side processing of `0x500` into Stream Engine outputs is outside
-this document.
+this document. Calibrating, backing up and restoring the calibration from
+Linux are covered in [gaze calibration](gaze-calibration.md).
 
 Target: `platform_runtime_IS5LEYETRACKER5_service.exe`, SHA-256
 `0f13b1f1cfa4ca9bb6f02580e7c3780eb455057ab210fcac186ac61fe82dc469`, image base
@@ -160,15 +161,15 @@ Live (albedo, read only):
   doing nothing (0xbc381a37)" at every start, so Windows sends no calibration
   command in normal operation. The calibration persists on the device across
   USB re-attachment and the WSL sessions.
-- The blob starts with uint32 732,403 (the length of the part before the
+- The blob starts with uint32 732,403 (the offset of the point table
   trailer), then uint32 values 110, 84, 1, 0, the id and 732,315, the label
-  `human` padded to 64 bytes and opaque data. The trailer is uint32 14 and 14
-  records of 40 bytes: a target point, then left and right gaze points each
-  with a validity word and a zero word (record layout inferred from values:
-  targets 0.1, 0.5, 0.9 and points near them).
+  `human` padded to 64 bytes and opaque data. The trailer holds a word, the
+  count 14 and 14 records of 40 bytes: a target, then per eye the mapped gaze
+  point and a status. Stream Engine's `tobii_calibration_parse` reads it this
+  way (static and emulation, see [gaze calibration](gaze-calibration.md)).
 - 1120 returns 14 records of struct `13200`: a target point (struct `8002`,
-  z 0), then per eye a validity of 2 and two small numbers (0.01 to 0.23;
-  accuracy and precision in normalised units, inferred).
+  z 0), then per eye a status of 2 (valid and used), the bias and the
+  precision in normalized display units ([gaze calibration](gaze-calibration.md)).
 - 3060 returns an empty file list: there are no persistent files (license
   files are what `platmod_command_license_key_*` would store there).
 - No realm or unlock beyond the head-pose realm is involved: `unlock_ppu`
@@ -242,8 +243,8 @@ services; their sources are in `evidence/private/gaze-device/albedo/`.
 - Meaning of 1011, 1800, 1310 and device status keys 0 to 6 and 8.
 - Why the device sent no notification at all, while the runtime handles
   `0xc94` for calibration changes; it may only send it after a calibration.
-- The 14-record trailer of the calibration blob and the 1120 reply fields are
-  read from values, not from code.
+- The calibration blob outside its point table is opaque; see
+  [gaze calibration](gaze-calibration.md) for what is known.
 - Stream Engine validity is 98.8 % against 94 to 96 % for the device's
   combined column; whether the host fills single-eye records belongs to the
   host-side gaze work.
