@@ -54,8 +54,14 @@ next steps; detailed evidence is linked below.
   Linux startup is complete. With a person following eight screen targets,
   the device's combined gaze point on Linux is valid 94 to 96% of the time
   with a median error of 48 to 51 px on 2560x1440, against 98.8% and 52 px
-  for Windows Stream Engine ([gaze device](gaze-device.md)). Host-side
-  processing and delivery to games are in progress.
+  for Windows Stream Engine ([gaze device](gaze-device.md)).
+- **Gaze, host side:** the runtime does no host processing on ET5 gaze; the
+  game's gaze point is the device's combined point bit for bit (emulated
+  end to end, byte-exact). The PRP service serves gaze point, responsive gaze
+  point and gaze origin in the real service's encoding, and under patched
+  Wine the game DLL's integration layer reads gaze points
+  ([gaze host](gaze-host.md)). Live device gaze is not yet fed into
+  `cli serve`.
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
