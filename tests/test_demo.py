@@ -2,6 +2,7 @@ import asyncio
 import base64
 from dataclasses import dataclass
 import http.client
+import importlib.util
 import json
 from pathlib import Path
 import struct
@@ -13,6 +14,8 @@ import unittest
 import urllib.error
 import urllib.request
 import zlib
+
+HAS_NUMPY = importlib.util.find_spec('numpy') is not None
 
 from tobii_linux.demo import events
 from tobii_linux.demo.app import build_parser, run
@@ -54,6 +57,7 @@ def tracked_frame(accepted=True):
                         {'rigid_state': (0.0,) * 6}, 1.5)
 
 
+@unittest.skipUnless(HAS_NUMPY, 'Optional NumPy is not installed')
 class EventEncodingTests(unittest.TestCase):
     def test_grayscale_png_round_trip(self):
         pixels = bytes(range(12))
@@ -158,6 +162,7 @@ class Collector:
             return [p for t, p in self.events if t == topic]
 
 
+@unittest.skipUnless(HAS_NUMPY, 'Optional NumPy is not installed')
 class PipelineTests(unittest.TestCase):
     def test_frames_are_processed_and_published_with_their_overlay(self):
         published = Collector()
@@ -296,6 +301,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(dropped, 2)
 
 
+@unittest.skipUnless(HAS_NUMPY, 'Optional NumPy is not installed')
 class ReplayTests(unittest.TestCase):
     def test_replay_serves_recorded_frames_and_gaze(self):
         with tempfile.TemporaryDirectory() as directory:
