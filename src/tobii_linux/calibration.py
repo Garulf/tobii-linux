@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path
+import threading
+import time
 
 from . import gaze_device as gd
 from .gaze_device import Eye, GazeCommand, LocalCalibration
@@ -38,6 +40,7 @@ ZONE_RADIUS_FACTOR = 0.45
 FOCUS_CHANGE_MS = 150.0
 GAZE_LOST_MS = 250.0
 EYE_VALID_BELOW = 2
+READ_SLICE_MS = 100
 
 READ_COMMANDS = frozenset(gd.READ_ONLY | {Command.GET_DEVICE_STATUS, Command.GET_DISPLAY_AREA,
                                           Command.GET_DEVICE_INFO, Command.GET_ENABLED_EYE})
@@ -186,7 +189,11 @@ from the blob itself.
 
 
 class CalibrationUI:
-    """Callbacks a display implements to drive Calibrator; the defaults do nothing."""
+    """Callbacks a display implements to drive Calibrator; the defaults do nothing.
+
+Calibrator runs each callback on a worker thread while it keeps reading the
+device, so a callback may block but must not use the device session.
+"""
 
     def show_point(self, index, x, y):
         """Show target index at normalized (x, y) and return once the user's eye is settled on it."""
@@ -287,6 +294,13 @@ looked away from, then 1030 again) and 1070 once the stage is complete, then
 1020 stop and unsubscribe. Afterwards it reads the new calibration (1100),
 its id (1490 key 7) and the per-target quality (1120). Any failure after 1010
 sends 1020 and raises CalibrationFailed; nothing is applied on failure.
+
+The UI callbacks block (a target animates for about 1.5 s), so they run on a
+worker thread while this thread keeps reading the device. The device stops
+sending, and stops answering requests for the rest of the USB session, once a
+subscribed stream has gone unread for about two seconds (live, see
+docs/gaze-calibration.md); the session must never pause reading while gaze is
+subscribed.
 """
 
     def __init__(self, session, ui=None, targets=INTERACTIVE_POINTS, stages=STAGES, previous=None,
@@ -328,7 +342,7 @@ sends 1020 and raises CalibrationFailed; nothing is applied on failure.
                 step = f'compute stage {number} (1070)'
                 self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY),
                            COMPUTE_TIMEOUT_S)
-                self.ui.stage_done(number)
+                self._while_reading(self.ui.stage_done, number)
             step = 'calibration stop (1020)'
             self._call(step, lambda rid: gd.header_only(rid, GazeCommand.CALIBRATION_STOP))
         except BaseException as error:
@@ -342,18 +356,20 @@ sends 1020 and raises CalibrationFailed; nothing is applied on failure.
     def _collect(self, stage_number, stage, index):
         x, y = self.targets[index]
         for attempt in range(1, self.max_attempts + 1):
-            self.ui.show_point(index, x, y)
-            self._drain()
+            self._while_reading(self.ui.show_point, index, x, y)
             self.session.pending_streams.clear()
+            started = time.monotonic()
             self._call(f'collect target {index} (1030)',
                        lambda rid: gd.calibration_collect_2d(rid, x, y, Eye.BOTH), COLLECT_TIMEOUT_S)
+            self.log('collected', target=index, seconds=round(time.monotonic() - started, 3),
+                     stream_messages=len(self.session.pending_streams))
             if not self._focus_changed(stage_number, stage, index):
-                self.ui.point_done(index, True)
+                self._while_reading(self.ui.point_done, index, True)
                 return
             self.discarded.append((index, attempt))
             self._call(f'discard target {index} (1080)',
                        lambda rid: gd.calibration_discard_2d(rid, x, y, Eye.BOTH))
-            self.ui.point_done(index, False)
+            self._while_reading(self.ui.point_done, index, False)
         raise CalibrationError(f'target {index} lost focus {self.max_attempts} times')
 
     def _focus_changed(self, stage_number, stage, index):
@@ -368,22 +384,37 @@ sends 1020 and raises CalibrationFailed; nothing is applied on failure.
         self.log('focus', target=index, samples=len(samples), changed=changed)
         return changed
 
-    def _drain(self, quiet_ms=20):
-        """Read what the device sent while the display waited; stream data is kept for the focus check."""
+    def _while_reading(self, callback, *args):
+        """Run a UI callback on a worker thread and keep reading the device until it returns."""
+        outcome = {}
+
+        def run():
+            try:
+                callback(*args)
+            except BaseException as error:
+                outcome['error'] = error
+        worker = threading.Thread(target=run, name='calibration-ui', daemon=True)
+        worker.start()
+        while worker.is_alive():
+            self._read_once()
+            worker.join(0)
+        if 'error' in outcome:
+            raise outcome['error']
+
+    def _read_once(self):
+        """One bounded read; stream data is kept for the focus check, notifications are logged."""
         channel = getattr(self.session, 'channel', None)
         decoder = getattr(self.session, 'decoder', None)
         if channel is None or decoder is None:
+            time.sleep(READ_SLICE_MS / 1000)
             return
-        while True:
-            data = channel.read(timeout_ms=quiet_ms)
-            if not data:
-                return
-            for message in decoder.feed(data):
-                if message.kind == STREAM_DATA_KIND:
-                    self.session.pending_streams.append(message)
-                elif message.kind == NOTIFICATION_KIND:
-                    self.notifications.append(message)
-                    self.log('notification', command=message.command, payload=message.payload.hex())
+        data = channel.read(timeout_ms=READ_SLICE_MS)
+        for message in decoder.feed(data) if data else ():
+            if message.kind == STREAM_DATA_KIND:
+                self.session.pending_streams.append(message)
+            elif message.kind == NOTIFICATION_KIND:
+                self.notifications.append(message)
+                self.log('notification', command=message.command, payload=message.payload.hex())
 
     def _stop_after_failure(self):
         try:

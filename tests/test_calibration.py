@@ -7,6 +7,7 @@ from pathlib import Path
 import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 
@@ -14,8 +15,11 @@ from tobii_linux import calibration as cal
 from tobii_linux import calibration_page
 from tobii_linux import gaze
 from tobii_linux import gaze_device as gd
+from tobii_linux import traffic_log
 from tobii_linux import ttp_commands as tc
-from tobii_linux.driver import TrackerSession
+from tobii_linux.driver import DeviceError, TrackerSession
+from tobii_linux.usb import USBError
+from tobii_linux.usb_channel import USBChannel
 from tobii_linux.gaze_device import GazeCommand
 from tobii_linux.ttp import Decoder, Message, fields
 from tobii_linux.ttp_fields import encode_payload, struct_field, triple_fixed42_fields, uint32_field, value
@@ -134,6 +138,52 @@ class CalibrationDevice:
         return [m.command for m in self.log]
 
 
+class StallingDevice(CalibrationDevice):
+    """Streams gaze while subscribed and goes silent for good once it is left unread too long.
+
+Models the live run of 2026-10-14: after the UI paused reading for 2.1 s the
+tracker sent nothing more in that USB session, neither stream data nor replies.
+"""
+    def __init__(self, unread_limit_s=0.3, **kwargs):
+        super().__init__(**kwargs)
+        self.unread_limit_s = unread_limit_s
+        self.subscribed = False
+        self.wedged = False
+        self.last_read = time.monotonic()
+        self.last_gaze = 0.0
+
+    def handle(self, request):
+        if request.command == SUBSCRIBE:
+            self.subscribed = True
+        elif request.command == UNSUBSCRIBE:
+            self.subscribed = False
+        if not self.wedged:
+            super().handle(request)
+
+    def read(self, timeout_ms):
+        now = time.monotonic()
+        if self.subscribed and now - self.last_read > self.unread_limit_s:
+            self.wedged = True
+        self.last_read = now
+        if self.wedged:
+            time.sleep(timeout_ms / 1000)
+            return b''
+        if self.subscribed and now - self.last_gaze > 0.03:
+            self.last_gaze = now
+            self.outgoing += [m.encode() for m in gaze_at([now * 1000], (0.5, 0.5))]
+        if not self.outgoing:
+            time.sleep(min(timeout_ms, 10) / 1000)
+        return super().read(timeout_ms)
+
+
+class SlowUI(cal.CalibrationUI):
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def show_point(self, index, x, y):
+        time.sleep(self.seconds)
+
+
 class RecordingUI(cal.CalibrationUI):
     def __init__(self, interrupt_at=None):
         self.events = []
@@ -155,7 +205,8 @@ START, STOP, CLEAR = GazeCommand.CALIBRATION_START, GazeCommand.CALIBRATION_STOP
 COLLECT, DISCARD = GazeCommand.CALIBRATION_COLLECT_2D, GazeCommand.CALIBRATION_DISCARD_2D
 COMPUTE, APPLY = GazeCommand.CALIBRATION_COMPUTE_AND_APPLY, GazeCommand.CALIBRATION_APPLY
 RETRIEVE, STIMULUS = GazeCommand.CALIBRATION_RETRIEVE, GazeCommand.GET_CALIBRATION_STIMULUS_POINTS
-STATUS, SUBSCRIBE, UNSUBSCRIBE = tc.Command.GET_DEVICE_STATUS, tc.Command.SUBSCRIBE_STREAM, tc.Command.UNSUBSCRIBE_STREAM
+STATUS = tc.Command.GET_DEVICE_STATUS
+SUBSCRIBE, UNSUBSCRIBE = tc.Command.SUBSCRIBE_STREAM, tc.Command.UNSUBSCRIBE_STREAM
 WRITES = {START, STOP, CLEAR, COLLECT, DISCARD, COMPUTE, APPLY, GazeCommand.CALIBRATION_START_EYE,
           GazeCommand.CALIBRATION_COLLECT_3D, GazeCommand.CALIBRATION_COLLECT_PER_EYE_2D,
           GazeCommand.CALIBRATION_COMPUTE_AND_APPLY_PER_EYE, GazeCommand.CALIBRATION_DISCARD_3D,
@@ -287,6 +338,31 @@ class CalibratorTests(unittest.TestCase):
         with self.assertRaises(cal.CalibrationFailed):
             cal.Calibrator(TrackerSession(device), focus=cal.FocusCheck(), max_attempts=2).run()
         self.assertEqual(device.commands()[5:10], [COLLECT, DISCARD, COLLECT, DISCARD, STOP])
+
+
+class UnreadStreamTests(unittest.TestCase):
+    def test_pausing_reads_while_gaze_is_subscribed_silences_the_device(self):
+        device = StallingDevice()
+        session = TrackerSession(device)
+        session.call(lambda rid: tc.subscribe_stream(rid, tc.Stream.GAZE))
+        time.sleep(0.5)
+        with self.assertRaises(DeviceError):
+            session.call(lambda rid: tc.header_only_request(rid, STATUS), timeout_s=0.3)
+
+    def test_calibrator_keeps_reading_while_the_ui_blocks(self):
+        device = StallingDevice(points=[(0.5, 0.5)])
+        outcome = cal.Calibrator(TrackerSession(device), SlowUI(0.5), stages=((0,), (1,))).run()
+        self.assertFalse(device.wedged)
+        self.assertEqual(device.commands(), [SUBSCRIBE, START, CLEAR, COLLECT, COMPUTE, COLLECT, COMPUTE, STOP,
+                                             UNSUBSCRIBE, RETRIEVE, STATUS, STIMULUS])
+        self.assertEqual(len(outcome.points), 2)
+
+    def test_ui_errors_are_raised_after_the_worker_ends(self):
+        device = StallingDevice()
+        with self.assertRaises(KeyboardInterrupt):
+            cal.Calibrator(TrackerSession(device), RecordingUI(interrupt_at=0)).run()
+        self.assertEqual(device.commands()[-2:], [STOP, UNSUBSCRIBE])
+        self.assertFalse(device.wedged)
 
 
 class DryRunTests(unittest.TestCase):
@@ -449,6 +525,44 @@ class PageTests(unittest.TestCase):
                 ui.show_point(4, 0.1, 0.1)
         finally:
             ui.close()
+
+
+class FramedTransport:
+    """Bulk transfers with the channel framing of usb_framing, for the traffic log."""
+    def __init__(self, reads):
+        self.reads = list(reads)
+        self.written = []
+
+    def control_out(self, request, value=0, timeout_ms=1000):
+        return 0
+
+    def write(self, data, timeout_ms=1000):
+        self.written.append(bytes(data))
+        return len(data)
+
+    def read(self, size, timeout_ms=1000):
+        item = self.reads.pop(0) if self.reads else USBError('bulk transfer', -7)
+        if isinstance(item, USBError):
+            raise item
+        return item
+
+
+class TrafficLogTests(unittest.TestCase):
+    def test_log_records_transfers_and_replays_messages(self):
+        reply = Message(tc.RESPONSE_KIND, 1, 0, 1490, 0, b'').encode()
+        frame = struct.pack('<II', 1, len(reply) + 8) + reply
+        transport = FramedTransport([USBError('bulk transfer', -7, 10, frame[:10]), frame[10:]])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'raw.jsonl'
+            log = traffic_log.TrafficLog(path)
+            with USBChannel(traffic_log.LoggingTransport(transport, log)) as channel:
+                session = TrackerSession(channel)
+                session.call(lambda rid: tc.header_only_request(rid, STATUS))
+            log.close()
+            ops = [json.loads(line)['op'] for line in path.read_text().splitlines()]
+            self.assertEqual(ops, ['start', 'control_out', 'write', 'read_error', 'read', 'control_out'])
+            replayed = [(direction, m.command) for _, direction, m in traffic_log.replay_messages(path)]
+            self.assertEqual(replayed, [('out', 1490), ('in', 1490)])
 
 
 if __name__ == '__main__':
