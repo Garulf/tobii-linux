@@ -187,8 +187,9 @@ Linux frames (all valid before and after):
 | Windows before / after | (-27.9, -8.3, 694.5) / (-13.2, -10.0, 680.2) | (8.3, -0.2, 1.8) / (6.6, -9.7, 1.6) | |
 
 Smoothing lowers frame-to-frame jitter (17% in position, 40% in rotation) but
-leaves the means unchanged, so the 15 mm / 3 degree difference to Windows is
-not explained by it (live).
+leaves the means unchanged (live). The 15 mm / 3 degree difference turned out
+to be head movement between recordings; a still session agrees with Windows
+within 2 mm and 0.4 degrees ([face tracking](face-tracking.md#fitting-coordinates-live-comparison)).
 
 ## Open questions
 

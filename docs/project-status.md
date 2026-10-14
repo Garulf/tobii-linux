@@ -41,10 +41,13 @@ next steps; detailed evidence is linked below.
 - **Fit and smoothing:** the shipped configuration fits in the per-object
   driver (`0x14004a2c0`) on full-frame records after quality-weighted landmark
   smoothing (`0x14007f5a0`), now reproduced within 5 ulps
-  ([landmark smoothing](landmark-smoothing.md)). It reduces jitter but leaves
-  the 15 mm / 3 degree offset against Windows unexplained; a simultaneous
-  comparison needs frames captured from the Windows runtime, and USBPcap's
-  device listing returned nothing on the reference host.
+  ([landmark smoothing](landmark-smoothing.md)).
+- **Live accuracy:** with a person holding still, Linux and the Windows
+  runtime agree within 2 mm in position and 0.4 degrees in rotation at about
+  620 mm; the earlier 15 mm / 3 degree gap was head movement between
+  recordings. Valid samples reached both client DLLs under patched Wine 11.0
+  (361 of 361 in 10 s each) and the game integration layer (359 head poses in
+  10 s, read 20 ms after the frame timestamp on median).
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
   `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
@@ -59,9 +62,8 @@ next steps; detailed evidence is linked below.
   88 skipped for missing private inputs). Checked with nix-portable in a
   container, not on NixOS hardware.
 - **Fitting coordinates:** the live comparison only matches when the fit uses
-  full-frame landmarks, so the tracker now does that; the static path that
-  maps working-view records to the frame is still unidentified, and lateral
-  and angular differences of up to 15 mm and 3 degrees remain
+  full-frame landmarks, so the tracker now does that; the static path was
+  later found in the per-object driver `0x14004a530`
   ([face tracking](face-tracking.md#fitting-coordinates-live-comparison)).
 
 ### Head-pose output path traced

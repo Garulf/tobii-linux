@@ -34,9 +34,9 @@ synthetic inputs; those checks are listed in the linked documents.
 | Wine pipe bridge | `tools/prp_bridge/` | The game DLL and `tobii_stream_engine.dll` receive tracker samples under Wine |
 | Wine pipe listing | `patches/wine/` | Needed for service discovery; tested on Wine 11.0 and master |
 
-On recorded live frames the Linux pipeline puts the head at 691 mm against
-694 mm from the Windows runtime moments earlier; lateral position and angles
-differ by up to 15 mm and 3 degrees, which is not yet explained
+With a person holding still, the Linux pipeline and the Windows runtime agree
+within 2 mm in position and 0.4 degrees in rotation, and those samples reach
+the game DLL's head-tracking API under Wine
 ([tracking loop](docs/face-tracking.md#fitting-coordinates-live-comparison)).
 
 ## Use

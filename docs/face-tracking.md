@@ -105,7 +105,20 @@ Windows depth (0.5% apart) and height. The static mechanism is now known
 FDP map has no group 10 point, and the object step `0x14004a530` fits the
 smoothed, frame-normalised records with the full frame size through
 `0x14004a2c0` ([landmark smoothing](landmark-smoothing.md)). Adding the
-smoothing leaves the means unchanged (live); the differences of about 15 mm in
-x and 3 to 4 degrees in rotation remain open. The comparison is not
-simultaneous (the device serves one host at a time), so some of it may be head
-movement.
+smoothing leaves the means unchanged (live).
+
+The 15 mm and 3 to 4 degree differences in that first comparison were head
+movement between recordings. A second session, with the person holding still
+through a Windows recording, a Linux recording and the Linux service, agrees
+within 2 mm and 0.4 degrees (live, `evidence/private/e2e-person/`):
+
+| Source | Position (mm) | Rotation (deg) | Std. dev. position (mm) | Std. dev. rotation (deg) |
+| --- | --- | --- | --- | --- |
+| Windows runtime, just after | (-27.4, 3.1, 620.4) | (11.85, 0.73, 2.21) | (0.34, 0.22, 0.93) | (0.18, 0.07, 0.16) |
+| Linux, 150 recorded frames replayed | (-27.7, 3.0, 622.1) | (11.51, 1.14, 2.27) | (0.67, 0.53, 2.12) | (0.14, 0.15, 0.11) |
+| Linux through Wine, game DLL (Stream Engine path) | (-26.7, 3.0, 622.3) | (11.54, 0.61, 2.13) | | |
+| Linux through Wine, `tobii_stream_engine.dll` | (-27.1, 3.2, 623.2) | (11.37, 0.39, 2.27) | | |
+
+A Windows recording just before was taken while the person was still settling
+(-13 degrees of pitch) and is not comparable. Linux position noise is about
+twice the Windows figure; rotation noise is similar.
