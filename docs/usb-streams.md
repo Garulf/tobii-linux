@@ -138,6 +138,9 @@ Header-only getters for track box (1400), display area (1430), device name
 and enabled eye (3170) are also encoded and emulated. The full builder map
 (about 75 builders, including calibration and persistent files) was produced
 by scanning callers of `0x1402c3bc0` and the header writer `0x1403afc40`.
+Calibration, persistent-file and configuration builders, the runtime's device
+start sequence and where the user calibration lives are in
+[the device-side gaze notes](gaze-device.md).
 "Parsed type" is the runtime's decoded item type; known correspondences:
 1 = uint32 (tag 2), 4 = int64 (tag 6), 13 = blob (tag 0x15). The wire layout
 of replies is not reconstructed here.
@@ -338,3 +341,7 @@ the steps.
 
 Not yet observed: frames with a person present, and therefore any live head
 pose from the Linux pipeline.
+
+Gaze stream `0x500` with a person following on-screen targets is compared
+with the Windows runtime in
+[the device-side gaze notes](gaze-device.md#live-gaze-comparison-2026-10-13).
