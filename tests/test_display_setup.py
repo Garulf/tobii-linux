@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 
 from tobii_linux import display_setup as ds
 from tobii_linux import ttp_commands as tc
@@ -213,3 +215,114 @@ class DeviceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LineSetupTests(unittest.TestCase):
+    def test_initial_lines_from_the_stored_area_reproduce_it(self):
+        lines = ds.initial_lines(ds.ET5_MOUNTING, ALBEDO_AREA, ds.edid_size_mm(ALBEDO_EDID), (2560, 1440))
+        self.assertEqual((lines.size_mm, lines.source), ((597.0, 336.0), 'edid size and stored offset'))
+        self.assertAlmostEqual(lines.left, 0.3427472, places=6)
+        self.assertAlmostEqual(lines.right, 0.6509549, places=6)
+        size, offset, area = ds.area_from_lines(lines.left, lines.right, lines.aspect)
+        self.assertEqual(area, ALBEDO_AREA)
+        self.assertAlmostEqual(offset, -1.87991, places=5)
+
+    def test_lines_placed_for_597_mm_and_minus_1_88_give_the_device_area(self):
+        left, right = ds.tracker_lines((597.0, 336.0), -1.88, 184.0)
+        size, offset, area = ds.area_from_lines(left, right, 597.0 / 336.0)
+        self.assertAlmostEqual(size[0], 597.0, places=9)
+        self.assertAlmostEqual(size[1], 336.0, places=9)
+        self.assertTrue(area.almost_equals(ALBEDO_AREA, squared_mm=1e-8))
+        for mine, device in zip(area.corners, ALBEDO_AREA.corners):
+            self.assertEqual(mine[1:], device[1:])
+
+    def test_without_a_stored_area_the_wizard_estimates(self):
+        hinted = ds.initial_lines(ds.ET5_MOUNTING, None, (597.0, 336.0), (2560, 1440))
+        self.assertEqual(hinted.source, 'edid size estimate')
+        self.assertAlmostEqual(hinted.right - hinted.left, 184.0 / 597.0)
+        self.assertAlmostEqual((hinted.left + hinted.right) / 2, 0.5)
+        self.assertAlmostEqual(hinted.aspect, 16 / 9)
+        rejected = ds.initial_lines(ds.ET5_MOUNTING, None, (597.0, 336.0), (1280, 1024))
+        self.assertEqual(rejected.source, 'default width estimate')
+        self.assertAlmostEqual(rejected.right - rejected.left, 184.0 / 376.3)
+        self.assertAlmostEqual(rejected.aspect, 1.25)
+
+    def test_line_limits_follow_the_view_model(self):
+        self.assertEqual(ds.clamp_lines(0.0, 1.0), (0.02, 0.98))
+        self.assertEqual(ds.clamp_lines(0.5, 0.51), (0.5, 0.55))
+        self.assertEqual(ds.clamp_lines(0.99, 0.995), (0.95, 0.98))
+
+    def test_picture_is_wider_than_the_lines_for_two_guides(self):
+        self.assertAlmostEqual(ds.picture_proportion(ds.ET5_MOUNTING), 286.0 / 184.0)
+        self.assertEqual(ds.picture_proportion(ds.MountingGeometry(1, 184.0, 20.0, (0, 0, 0), (0, 0, 0))), 1.0)
+
+
+class SetupPageTests(unittest.TestCase):
+    def start_page(self, evaluate=None):
+        from tobii_linux.display_setup_page import DisplaySetupPage
+        configured = []
+
+        def configure(screen_px):
+            configured.append(screen_px)
+            return {'left': 0.25, 'right': 0.75}
+        page = DisplaySetupPage(configure, evaluate or (lambda l, r, v: {'width': 184.0 / (r - l)}), port=0).start()
+        self.addCleanup(page.close)
+        return page, configured
+
+    @staticmethod
+    def post(url, body):
+        request = urllib.request.Request(url + 'result', data=json.dumps(body).encode(), method='POST')
+        return json.loads(urllib.request.urlopen(request, timeout=5).read())
+
+    def test_page_config_and_result(self):
+        page, configured = self.start_page()
+        self.assertIn(b'display setup', urllib.request.urlopen(page.url, timeout=5).read())
+        config = json.loads(urllib.request.urlopen(page.url + 'setup?sw=2560&sh=1440', timeout=5).read())
+        self.assertEqual((config, configured), ({'left': 0.25, 'right': 0.75}, [(2560, 1440)]))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post(page.url, {'left': 0.5, 'right': 0.52})
+        self.assertEqual(error.exception.code, 400)
+        reply = self.post(page.url, {'left': 0.25, 'right': 0.75, 'viewport': {'width': 2560}})
+        self.assertEqual(reply, {'width': 368.0})
+        result = page.wait_result(1)
+        self.assertEqual((result['left'], result['right'], result['reply']), (0.25, 0.75, reply))
+        page.finish('saved')
+        self.assertEqual(json.loads(urllib.request.urlopen(page.url + 'status', timeout=5).read()),
+                         {'message': 'saved', 'final': True})
+
+    def test_cancel(self):
+        from tobii_linux.display_setup_page import SetupCancelled
+        page, _ = self.start_page()
+        self.post(page.url, {'cancelled': True})
+        with self.assertRaises(SetupCancelled):
+            page.wait_result(1)
+
+    def test_tool_setup_saves_and_sends_nothing_without_apply(self):
+        import threading
+        import time
+        tool = load_tool()
+        device = DisplayDevice()
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(edid=None, connector=None, output=str(Path(directory)/'area'), overwrite=False,
+                                      apply=False, host='127.0.0.1', port=0, page_timeout_s=10,
+                                      then_calibrate=False, calibration_port=8775)
+            outcome = {}
+            with contextlib.redirect_stdout(output):
+                worker = threading.Thread(target=lambda: outcome.update(status=tool.setup(TrackerSession(device), args)))
+                worker.start()
+                while '"page"' not in output.getvalue():
+                    time.sleep(0.01)
+                url = next(json.loads(line)['url'] for line in output.getvalue().splitlines() if '"page"' in line)
+                config = json.loads(urllib.request.urlopen(url + 'setup?sw=2560&sh=1440', timeout=5).read())
+                reply = self.post(url, {'left': config['left'], 'right': config['right']})
+                worker.join(10)
+            self.assertEqual(outcome['status'], 0)
+            self.assertTrue(reply['identical_to_device'])
+            self.assertEqual(ds.load_display_area(Path(directory)/'area.setpm'), ALBEDO_AREA)
+            saved = json.loads((Path(directory)/'area.json').read_text())
+            self.assertEqual(saved['display_args'], list(ALBEDO_AREA.floats))
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertNotIn(GazeCommand.SET_DISPLAY_AREA, device.commands())
+        self.assertEqual([r['name'] for r in records if r['kind'] == 'would_send'], ['SET_DISPLAY_AREA'])
+        self.assertTrue(next(r for r in records if r['kind'] == 'apply')['identical_to_device'])

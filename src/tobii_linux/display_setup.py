@@ -183,6 +183,69 @@ def tracker_lines(size_mm, tracker_offset_mm, tracker_width_mm):
     return centre - span * 0.5, centre + span * 0.5
 
 
+ET5_TOTAL_WIDTH_MM = 286.0
+DEFAULT_MONITOR_WIDTH_MM = 376.3
+DEFAULT_ASPECT = 16 / 9
+MIN_LINE = 0.02
+MAX_LINE = 0.98
+MIN_LINE_DISTANCE = 0.05
+
+
+def picture_proportion(mounting=ET5_MOUNTING):
+    """EyeTrackerToLineWidthProportion: the tracker picture's width over the line distance.
+
+GetTotalWidth gives 286 mm for an Eye Tracker 5 with two guides; with no or
+one guide the picture is as wide as the lines.
+"""
+    return ET5_TOTAL_WIDTH_MM / mounting.width_mm if mounting.guides >= 2 else 1.0
+
+
+def clamp_lines(left, right):
+    """ScreenPlaneSetupViewModel setters, applied left then right as the app sets them."""
+    left = max(min(left, 1.0 - MIN_LINE_DISTANCE), MIN_LINE)
+    right = min(max(right, left + MIN_LINE_DISTANCE), MAX_LINE)
+    return left, right
+
+
+@dataclass(frozen=True)
+class LineSetup:
+    """Where the wizard puts the lines first, and the monitor aspect it keeps while they move."""
+    left: float
+    right: float
+    size_mm: tuple[float, float]
+    tracker_offset_mm: float
+    aspect: float
+    source: str
+
+
+def initial_lines(mounting=ET5_MOUNTING, device_area=None, size_hint=None, screen_px=None) -> LineSetup:
+    """MovingLinesScreenPlaneSetupFactory.CreateMovingLinesScreenPlaneSetup.
+
+With a stored display area the size is the EDID hint when there is one, else
+the decomposed size (DisplaySetupStorage), and the offset comes from the area.
+Otherwise the width is the hint, if its aspect matches the screen's pixels, or
+376.3 mm, the aspect is the screen's, and the tracker starts centred.
+"""
+    if device_area is not None and device_area.width_mm > 0 and device_area.height_mm > 0:
+        stored = decompose_display_area(device_area, mounting)
+        size = tuple(size_hint) if size_hint and all(size_hint) else stored.size_mm
+        left, right = clamp_lines(*tracker_lines(size, stored.tracker_offset_mm, mounting.width_mm))
+        return LineSetup(left, right, size, stored.tracker_offset_mm, size[0] / size[1],
+                         'edid size and stored offset' if size_hint and all(size_hint) else 'stored display area')
+    usable_hint = size_hint if size_hint and screen_px and size_hint_is_plausible(size_hint, screen_px) else None
+    width = usable_hint[0] if usable_hint else DEFAULT_MONITOR_WIDTH_MM
+    aspect = screen_px[0] / screen_px[1] if screen_px and all(screen_px) else DEFAULT_ASPECT
+    left, right = clamp_lines(*tracker_lines((width, width / aspect), 0.0, mounting.width_mm))
+    return LineSetup(left, right, (width, width / aspect), 0.0, aspect,
+                     'edid size estimate' if usable_hint else 'default width estimate')
+
+
+def area_from_lines(left, right, aspect, mounting=ET5_MOUNTING):
+    """What the wizard writes when the user confirms lines at left and right: size, offset and area."""
+    size, offset = size_from_tracker_lines(left, right, mounting.width_mm, aspect)
+    return size, offset, compose_display_area(size, mounting, offset)
+
+
 def size_from_diagonal(diagonal_inches, aspect=(16, 9)):
     """Panel size in millimetres from its diagonal and aspect ratio."""
     width, height = aspect

@@ -185,6 +185,71 @@ only the untilted case is bit-equal.
   Its black-bars mode (a resolution with a different aspect ratio than the
   panel) adjusts the area; this is not reproduced.
 
+## The on-screen step (static)
+
+Sources: `ScreenPlaneSetupControl` (.xaml and .xaml.cs),
+`DisplaySetupLineHandleView`, `ScreenPlaneSetupViewModel`,
+`MonitorMappingViewModel`, `MonitorMappingModel` and
+`ResolveConfigurationFlow` in `Tobii.Configuration.exe`; texts from
+`Tobii.Configuration.Common.Localization.LanguageResources`.
+
+Where it sits in the app's flow. `ResolveConfigurationFlow.InitAndRunFlow`
+runs the display setup when the configuration status is
+`InvalidMonitorConfiguration`; when that flow succeeds it waits up to 2 s for
+the status to change and then runs profile creation or recalibration when the
+status is `IncompleteUserProfile` or `NoCalibration`. So display setup comes
+first and calibration follows it. Albedo's log shows the same order on
+2026-03-29 (display setup finished at 21:12:04, calibration of the new
+profile right after). Inside the display setup, `MonitorMappingViewModel` goes
+Loading (device info, 2110, the stored mapping), Mapping (the lines),
+SavingConfiguration (1440 and the display id) and TrackboxVisualization (a
+screen asking the user to sit upright in front of the screen) before it
+reports success. Before Mapping it warns, with a yes/no box offering the
+display settings, when the screen's resolution does not have the panel's
+native aspect ratio (`VirtualScreen.MonitorHasRecommendedAspectRatio`).
+
+Intro. Only when no monitor has been mapped yet (`ShowIntro` is set when the
+persisted monitor id is empty), the page asks where the eye tracker is, tells
+the user to attach it now if they have not, and offers a "This display"
+button plus previous/next arrows to move to another monitor. Choosing the
+display animates the tracker picture down into place.
+
+Layout. The control fills the monitor. A picture of the tracker model (for
+the Eye Tracker 5 the `EyeTracker5` vector drawing, 812.7 x 72.2 units, white
+outline on black) sits with its bottom 150 px above the bottom of the screen
+(`MarginFromEyeTrackerToBottomOfScreen`), centred between the lines and
+`TotalWidth / EyeTrackerWidth` = 286 / 184 times as wide as their distance
+(`EyeTrackerToLineWidthProportion`, `TrackerLeft`, `TrackerWidth`). Because
+that proportion is above 1, `LineIsOnSide` is false and the lines start a
+quarter of the picture's height below its top
+(`OffsetFromEyeTrackerTopToDragLineTop`) and run down to the bottom edge of
+the screen. Each line handle is a 1 px dashed line (dash 5) in the foreground
+colour, highlighted while the mouse is over it, with a small filled triangle
+on each side and a "V" arrowhead at the bottom pointing at the real tracker.
+The instruction for two-guide trackers (Eye Tracker 5, PCEye 5, G6 large, H5)
+asks the user to move the lines to the marks on top of the eye tracker; one
+guide (G6 small): to its sides. A Done button (the default button, so Enter)
+confirms. When the step opens, the lines slide in from 0.01 outside their
+positions over 1.5 s.
+
+Initial positions. From `MovingLinesScreenPlaneSetupFactory` (see "The
+wizard"): from the stored mapping when valid, otherwise centred with the
+EDID width or 376.3 mm.
+
+Interaction. Mouse only (`WindowPreviewMouseDown/Move/Up`): pressing within
+half a handle's width of a line, below the line's top, drags that line;
+pressing on the tracker picture drags both, keeping the distance from the
+pointer to each line. The cursor turns into a horizontal resize cursor over a
+line or the picture. Leaving the window ends a drag. There is no keyboard
+handling and no step size: positions follow the pointer in device-independent
+pixels and are stored as fractions of the control width. Limits come from the
+view model setters: each line in 0.02 to 0.98 of the width and the lines at
+least 0.05 apart (`MinRelativeLinePosition`, `MaxRelativeLinePosition`,
+`MinRelativeDistanceBetweenLines`). There is no minimum or maximum monitor
+width and no aspect check at this point: Done always takes width = 184 /
+(right - left), height = width / aspect, where the aspect is the stored or
+estimated one from the start of the step.
+
 ## Linux implementation
 
 `src/tobii_linux/display_setup.py`:
@@ -223,6 +288,45 @@ instead and, like the wizard, derives the width from them. `args` prints a
 saved area in the order `--display` takes, so `serve`, `headpose` and the
 demo use it without writing anything to the device.
 
+### The setup page
+
+```sh
+python3 tools/display_setup.py setup [--edid FILE | --connector NAME] [--output display-area] [--apply] [--then-calibrate]
+```
+
+`setup` reads 1430 and 2110, serves `src/tobii_linux/display_setup_page.py`
+on port 8776 (open `http://localhost:8776/` fullscreen on the display the
+tracker is under; under WSL a Windows browser reaches it through mirrored
+networking) and waits for the user:
+
+- The page shows the intro text first; a click or key asks for fullscreen and
+  shows the lines. It reports its viewport, `devicePixelRatio` and the screen
+  size in device pixels; the canvas is drawn at device resolution. Done (or
+  Enter) is refused unless the page covers the whole screen, because line
+  positions are fractions of the page width.
+- Initial lines: `display_setup.initial_lines`, the factory's rules: the
+  stored area decomposed with the device mounting (size replaced by the EDID
+  size when `--edid` or `--connector` gives one), else an estimate from the
+  EDID size (only if its aspect matches the screen's pixels) or 376.3 mm
+  wide, centred, with the screen's pixel aspect.
+- The drawing follows the control's layout (tracker 150 px above the bottom,
+  286/184 as wide as the line distance, dashed lines with side triangles and
+  a downward arrowhead); the tracker is a plain rounded bar, not Tobii's
+  artwork. Dragging works as in the app, with the same limits. As a Linux
+  addition the arrow keys move the selected item by one device pixel (Shift:
+  ten), L, R and B select the left line, the right line or both, Enter
+  confirms and Esc cancels. The page shows the resulting size, diagonal and
+  tracker offset live.
+- On confirm, `display_setup.area_from_lines` computes size, offset and area
+  as Done does; the tool saves `OUTPUT.setpm` (screenplane.setpm layout) and
+  `OUTPUT.json` (the corners, `display_args` and the full `--display` option),
+  prints the 1440 request it would send, and sends it only with `--apply`,
+  reading 1430 before and after. `/auto` confirms the initial lines without a
+  person, for automated checks.
+- `--then-calibrate` then runs `tools/gaze_calibrate.py calibrate` (dry run
+  unless `--apply`) and the page switches to the calibration page on port
+  8775 once it answers, as Tobii runs calibration after display setup.
+
 ## Checks
 
 Emulation (`PYTHONPATH=.local/python:.local/inference:src:tools python3
@@ -253,6 +357,38 @@ output in `evidence/private/display-setup/live/`):
 - `screenplane.setpm` had the same SHA-256 before and after, and the runtime
   logged its normal start ("Restoring screen plane from disk and applying to
   tracker", calibration in sync) when the services came back.
+
+Setup page:
+
+- Unit tests (`tests/test_display_setup.py`): the initial lines from albedo's
+  stored area and EDID size (left 0.342747, right 0.650955) reproduce the
+  device area bit for bit; lines placed for 597 mm and -1.88 mm give 597 x
+  336 mm and the device's y and z exactly; the estimate paths (EDID accepted
+  and rejected by the aspect check, default 376.3 mm); the line limits; the
+  page server on port 0 (page, `/setup`, a rejected and an accepted
+  `/result`, `/status`, cancel); and `setup` against a scripted device, which
+  saves the files and sends no 1440.
+- Local browser check (headless Chromium driven over the DevTools protocol,
+  1280 x 720 at device pixel ratio 2): intro, key press, lines at the
+  initial positions, R then three Shift+Right moved the right line by 30
+  device pixels (0.0234 of the width), the readout and the confirmed result
+  agreed (554.8 x 312.3 mm, +4.75 mm), and the drawing was checked on
+  screenshots.
+- Live, without a person (albedo, 2026-10-14 02:02,
+  `evidence/private/display-setup/albedo/setup-check.cmd`, output in
+  `evidence/private/display-setup/setup-check.out`): headless Edge on Windows
+  opened `http://localhost:8776/auto`; the tool read 1430 and 2110, the page
+  fetched the initial lines (0.3427472, 0.6509549, source "stored display
+  area") and confirmed them; the computed area was identical to the device's
+  (`identical_to_device: true`), the saved `display-area.setpm` equals
+  albedo's `screenplane.setpm` byte for byte, the 1440 request was only
+  reported (188 bytes, SHA-256 `1f769209...a09b`, the same as the live
+  identical rewrite) and a `show` afterwards read the same area. Headless Edge
+  reported an 800 x 600 screen, which the stored-mapping path does not use.
+- `evidence/private/display-setup/albedo/setup-display.cmd` is the
+  person-present version: it opens the page in Edge kiosk mode on the
+  desktop through `schtasks /it`, runs `setup` without `--apply` (results in
+  `setup-person\`) and gives the tracker back to Windows. Not run yet.
 
 ## Open questions
 
