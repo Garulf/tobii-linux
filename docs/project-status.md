@@ -73,7 +73,9 @@ next steps; detailed evidence is linked below.
   ([service behaviour](service-behaviour.md)).
 - **Clock:** the service clock must match the game Wine's
   `QueryPerformanceCounter` source (`CLOCK_BOOTTIME` from Wine 10.17,
-  `CLOCK_MONOTONIC_RAW` before); `--wine-clock` selects it.
+  `CLOCK_MONOTONIC_RAW` before and in every Proton). The bridge reports its
+  counter and `--wine-clock auto` (default) follows the matching clock; live
+  with Debian Wine 8.0, not yet on albedo ([Time base](prp-bridge.md#time-base)).
 - **Speed:** on the reference host's CPU, 9.6 ms per frame with landmark
   smoothing (3.8 ms before it), after vectorizing the float32 inverse
   (results unchanged bit for bit).

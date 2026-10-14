@@ -46,6 +46,7 @@ Evidence labels:
 | Gaze points through both client DLLs and `GetGazePoints` of the game integration layer, synthetic service | every package delivered; the layer returns the same `(2x - 1, 1 - 2y)` as on Windows | live (Wine 11.0 + patch) |
 | User presence from the device stream, operation 2 change notifications, commands 5 and 6 for properties 1 to 24 ([service-behaviour.md](service-behaviour.md)) | notification framing byte-identical to a real operation 2; subscription answers byte-identical except uninitialised bytes | emulation, live (Windows), unit |
 | Tracker unplugged and attached again under `cli serve`, two clients, SIGTERM ([service-behaviour.md](service-behaviour.md)) | clients disconnected while it is gone, as the real server shuts down; the game layer reconnects and streams again | live (Wine 11.0 + patch) |
+| Service clock chosen from the bridge's `QPC` reports (`--wine-clock auto`, [Time base](#time-base)) | Debian Wine 8.0: `CLOCK_MONOTONIC_RAW` chosen at the first report, timestamp lag flat over 30 s; Wine 11.0 and GE-Proton on albedo not run yet | live (Wine 8.0), unit |
 
 ## Architecture
 
@@ -83,12 +84,15 @@ little-endian, payload at most 1 MiB.
 | 4 | `REPLY_PIPE` | service to bridge | reply pipe name, NUL; the bridge opens it before handling later frames |
 | 5 | `MESSAGE` | both | one pipe message |
 | 6 | `DISPLAY_ID` | bridge to service, on the control connection after `PIPES` | UTF-8 device instance id of the primary monitor inside the prefix, no NUL; skipped on Wine 9 and older |
+| 7 | `QPC` | bridge to service, on the control connection right after `PIPES`, then every 2 s | u64 `QueryPerformanceCounter`, u64 `QueryPerformanceFrequency`; the first frame adds UTF-8 `key=value` lines: `wine` (`wine_get_version`), `build` (`wine_get_build_id`), `host` (`wine_get_host_version`), `proton` (first line of `$STEAM_COMPAT_DATA_PATH/version`), each only when available |
 
 Connections:
 
 1. **Control**: the bridge connects, sends `BRIDGE_HELLO`, receives `PIPES`
-   and keeps the connection open. When the service closes it, the bridge exits
-   and its pipes disappear.
+   and keeps the connection open, sending `QPC` and `DISPLAY_ID` frames on it.
+   When the service closes it, the bridge exits and its pipes disappear.
+   Services that predate a frame type ignore it, and a bridge that predates
+   `QPC` leaves the service on its configured clock.
 2. **Pipe**: for each accepted client pipe instance the bridge opens a new TCP
    connection, sends `PIPE_OPEN` with the pipe name and
    `GetNamedPipeClientProcessId`
@@ -151,22 +155,115 @@ one TPRP packet per pipe message, as the real service sends them.
 are dropped while more than 64 KiB are unsent on its TCP connection, so a
 stalled game never blocks the producer.
 
-Time base: timesync replies and package timestamps both use one service
-clock in microseconds, which must run at the rate of the game's
+### Time base
+
+Timesync replies and package timestamps both use one service clock in
+microseconds, which must run at the rate of the game's
 `QueryPerformanceCounter`: the DLL's client clock is QPC scaled to
 microseconds (0x180027650 calls `QueryPerformanceCounter` and multiplies by
 1,000,000 over the frequency, static), and it converts package timestamps with
-the offset measured by timesync only. Wine's `monotonic_counter` in
-`dlls/ntdll/unix/sync.c` reads `CLOCK_MONOTONIC_RAW` up to Wine 10.16 and
-`CLOCK_BOOTTIME` from 10.17 on (commit
-https://github.com/wine-mirror/wine/commit/3d373e452388b60bea9dca6d5c4cf3f8b20a0c54,
-"ntdll: Switch to CLOCK_BOOTTIME for monotonic counters when available";
-checked in the 10.0, 10.16, 10.17, 10.20, 11.0 and 11.19 sources).
-`prp_service.wine_clock("boottime" | "raw")` and the `--wine-clock` option
-select the matching clock; the default is `boottime`. On most Linux hosts the
-two run at the same rate, but on the reference host's WSL2 kernel they differ
-by 9.1% (below), and the wrong choice makes timestamps run ahead of the game's
-clock by that fraction of the elapsed time.
+the offset measured by timesync only. The game layer timesyncs when it creates
+its device (four rounds, `0x18002a6a0` and `0x180016ad0`) and when it
+reconnects (`tobii_device_reconnect` `0x18000d800` from the layer's "Reconnecting
+to device after timeout" path `0x180009060`, through `device_reconnect`
+`0x18002cd70`); `tobii_update_timesync` (`0xdef0`) and `0x180015f40` have no
+direct, `lea` or pointer references in the game DLL (static, with
+`tools/pe_xref.py`-style scans). So no periodic timesync corrects the offset
+during a session.
+
+What Wine's counter is (static, Wine sources):
+
+- `kernel32` forwards `QueryPerformanceCounter` to `kernelbase`, which
+  forwards it to `ntdll.RtlQueryPerformanceCounter` (spec files). In upstream
+  Wine 10.0, 10.16, 10.17, 11.0 and master (`a312fc87`, 2026-10-13) and in
+  Valve's `proton_9.0`, `proton_10.0` and `proton_11.0` branches,
+  `RtlQueryPerformanceCounter` calls `NtQueryPerformanceCounter`, which returns
+  `monotonic_counter()` in `dlls/ntdll/unix/sync.c`: the Linux clock's
+  absolute value in 100 ns units (`tv_sec * 10000000 + tv_nsec / 100`), and
+  the frequency is always `TICKSPERSEC` (10 MHz). `monotonic_counter` reads
+  `CLOCK_MONOTONIC_RAW` up to Wine 10.16 and in every Proton branch, and
+  `CLOCK_BOOTTIME` from 10.17 on (commit
+  https://github.com/wine-mirror/wine/commit/3d373e452388b60bea9dca6d5c4cf3f8b20a0c54,
+  "ntdll: Switch to CLOCK_BOOTTIME for monotonic counters when available"),
+  with `CLOCK_MONOTONIC` only as a fallback when the first clock fails. No
+  user-mode bypass exists there: in `dlls/ntdll`, `dlls/kernel32`,
+  `dlls/kernelbase` and `server`, `QpcBypassEnabled`, `QpcBias` and
+  `QpcFrequency` are never written or read (they appear only in the
+  `KUSER_SHARED_DATA` declaration in `include/ddk/wdm.h`), and no code reads
+  the TSC. wine-staging's patches (`11dd86bd`, 2026-10-10) do not touch the
+  counter.
+- GE-Proton 11-7 and later apply
+  `patches/proton/0001-ntdll-Read-QueryPerformanceCounter-from-the-TSC-in-us.patch`
+  (proton-ge-custom commits `d364220395`, 2026-09-10, and `e01fa04d29`,
+  2026-09-22). On x86-64 with an invariant TSC and `rdtscp`, and from
+  2026-09-22 only while the kernel's `current_clocksource` is `tsc`,
+  `RtlQueryPerformanceCounter` serves the syscall value for two 125 ms
+  calibration passes, then `base + (tsc - base_tsc) * rate`, where the base is a
+  syscall reading (`CLOCK_MONOTONIC_RAW`) and the rate is measured against it.
+  The counter therefore keeps the raw clock's absolute value up to the
+  calibration error, which is never corrected (parts per million, a different
+  error in every process). `WINE_DISABLE_QPC_TSC=1` turns it off.
+
+So the counter equals the absolute value of one Linux clock in every build
+examined, except for the slow, bounded drift of GE-Proton's TSC path.
+
+`--wine-clock auto` (the default for `prp_service` and `cli serve`) uses that.
+The bridge reports its counter in `QPC` frames, and the service
+(`qpc_clock.QpcClockFollower`) reads `CLOCK_BOOTTIME`, `CLOCK_MONOTONIC_RAW`
+and `CLOCK_MONOTONIC` when each frame arrives:
+
+1. **Absolute match.** For each clock, the smallest of
+   (clock at receipt minus counter in microseconds) over the last four reports
+   is the receipt delay, normally well under a millisecond. A clock within
+   10 ms of the counter matches. The service keeps its current clock while it
+   matches and otherwise takes the closest match. The first report, sent
+   before the bridge creates its pipes, decides before any game connects.
+2. **Rate match.** When no clock matches (a counter on another epoch, or
+   GE-Proton's TSC counter after enough drift), the service waits until it
+   has reports spanning 6 s and takes the clock whose offset to the counter
+   drifts least (median pairwise slope over up to 32 reports), switching away
+   from the current clock only when another is steadier by more than 2000 ppm.
+3. **Switches.** The service starts on `CLOCK_BOOTTIME` and logs every bridge's
+   verdict with the offsets it measured. A switch after an absolute match
+   reads the new clock's own value; after a rate match the service time
+   continues from its current value. Each switch moves the cached presence
+   time by the same step, restarts the device clock mapping (`ClockMapper`
+   watches the clock's generation), and closes the connected game clients so
+   that they reconnect and timesync on the new clock, since nothing else makes
+   them timesync again. A bridge's verdict is not adopted while another
+   connected bridge still confirms the current clock (two prefixes on
+   different Wine builds); that case is logged as a warning.
+
+Clocks that agree (no suspend since boot and no clock slew) give the same
+result either way, and the service keeps its current clock. They split after a
+host suspend (`CLOCK_BOOTTIME` jumps ahead of the other two), with NTP slew
+(`CLOCK_MONOTONIC_RAW` against the others, tens of ppm), and on the reference
+host's WSL2 kernel, where `CLOCK_MONOTONIC_RAW` runs 9.1% faster (below).
+
+`--wine-clock boottime` or `raw` fixes the clock as before; the service still
+classifies the reports and warns when the bridge's counter follows another
+clock. A bridge that sends no `QPC` frame (older builds) leaves the clock as
+configured, and the service logs that after 5 s.
+
+Live (Debian `wine-8.0 (Debian 8.0~repack-4)`, 64-bit prefix, container
+host on kernel 4.4 with clocksource `tsc`, not albedo): synthetic service with
+`--wine-clock auto`, bridge and `prp_test_client.exe` with Star Citizen's game
+DLL for 30 s. The first report arrived 1 ms after the bridge attached:
+
+```
+bridge ('127.0.0.1', 44362) runs wine 8.0, build wine-8.0 (Debian 8.0~repack-4), host Linux 4.4.180+
+bridge ('127.0.0.1', 44362): QueryPerformanceCounter follows raw (absolute; clock minus counter: boottime +551.4 ms, raw +0.4 ms, monotonic +551.4 ms)
+service clock now follows raw instead of boottime (absolute match); moved -550.994 ms
+```
+
+The client connected 1.5 s later and received 993 head poses; QPC at the
+callback minus sample timestamp had a median of 4.1, 3.3, 4.1, 4.1, 4.5 and
+4.2 ms in the six 5 s intervals (the client polls every 5 ms). With
+`--wine-clock boottime` the service logged "counter follows raw but the service
+clock is fixed to boottime". On this host `CLOCK_BOOTTIME` gained 2.2 ms on
+`CLOCK_MONOTONIC_RAW` between the two runs, 54 s apart (40 ppm of slew), so a
+wrong choice there drifts by about 1 ms per 30 s rather than WSL2's 9%.
+Logs: `evidence/private/clock-auto/`.
 
 ### Real tracker
 
@@ -493,6 +590,16 @@ disconnect, other streams, timesync, an unknown command, pid mismatch and a
 version-0 hello. Real-service vectors check byte equality of packages,
 stream start/stop and timesync responses and the handshake information.
 
+`tests/test_qpc_clock.py` (unit) feeds `QPC` reports from synthetic hosts
+(each Linux clock as an offset and rate, including WSL2's 9.1%): upstream Wine
+on `CLOCK_BOOTTIME`, Proton on `CLOCK_MONOTONIC_RAW` from the first report,
+equal clocks, a latency spike, a suspend that moves the match from boottime to
+raw, an unanchored counter matched by rate without a jump, GE-Proton's TSC
+counter drifting 5 ppm, disagreeing bridges, a fixed clock that only warns,
+an old bridge without reports, a malformed report, the switch closing
+connected clients and moving the presence time, timesync and sample times on
+the chosen clock, and `ClockMapper` starting over on a switch.
+
 ## What remains
 
 - **Discovery**: the stock DLL finds `tobii-prp://` devices only through a
@@ -519,6 +626,10 @@ stream start/stop and timesync responses and the handshake information.
   11-9's `proton` script, directly and inside umu's Steam Linux Runtime
   container, it relayed 90 to 91 samples per 3 s; a real Steam client and
   Lutris were not exercised (see "Launch modes").
+- **Clock choice on albedo**: `--wine-clock auto` with patched Wine 11.0
+  (expected `CLOCK_BOOTTIME`) and GE-Proton 11-9 (expected
+  `CLOCK_MONOTONIC_RAW`, through the TSC path when WSL2's clocksource is
+  `tsc`), with the timestamp lag over 30 s; albedo was unreachable.
 - **Unknown fields**: meanings of `list_a` to `list_d`, `groups`, `mode`, the
   nine words and the extended strings, and how the real service answers
   unsupported streams, repeated starts or unknown commands.

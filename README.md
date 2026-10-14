@@ -90,8 +90,8 @@ Three pieces are needed:
    ```
 
    It serves the tracker's gaze from the same session as well; `--no-gaze`
-   serves head pose only. Pass `--wine-clock raw` when the game runs under
-   Proton or GE-Proton, or a Wine 10.16 or older. The bridge tells the service which monitor is primary
+   serves head pose only. The bridge tells the service which clock the game's
+   Wine counter follows (`--wine-clock auto`) and which monitor is primary
    inside the prefix; if
    the game runs on another monitor, pass that monitor's id with
    `--display-id` ([game integration layer](docs/game-integration-layer.md)).
@@ -140,7 +140,6 @@ service in the background as a systemd user service:
 hardware.tobii-eye-tracker-5.headPoseService = {
   enable = true;
   displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
-  # wineClock = "raw"; # for Proton, GE-Proton and Wine 10.16 and older
 };
 ```
 

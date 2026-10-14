@@ -74,22 +74,38 @@ later.
 ## The service clock
 
 The service stamps samples with the clock behind the game's
-`QueryPerformanceCounter` ([prp-bridge.md](prp-bridge.md#service-behaviour)),
-and that clock depends on the runner:
+`QueryPerformanceCounter` ([prp-bridge.md](prp-bridge.md#time-base)), and that
+clock depends on the runner:
 
-| Runner | Clock | Service option |
-| --- | --- | --- |
-| Wine 10.17 or later, wine-staging, wine-tkg and LUG runners on those | `CLOCK_BOOTTIME` | default (`--wine-clock boottime`) |
-| Proton 9, 10 and 11, GE-Proton 11 | `CLOCK_MONOTONIC_RAW` | `--wine-clock raw` |
-| Wine 10.16 or older | `CLOCK_MONOTONIC_RAW` | `--wine-clock raw` |
+| Runner | Clock |
+| --- | --- |
+| Wine 10.17 or later, wine-staging, wine-tkg and LUG runners on those | `CLOCK_BOOTTIME` |
+| Proton 9, 10 and 11, GE-Proton 11 | `CLOCK_MONOTONIC_RAW` |
+| Wine 10.16 or older | `CLOCK_MONOTONIC_RAW` |
 
-Valve's trees still read `CLOCK_MONOTONIC_RAW` in `monotonic_counter`
-(`dlls/ntdll/unix/sync.c` on `proton_9.0`, `proton_10.0`, `proton_11.0` and
-GE-Proton11-9's Wine). With the wrong choice, sample timestamps drift from the
-game's clock by the rate difference between the two clocks: about 9% on the
-WSL2 test host (in the GE-Proton test run with the default, samples fell from
-6 ms to 58 ms behind the game's clock within 0.6 s), usually much less on a
-native kernel. The NixOS module sets it with `headPoseService.wineClock`.
+Nothing needs to be set for this. The bridge reports its counter to the
+service, which follows the matching clock (`--wine-clock auto`, the default)
+and logs its choice:
+
+```text
+bridge ('127.0.0.1', 44362): QueryPerformanceCounter follows raw (absolute; ...)
+service clock now follows raw instead of boottime (absolute match); moved -550.994 ms
+```
+
+The choice is made when the bridge connects, before the game starts. If the
+clock changes later while a game is connected, the service disconnects the
+game's clients and the game reconnects on the new clock, as after a service
+restart. With a bridge older than this report the service stays on
+`CLOCK_BOOTTIME`.
+
+`--wine-clock boottime` or `--wine-clock raw` still fixes the clock; the
+service then warns when the bridge's counter follows the other one. With the
+wrong clock, sample timestamps drift from the game's clock by the rate
+difference between the two: about 9% on the WSL2 test host (in a GE-Proton
+test run with the old `boottime` default, samples fell from 6 ms to 58 ms
+behind the game's clock within 0.6 s), tens of parts per million on a native
+kernel, plus the whole suspend time after a host suspend. The NixOS module
+sets it with `headPoseService.wineClock`.
 
 ## Lutris
 
@@ -108,8 +124,7 @@ patch:
   Wine): build the runner with the patch (below) and select it under
   **Runner options**, **Wine version**.
 - **GE-Proton through umu**: needs a GE-Proton built with the Proton variant of
-  the patch, and the service with `--wine-clock raw`. Lutris passes
-  `PROTONPATH`; point it at the patched build.
+  the patch. Lutris passes `PROTONPATH`; point it at the patched build.
 
 A **pre-launch script** is not a good fit: it runs before Wine starts and does
 not see the game end.
@@ -136,8 +151,7 @@ Add the RSI Launcher (or the game) to Steam, choose the patched Proton under
 tobii-linux-wine-run --start-service %command%
 ```
 
-Run the service with `--wine-clock raw` for Proton
-([The service clock](#the-service-clock)). Steam passes
+Steam passes
 `STEAM_COMPAT_DATA_PATH`, and `%command%` ends with
 `.../proton waitforexitandrun <program>`; the wrapper rewrites that to
 `.../proton waitforexitandrun .../tobii-linux/prp_bridge.exe 127.0.0.1 7760 --
@@ -164,7 +178,6 @@ hardware.tobii-eye-tracker-5 = {
   headPoseService = {
     enable = true;
     displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
-    # wineClock = "raw"; # for Proton and GE-Proton
   };
 };
 ```
@@ -188,7 +201,7 @@ environment.systemPackages = [ pkgs.tobii-linux-wine.staging ];
 Then choose **System Wine** in Lutris, or point a custom Wine version at the
 package's `bin/wine`. `tobii-linux-wine.stable` (11.0) and `.unstable` (11.19)
 are also available; `.patchedSourceCheck.<name>` only applies the patch.
-All current nixpkgs Wines read `CLOCK_BOOTTIME`, the service's default.
+All current nixpkgs Wines read `CLOCK_BOOTTIME`.
 
 ## Patched runners
 

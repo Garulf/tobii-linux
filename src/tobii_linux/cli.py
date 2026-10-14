@@ -143,9 +143,10 @@ def main():
     serve_parser.add_argument('--display-id',
                               help="Monitor device instance id the game's window tracking matches "
                                    "(the part before '##'); needed only when the game tracks a window")
-    serve_parser.add_argument('--wine-clock', choices=WINE_CLOCKS, default='boottime',
-                              help="Clock behind the game's Wine QueryPerformanceCounter: "
-                                   'boottime for Wine 10.17 and later, raw for older')
+    serve_parser.add_argument('--wine-clock', choices=WINE_CLOCKS, default='auto',
+                              help="Clock behind the game's Wine QueryPerformanceCounter: auto follows "
+                                   'what the bridge reports (default), boottime is upstream Wine 10.17 '
+                                   'and later, raw older Wine and every Proton')
     serve_parser.add_argument('--no-gaze', action='store_true',
                               help='Serve head pose only, without subscribing the gaze stream')
     args = parser.parse_args()

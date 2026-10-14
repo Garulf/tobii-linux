@@ -33,6 +33,7 @@
 #define FRAME_REPLY_PIPE 4
 #define FRAME_MESSAGE 5
 #define FRAME_DISPLAY_ID 6
+#define FRAME_QPC 7
 #define MAX_FRAME (1u << 20)
 #define MAX_PIPES 16
 #define PIPE_NAME_LIMIT 256
@@ -42,6 +43,8 @@
 #define REPLY_OPEN_ATTEMPTS 4
 #define FIRST_ATTACH_TIMEOUT_MS 10000
 #define WINE_MAKE_PROCESS_SYSTEM 1000
+#define QPC_REPORT_INTERVAL_MS 2000
+#define RUNTIME_DETAILS_LIMIT 1024
 
 static const char *service_host = "127.0.0.1";
 static const char *service_port = "7760";
@@ -50,16 +53,21 @@ static FILE *log_file;
 static HANDLE first_serving;
 static HANDLE display_id_known;
 static char display_id[512];
+static char runtime_details[RUNTIME_DETAILS_LIMIT];
+static CRITICAL_SECTION control_send_lock;
+
+static WCHAR *dos_path_of_unix_path(const WCHAR *unix_path);
 
 typedef struct {
     char name[PIPE_NAME_LIMIT];
     HANDLE stop;
 } Listener;
 
+/* The control connection as the reporting threads share it until stop is set. */
 typedef struct {
     SOCKET control;
     HANDLE stop;
-} DisplayReport;
+} ControlLink;
 
 typedef struct {
     HANDLE pipe;
@@ -126,6 +134,35 @@ static int send_frame(SOCKET socket, UINT32 kind, const void *payload, UINT32 si
 {
     UINT32 header[2] = {kind, size};
     return send_all(socket, header, sizeof header) && send_all(socket, payload, size);
+}
+
+/* Several threads report on the control connection; frames must not interleave. */
+static int send_control_frame(SOCKET control, UINT32 kind, const void *payload, UINT32 size)
+{
+    int sent;
+    EnterCriticalSection(&control_send_lock);
+    sent = send_frame(control, kind, payload, size);
+    LeaveCriticalSection(&control_send_lock);
+    return sent;
+}
+
+/* FRAME_QPC: u64 counter, u64 frequency, then optional "key=value" lines. The counter
+   is read last, once the connection is ours, so the service sees it as fresh as possible. */
+static int send_qpc_report(SOCKET control, const char *details)
+{
+    char payload[16 + RUNTIME_DETAILS_LIMIT];
+    size_t details_size = details ? strlen(details) : 0;
+    LARGE_INTEGER counter, frequency;
+    int sent;
+    QueryPerformanceFrequency(&frequency);
+    memcpy(payload + 8, &frequency.QuadPart, 8);
+    memcpy(payload + 16, details, details_size);
+    EnterCriticalSection(&control_send_lock);
+    QueryPerformanceCounter(&counter);
+    memcpy(payload, &counter.QuadPart, 8);
+    sent = send_frame(control, FRAME_QPC, payload, (UINT32)(16 + details_size));
+    LeaveCriticalSection(&control_send_lock);
+    return sent;
 }
 
 /* Returns a malloc'd payload (NUL-terminated for convenience) or NULL on EOF or error. */
@@ -456,12 +493,89 @@ static DWORD WINAPI find_display_id(void *unused)
 
 static DWORD WINAPI report_display_id(void *context)
 {
-    DisplayReport *report = context;
-    HANDLE waits[2] = {display_id_known, report->stop};
+    ControlLink *link = context;
+    HANDLE waits[2] = {display_id_known, link->stop};
     if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 && display_id[0]
-        && send_frame(report->control, FRAME_DISPLAY_ID, display_id, (UINT32)strlen(display_id)))
+        && send_control_frame(link->control, FRAME_DISPLAY_ID, display_id,
+                              (UINT32)strlen(display_id)))
         say("reported primary monitor %s", display_id);
     return 0;
+}
+
+/* The service picks the Linux clock behind QueryPerformanceCounter from these reports. */
+static DWORD WINAPI report_qpc(void *context)
+{
+    ControlLink *link = context;
+    while (WaitForSingleObject(link->stop, QPC_REPORT_INTERVAL_MS) == WAIT_TIMEOUT
+           && send_qpc_report(link->control, NULL))
+        ;
+    return 0;
+}
+
+static void append_detail(const char *key, const char *value)
+{
+    size_t used = strlen(runtime_details);
+    if (value && *value)
+        snprintf(runtime_details + used, sizeof runtime_details - used, "%s=%s\n", key, value);
+}
+
+static void first_line_of_file(const WCHAR *path, char *line, int size)
+{
+    FILE *file = _wfopen(path, L"r");
+    line[0] = 0;
+    if (!file)
+        return;
+    if (fgets(line, size, file))
+        line[strcspn(line, "\r\n")] = 0;
+    fclose(file);
+}
+
+/* Proton writes its version (build time and name) to the compat data directory. */
+static void proton_version(char *version, int size)
+{
+    WCHAR path[MAX_PATH], *dos_path;
+    DWORD length = GetEnvironmentVariableW(L"STEAM_COMPAT_DATA_PATH", path, MAX_PATH);
+    version[0] = 0;
+    if (length == 0 || length + 9 > MAX_PATH)
+        return;
+    wcscat(path, L"/version");
+    dos_path = dos_path_of_unix_path(path);
+    if (!dos_path)
+        return;
+    first_line_of_file(dos_path, version, size);
+    HeapFree(GetProcessHeap(), 0, dos_path);
+}
+
+/* Wine version, build id, host kernel and Proton version, for the service's log only. */
+static void describe_runtime(void)
+{
+    typedef const char *(CDECL *WineText)(void);
+    typedef void (CDECL *WineHostVersion)(const char **, const char **);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    FARPROC version = GetProcAddress(ntdll, "wine_get_version");
+    FARPROC build_id = GetProcAddress(ntdll, "wine_get_build_id");
+    FARPROC host_version = GetProcAddress(ntdll, "wine_get_host_version");
+    char host[256], proton[256];
+    if (version) {
+        WineText text;
+        memcpy(&text, &version, sizeof text);
+        append_detail("wine", text());
+    }
+    if (build_id) {
+        WineText text;
+        memcpy(&text, &build_id, sizeof text);
+        append_detail("build", text());
+    }
+    if (host_version) {
+        WineHostVersion host_text;
+        const char *system = NULL, *release = NULL;
+        memcpy(&host_text, &host_version, sizeof host_text);
+        host_text(&system, &release);
+        snprintf(host, sizeof host, "%s %s", system ? system : "", release ? release : "");
+        append_detail("host", host);
+    }
+    proton_version(proton, sizeof proton);
+    append_detail("proton", proton);
 }
 
 static SOCKET attach_to_service(char **names_out, UINT32 *size_out)
@@ -490,13 +604,15 @@ static SOCKET attach_to_service(char **names_out, UINT32 *size_out)
 static void serve_pipes(SOCKET control, char *names, UINT32 size)
 {
     Listener listeners[MAX_PIPES];
-    HANDLE threads[MAX_PIPES + 1];
+    HANDLE threads[MAX_PIPES + 2];
     HANDLE stop = CreateEventA(NULL, TRUE, FALSE, NULL);
-    DisplayReport report = {control, stop};
+    ControlLink link = {control, stop};
     const char *cursor;
     char sink[16];
     int count = 0, index;
 
+    if (!send_qpc_report(control, runtime_details))
+        say("cannot report QueryPerformanceCounter to the service");
     for (cursor = names; cursor < names + size && *cursor && count < MAX_PIPES;
          cursor += strlen(cursor) + 1) {
         snprintf(listeners[count].name, sizeof listeners[count].name, "%s", cursor);
@@ -508,7 +624,10 @@ static void serve_pipes(SOCKET control, char *names, UINT32 size)
         }
     }
     SetEvent(first_serving);
-    threads[count] = CreateThread(NULL, 0, report_display_id, &report, 0, NULL);
+    threads[count] = CreateThread(NULL, 0, report_display_id, &link, 0, NULL);
+    if (threads[count])
+        count++;
+    threads[count] = CreateThread(NULL, 0, report_qpc, &link, 0, NULL);
     if (threads[count])
         count++;
     while (recv(control, sink, sizeof sink, 0) > 0)
@@ -697,7 +816,9 @@ int main(void)
     UINT32 size = 0;
 
     InitializeCriticalSection(&log_lock);
+    InitializeCriticalSection(&control_send_lock);
     open_log_file();
+    describe_runtime();
     first_serving = CreateEventA(NULL, TRUE, FALSE, NULL);
     display_id_known = CreateEventA(NULL, TRUE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 0, find_display_id, NULL, 0, NULL));

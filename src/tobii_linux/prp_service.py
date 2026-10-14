@@ -21,13 +21,15 @@ import itertools
 import logging
 import math
 import struct
-import time
 import uuid
 
 from tobii_linux import gaze
 from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
 from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, decode_envelope, encode_envelope
 from tobii_linux.prp import encode_stream_packet
+from tobii_linux.qpc_clock import (
+    AUTO, DEFAULT_SOURCE, WINE_CLOCKS, ClockSwitch, QpcClockFollower, QpcSample, ServiceClock,
+    decode_qpc_report)
 from tobii_linux.ttp_fields import float32
 from tobii_linux.prp_session import (
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE,
@@ -51,6 +53,7 @@ FRAME_PIPE_OPEN = 3
 FRAME_REPLY_PIPE = 4
 FRAME_MESSAGE = 5
 FRAME_DISPLAY_ID = 6
+FRAME_QPC = 7
 MAX_FRAME = 1 << 20
 DEFAULT_PORT = 7760
 DEFAULT_NAME = "ET5-LINUX"
@@ -71,6 +74,8 @@ GAZE_SERVICE_STREAMS = (gaze.PRP_GAZE_DATA, gaze.PRP_GAZE_POINT, gaze.PRP_RESPON
 ERROR_BODY_WORDS = 4
 # Real service head-pose cadence on albedo: 30.207 ms between timestamps.
 REAL_SERVICE_PERIOD_S = 0.030207
+# A bridge that has not reported its counter by then predates the report.
+QPC_REPORT_WAIT_S = 5.0
 # Unsent bytes above which stream packages are dropped for a slow client.
 MAX_PENDING_STREAM_BYTES = 64 * 1024
 PROPERTY_MODEL = 8
@@ -111,24 +116,24 @@ PROPERTY_BLOCK_SIZES = {0: 4, 1: 0x28, 0xA: 0x1C, 0xB: 0x10, 0xC: 0x18, 0xD: 0xC
 DEFAULT_PROPERTY_BLOCK_SIZE = 8
 
 
-WINE_CLOCKS = ("boottime", "raw")
-
-
-def wine_clock(name: str = "boottime"):
-    """Microsecond clock that runs at the rate of Wine's QueryPerformanceCounter.
+def wine_clock(name: str = DEFAULT_SOURCE) -> ServiceClock:
+    """Microsecond service clock that runs at the rate of Wine's QueryPerformanceCounter.
 
     The game DLL converts stream timestamps with an offset measured by timesync,
     so the service clock must tick at the same rate as the client's counter.
-    Wine 10.17 and later read CLOCK_BOOTTIME ("boottime"); 10.16 and earlier read
-    CLOCK_MONOTONIC_RAW ("raw"). The two can drift apart by percent under WSL2.
+    Wine 10.17 and later read CLOCK_BOOTTIME ("boottime"); 10.16 and earlier and
+    every Proton read CLOCK_MONOTONIC_RAW ("raw"). The two can drift apart by
+    percent under WSL2. "auto" starts on boottime and follows the clock the bridge's
+    counter reports (qpc_clock.QpcClockFollower).
     """
     if name not in WINE_CLOCKS:
         raise ValueError(f"Unknown Wine clock {name!r}; expected one of {WINE_CLOCKS}")
-    clock_id = time.CLOCK_BOOTTIME if name == "boottime" else time.CLOCK_MONOTONIC_RAW
-    return lambda: time.clock_gettime_ns(clock_id) // 1000
+    if name == AUTO:
+        return ServiceClock(DEFAULT_SOURCE, automatic=True)
+    return ServiceClock(name)
 
 
-service_clock_us = wine_clock()
+service_clock_us = wine_clock(DEFAULT_SOURCE)
 
 
 def device_connect_response(serial: str, license_count: int,
@@ -574,6 +579,15 @@ class PipeConnection:
         return encode_property_subscribe_response(response)
 
 
+@dataclass(eq=False)
+class BridgeLink:
+    """One bridge control connection and what has been logged about its clock."""
+    peer: object
+    writer: asyncio.StreamWriter
+    verdict_clock: str | None = None
+    conflict_logged: bool = False
+
+
 class PrpService:
     """Shared state: pipe names, subscription ids and the sample hub."""
 
@@ -581,6 +595,7 @@ class PrpService:
                  clock=service_clock_us, display_area: DisplayArea | None = None,
                  display_id: str | None = None, gaze_hub: GazeHub | None = None):
         self.hub, self.name, self.clock = hub, name, clock
+        self.clock_follower = QpcClockFollower(clock) if isinstance(clock, ServiceClock) else None
         self.gaze_hub = gaze_hub
         self.serial = serial or name
         self.display_area, self.display_id = display_area, display_id
@@ -766,13 +781,7 @@ class PrpService:
             if kind == FRAME_BRIDGE_HELLO:
                 writer.write(encode_frame(FRAME_PIPES, encode_names(self.pipe_names)))
                 await writer.drain()
-                self.bridges.add(writer)
-                log.info("bridge %s attached", peer)
-                while True:
-                    kind, payload = await read_frame(reader)
-                    if kind == FRAME_DISPLAY_ID:
-                        self.reported_display_id = payload.decode("utf-8", "replace")
-                        log.info("bridge reports primary monitor %s", self.reported_display_id)
+                await self.serve_bridge(BridgeLink(peer, writer), reader)
             elif kind == FRAME_PIPE_OPEN:
                 client_pid, pipe = decode_pipe_open(payload)
                 if not self.tracker_attached:
@@ -786,8 +795,83 @@ class PrpService:
         except ProtocolError as exc:
             log.warning("closing relay connection %s: %s", peer, exc)
         finally:
-            self.bridges.discard(writer)
             writer.close()
+
+    async def serve_bridge(self, bridge: BridgeLink, reader) -> None:
+        """Control connection: display id and QueryPerformanceCounter reports until it closes."""
+        self.bridges.add(bridge.writer)
+        log.info("bridge %s attached", bridge.peer)
+        unreported = asyncio.get_running_loop().call_later(
+            QPC_REPORT_WAIT_S, self.note_unreported_clock, bridge)
+        try:
+            while True:
+                kind, payload = await read_frame(reader)
+                if kind == FRAME_QPC:
+                    host_us = self.clock.read_all() if self.clock_follower else {}
+                    unreported.cancel()
+                    self.observe_bridge_clock(bridge, payload, host_us)
+                elif kind == FRAME_DISPLAY_ID:
+                    self.reported_display_id = payload.decode("utf-8", "replace")
+                    log.info("bridge reports primary monitor %s", self.reported_display_id)
+        finally:
+            unreported.cancel()
+            self.bridges.discard(bridge.writer)
+            if self.clock_follower is not None:
+                self.clock_follower.forget(bridge)
+
+    def note_unreported_clock(self, bridge: BridgeLink) -> None:
+        source = getattr(self.clock, "source", "the configured clock")
+        log.info("bridge %s does not report its QueryPerformanceCounter (older bridge); "
+                 "service clock stays %s", bridge.peer, source)
+
+    def observe_bridge_clock(self, bridge: BridgeLink, payload: bytes,
+                             host_us: dict[str, int]) -> None:
+        """One QueryPerformanceCounter report from `bridge`, with the Linux clocks read at receipt."""
+        try:
+            report = decode_qpc_report(payload)
+        except ValueError as exc:
+            log.warning("bridge %s: ignoring clock report: %s", bridge.peer, exc)
+            return
+        if report.details:
+            log.info("bridge %s runs %s", bridge.peer,
+                     ", ".join(f"{key} {value}" for key, value in report.details.items()))
+        if self.clock_follower is None:
+            return
+        decision = self.clock_follower.observe(bridge, QpcSample(report.micros, host_us))
+        verdict = decision.verdict
+        if verdict.clock != bridge.verdict_clock:
+            bridge.verdict_clock = verdict.clock
+            if verdict.clock is not None:
+                log.info("bridge %s: QueryPerformanceCounter follows %s (%s)", bridge.peer,
+                         verdict.clock, verdict.describe())
+            if verdict.clock not in (None, self.clock.source) and not self.clock.automatic:
+                log.warning("bridge %s counter follows %s but the service clock is fixed to %s; "
+                            "timestamps will drift (use --wine-clock auto or %s)", bridge.peer,
+                            verdict.clock, self.clock.source, verdict.clock)
+        if decision.held_by is not None and not bridge.conflict_logged:
+            bridge.conflict_logged = True
+            log.warning("bridge %s counter follows %s, but bridge %s still confirms %s; "
+                        "keeping %s", bridge.peer, verdict.clock, decision.held_by.peer,
+                        self.clock.source, self.clock.source)
+        if decision.switch is not None:
+            self.clock_switched(decision.switch, verdict.basis)
+
+    def clock_switched(self, switch: ClockSwitch, basis: str) -> None:
+        """Keep cached times on the new clock and make clients timesync again.
+
+        The game layer timesyncs only when it creates or reconnects its device
+        (docs/prp-bridge.md, Time base), so connected clients are closed and
+        reconnect as after a service restart.
+        """
+        log.info("service clock now follows %s instead of %s (%s match); moved %+.3f ms",
+                 switch.new, switch.old, basis, switch.delta_us / 1000)
+        if self.presence.value is not None:
+            self.presence.since_us += switch.delta_us
+        if self.connections:
+            log.info("closing %d game connection(s) so they timesync on the new clock",
+                     len(self.connections))
+            for connection in list(self.connections):
+                connection.close()
 
     async def serve(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT):
         return await asyncio.start_server(self.handle, host, port)
@@ -840,9 +924,10 @@ def main(argv=None) -> None:
                         help="display id string (tobii_get_display_id); the game layer matches "
                              "the part before '##' with a monitor's device instance id")
     parser.add_argument("--debug", action="store_true", help="log every relayed pipe message")
-    parser.add_argument("--wine-clock", choices=WINE_CLOCKS, default="boottime",
-                        help="clock behind the game's Wine QueryPerformanceCounter: "
-                             "boottime for Wine 10.17 and later, raw for older")
+    parser.add_argument("--wine-clock", choices=WINE_CLOCKS, default=AUTO,
+                        help="clock behind the game's Wine QueryPerformanceCounter: auto "
+                             "follows what the bridge reports (default), boottime is upstream "
+                             "Wine 10.17 and later, raw older Wine and every Proton")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(message)s")

@@ -29,12 +29,13 @@ in {
         '';
       };
       wineClock = lib.mkOption {
-        type = lib.types.enum [ "boottime" "raw" ];
-        default = "boottime";
+        type = lib.types.enum [ "auto" "boottime" "raw" ];
+        default = "auto";
         description = ''
-          Clock behind the game's Wine QueryPerformanceCounter: boottime for
-          Wine 10.17 and later, raw for older releases and for every Proton
-          and GE-Proton.
+          Clock behind the game's Wine QueryPerformanceCounter. auto follows
+          the counter the bridge in the game's prefix reports; boottime fixes
+          it for Wine 10.17 and later, raw for older releases and for every
+          Proton and GE-Proton.
         '';
       };
       port = lib.mkOption {

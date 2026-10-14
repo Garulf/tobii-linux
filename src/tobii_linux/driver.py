@@ -181,19 +181,31 @@ for every frame as it arrives.
 
 
 class ClockMapper:
-    """Maps device timestamps onto a host clock using the smallest recent receipt delay."""
+    """Maps device timestamps onto a host clock using the smallest recent receipt delay.
+
+A clock with a `generation` attribute (qpc_clock.ServiceClock) can change its
+source; the mapping then starts over from the next frame.
+"""
     def __init__(self, clock, window=64):
         self.clock = clock
         self.offsets = deque(maxlen=window)
         self.offset = None
+        self.generation = getattr(clock, 'generation', None)
 
     def observe(self, device_us):
+        generation = getattr(self.clock, 'generation', None)
+        if generation != self.generation:
+            self.generation = generation
+            self.offsets.clear()
         self.offsets.append(self.clock() - device_us)
         self.offset = min(self.offsets)
 
     def __call__(self, device_us):
         """Host time of a device timestamp, never later than the host clock's current time."""
-        return min(device_us + self.offset, self.clock())
+        now = self.clock()
+        if getattr(self.clock, 'generation', None) != self.generation:
+            return now
+        return min(device_us + self.offset, now)
 
 
 class HeadPoseProcessor:

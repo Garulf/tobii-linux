@@ -198,6 +198,10 @@ connection up, and mirrors the server shutdown towards clients:
   and `cli serve` hands results to the event loop without blocking.
 - SIGINT and SIGTERM stop the link, unsubscribe the three streams, close USB,
   disconnect clients and the bridge, and exit 0.
+- When `--wine-clock auto` moves the service clock to another Linux clock
+  while game clients are connected, the service closes them, so that they
+  reconnect and timesync on the new clock; the tracker session goes on
+  ([prp-bridge.md](prp-bridge.md#time-base)).
 - Several clients: every subscription has its own queue per stream; closing a
   client's command channel closes its subscription channel too, as the real
   service destroys both.
