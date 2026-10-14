@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Run a Windows game with Eye Tracker 5 head tracking: make sure the Linux PRP
+# service is reachable, start prp_bridge.exe in the game's Wine prefix and
+# wineserver, then run the game. See docs/game-launch.md.
+#
+# Usage: tobii-linux-wine-run [options] [--] <game command> [arguments...]
+#
+# The game command is used as Lutris, Steam or a launch script would run it:
+#   Steam/Proton:   tobii-linux-wine-run %command%
+#   umu (Lutris):   tobii-linux-wine-run umu-run game.exe
+#   plain Wine:     tobii-linux-wine-run wine game.exe
+#
+# Options (environment variable in brackets):
+#   --bridge PATH          prp_bridge.exe [TOBII_LINUX_BRIDGE]
+#   --host HOST            service host, default 127.0.0.1 [TOBII_LINUX_HOST]
+#   --port PORT            service port, default 7760 [TOBII_LINUX_PORT]
+#   --wine PATH            Wine that runs the game when the command does not start
+#                          with it; defaults to $WINE as Lutris sets it
+#   --start-service        start the systemd user unit when the service is down
+#                          [TOBII_LINUX_START_SERVICE=1]
+#   --service-unit NAME    unit for --start-service, default tobii-head-pose.service
+#                          [TOBII_LINUX_SERVICE_UNIT]
+#   --service-command CMD  start CMD (a shell command) when the service is down and
+#                          stop it after the game [TOBII_LINUX_SERVICE_COMMAND]
+#   --require-service      fail instead of starting the game without tracking
+#                          [TOBII_LINUX_REQUIRE_SERVICE=1]
+#   --dry-run              print the launch plan instead of running it
+set -uo pipefail
+
+program=$(basename "$0")
+script_dir=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+bridge=${TOBII_LINUX_BRIDGE:-}
+host=${TOBII_LINUX_HOST:-127.0.0.1}
+port=${TOBII_LINUX_PORT:-7760}
+wine_binary=
+start_service=${TOBII_LINUX_START_SERVICE:-0}
+service_unit=${TOBII_LINUX_SERVICE_UNIT:-tobii-head-pose.service}
+service_command=${TOBII_LINUX_SERVICE_COMMAND:-}
+require_service=${TOBII_LINUX_REQUIRE_SERVICE:-0}
+dry_run=0
+service_wait_seconds=${TOBII_LINUX_SERVICE_WAIT:-20}
+bridge_wait_seconds=${TOBII_LINUX_BRIDGE_WAIT:-15}
+owned_service_pid=
+
+say() { echo "$program: $*" >&2; }
+die() { say "$*"; exit 2; }
+
+usage() {
+    sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p}' "$0"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bridge) bridge=${2:?}; shift 2 ;;
+        --host) host=${2:?}; shift 2 ;;
+        --port) port=${2:?}; shift 2 ;;
+        --wine) wine_binary=${2:?}; shift 2 ;;
+        --start-service) start_service=1; shift ;;
+        --service-unit) service_unit=${2:?}; shift 2 ;;
+        --service-command) service_command=${2:?}; shift 2 ;;
+        --require-service) require_service=1; shift ;;
+        --dry-run) dry_run=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) die "unknown option $1 (see --help)" ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || die "no game command given (see --help)"
+
+find_bridge() {
+    local candidate
+    for candidate in "$bridge" "$script_dir/prp_bridge.exe" "$script_dir/../share/tobii-linux/prp_bridge.exe"; do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            readlink -f "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+service_reachable() {
+    (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+}
+
+wait_for_service() {
+    local deadline=$((SECONDS + service_wait_seconds))
+    while [ $SECONDS -lt $deadline ]; do
+        service_reachable && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+ensure_service() {
+    service_reachable && return 0
+    if [ -n "$service_command" ]; then
+        say "starting the service: $service_command"
+        bash -c "$service_command" &
+        owned_service_pid=$!
+    elif [ "$start_service" = 1 ]; then
+        say "starting $service_unit"
+        systemctl --user start "$service_unit" || say "could not start $service_unit"
+    fi
+    if [ -n "$owned_service_pid" ] || [ "$start_service" = 1 ]; then
+        wait_for_service && return 0
+    fi
+    if [ "$require_service" = 1 ]; then
+        die "no Eye Tracker 5 service at $host:$port"
+    fi
+    say "no Eye Tracker 5 service at $host:$port; the bridge keeps trying while the game runs"
+}
+
+stop_owned_service() {
+    if [ -n "$owned_service_pid" ]; then
+        kill "$owned_service_pid" 2>/dev/null
+        wait "$owned_service_pid" 2>/dev/null
+    fi
+}
+
+is_wine_binary() {
+    case "${1##*/}" in
+        wine|wine64|wine-*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Index of the Proton script followed by one of its verbs, or nothing.
+proton_index() {
+    local index
+    for ((index = 0; index < $# - 1; index++)); do
+        local argument=${*:index+1:1} verb=${*:index+2:1}
+        if [ "${argument##*/}" = proton ]; then
+            case "$verb" in
+                waitforexitandrun|run|runinprefix) echo "$index"; return 0 ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+umu_index() {
+    local index
+    for ((index = 0; index < $#; index++)); do
+        local argument=${*:index+1:1}
+        case "${argument##*/}" in
+            umu-run|umu_run.py) echo "$index"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Copies the bridge into the prefix's directory tree, which every Proton
+# container can see, unlike the Nix store or the package directory.
+place_bridge() {
+    local directory=$1/tobii-linux
+    mkdir -p "$directory" || die "cannot create $directory"
+    if ! cmp -s "$bridge" "$directory/prp_bridge.exe"; then
+        install -m 644 "$bridge" "$directory/prp_bridge.exe" || die "cannot copy the bridge to $directory"
+    fi
+    echo "$directory/prp_bridge.exe"
+}
+
+# Proton gives the bridge no terminal, so it logs beside its copy, one file per launch.
+log_beside_bridge() {
+    if [ -z "${TOBII_LINUX_BRIDGE_LOG:-}" ]; then
+        TOBII_LINUX_BRIDGE_LOG=$(dirname "$1")/bridge.log
+        : > "$TOBII_LINUX_BRIDGE_LOG"
+    fi
+    export TOBII_LINUX_BRIDGE_LOG
+}
+
+run_or_print() {
+    if [ "$dry_run" = 1 ]; then
+        printf '%s\n' "mode $mode" "$@"
+        exit 0
+    fi
+    if [ -n "$owned_service_pid" ]; then
+        "$@"
+        local status=$?
+        stop_owned_service
+        exit $status
+    fi
+    exec "$@"
+}
+
+launch_through_proton() {
+    local index=$1; shift
+    local data_path=${STEAM_COMPAT_DATA_PATH:-}
+    [ -n "$data_path" ] || die "STEAM_COMPAT_DATA_PATH is not set; is this a Steam launch?"
+    local placed; placed=$(place_bridge "$data_path") || exit 2
+    log_beside_bridge "$placed"
+    local verb_end=$((index + 2))
+    run_or_print "${@:1:verb_end}" "$placed" "$host" "$port" -- "${@:verb_end+1}"
+}
+
+launch_through_umu() {
+    local index=$1; shift
+    local game=${*:index+2:1}
+    case "$game" in
+        ""|-*|winetricks|createprefix) die "umu-run $game has no game executable to run behind the bridge" ;;
+    esac
+    local prefix=${WINEPREFIX:-$HOME/Games/umu/${GAMEID:-umu-default}}
+    local placed; placed=$(place_bridge "$prefix") || exit 2
+    log_beside_bridge "$placed"
+    if [ -z "${STEAM_COMPAT_INSTALL_PATH:-}" ] && [ -f "$game" ]; then
+        STEAM_COMPAT_INSTALL_PATH=$(cd "$(dirname "$game")" && pwd)
+        export STEAM_COMPAT_INSTALL_PATH
+    fi
+    local runner_end=$((index + 1))
+    run_or_print "${@:1:runner_end}" "$placed" "$host" "$port" -- "${@:runner_end+1}"
+}
+
+wait_for_bridge() {
+    local log=$1 pid=$2 deadline=$((SECONDS + bridge_wait_seconds))
+    while [ $SECONDS -lt $deadline ]; do
+        grep -qE 'serving|without head tracking' "$log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.2
+    done
+    return 1
+}
+
+launch_beside_wine() {
+    local wine=$1; shift
+    if [ "$dry_run" = 1 ]; then
+        printf '%s\n' "mode $mode" "bridge $wine $bridge --until-prefix-exits $host $port" "$@"
+        exit 0
+    fi
+    local log; log=$(mktemp "${TMPDIR:-/tmp}/tobii-linux-bridge.XXXXXX")
+    "$wine" "$bridge" --until-prefix-exits "$host" "$port" 2> >(tee "$log" >&2) &
+    local bridge_pid=$!
+    wait_for_bridge "$log" "$bridge_pid" || say "the bridge did not report its pipes; starting the game anyway"
+    "$@"
+    local status=$?
+    # The bridge leaves by itself once the prefix has no programs left, which
+    # also covers a launcher that exits while its game keeps running.
+    wait "$bridge_pid" 2>/dev/null
+    rm -f "$log"
+    stop_owned_service
+    exit $status
+}
+
+bridge=$(find_bridge) || die "prp_bridge.exe not found; pass --bridge or set TOBII_LINUX_BRIDGE"
+[ "$dry_run" = 1 ] || ensure_service
+
+if index=$(proton_index "$@"); then
+    mode=proton
+    launch_through_proton "$index" "$@"
+elif index=$(umu_index "$@"); then
+    mode=umu
+    launch_through_umu "$index" "$@"
+fi
+
+mode=wine
+if [ -z "$wine_binary" ]; then
+    if is_wine_binary "$1"; then
+        wine_binary=$1
+    elif [ -n "${WINE:-}" ]; then
+        wine_binary=$WINE
+    else
+        die "cannot tell which Wine runs the game; start the command with wine or pass --wine"
+    fi
+fi
+launch_beside_wine "$wine_binary" "$@"

@@ -5,12 +5,21 @@
  * reply pipe when the service names it, and relays every pipe message over one
  * loopback TCP connection per pipe connection. Relay framing: docs/prp-bridge.md.
  *
- * Usage: prp_bridge.exe [host] [port]   (defaults 127.0.0.1 7760)
+ * Usage: prp_bridge.exe [--until-prefix-exits] [host [port]] [-- program [arguments...]]
+ *
+ * host and port default to 127.0.0.1 7760. Without options the bridge exits when
+ * the service closes its control connection. --until-prefix-exits makes it a Wine
+ * system process instead: it reconnects when the service restarts and exits once
+ * the last ordinary process of the prefix has exited, as Proton's steam.exe does.
+ * Without a service it goes on after FIRST_ATTACH_TIMEOUT_MS and keeps trying.
+ * "-- program" implies that mode and starts the program once the pipes are up
+ * or that time has passed; a Unix program path is converted to a DOS path.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <devpropdef.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -31,10 +40,26 @@
 #define PIPE_DEFAULT_TIMEOUT_MS 5000
 #define CONNECT_ATTEMPTS 50
 #define REPLY_OPEN_ATTEMPTS 4
+#define FIRST_ATTACH_TIMEOUT_MS 10000
+#define WINE_MAKE_PROCESS_SYSTEM 1000
 
 static const char *service_host = "127.0.0.1";
 static const char *service_port = "7760";
 static CRITICAL_SECTION log_lock;
+static FILE *log_file;
+static HANDLE first_serving;
+static HANDLE display_id_known;
+static char display_id[512];
+
+typedef struct {
+    char name[PIPE_NAME_LIMIT];
+    HANDLE stop;
+} Listener;
+
+typedef struct {
+    SOCKET control;
+    HANDLE stop;
+} DisplayReport;
 
 typedef struct {
     HANDLE pipe;
@@ -44,19 +69,30 @@ typedef struct {
     char name[PIPE_NAME_LIMIT];
 } Session;
 
+static void write_log_line(FILE *stream, const SYSTEMTIME *now, const char *format, va_list args)
+{
+    fprintf(stream, "%02u:%02u:%02u.%03u ", now->wHour, now->wMinute, now->wSecond,
+            now->wMilliseconds);
+    vfprintf(stream, format, args);
+    fputc('\n', stream);
+    fflush(stream);
+}
+
+/* Logs to stderr and, when TOBII_LINUX_BRIDGE_LOG names a file, to that file. */
 static void say(const char *format, ...)
 {
     va_list args;
     SYSTEMTIME now;
     GetLocalTime(&now);
     EnterCriticalSection(&log_lock);
-    fprintf(stderr, "%02u:%02u:%02u.%03u ", now.wHour, now.wMinute, now.wSecond,
-            now.wMilliseconds);
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    write_log_line(stderr, &now, format, args);
     va_end(args);
-    fputc('\n', stderr);
-    fflush(stderr);
+    if (log_file) {
+        va_start(args, format);
+        write_log_line(log_file, &now, format, args);
+        va_end(args);
+    }
     LeaveCriticalSection(&log_lock);
 }
 
@@ -293,44 +329,59 @@ done:
     return 0;
 }
 
+/* Waits for a client on an overlapped server pipe; returns the Win32 error, or ERROR_CANCELLED on stop. */
+static DWORD await_client(HANDLE pipe, HANDLE stop)
+{
+    OVERLAPPED overlapped = {0};
+    HANDLE events[2];
+    DWORD error = 0, ignored;
+    overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    events[0] = overlapped.hEvent;
+    events[1] = stop;
+    if (!ConnectNamedPipe(pipe, &overlapped)) {
+        error = GetLastError();
+        if (error == ERROR_PIPE_CONNECTED) {
+            error = 0;
+        } else if (error == ERROR_IO_PENDING) {
+            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &overlapped);
+                GetOverlappedResult(pipe, &overlapped, &ignored, TRUE);
+                error = ERROR_CANCELLED;
+            } else {
+                error = GetOverlappedResult(pipe, &overlapped, &ignored, FALSE) ? 0 : GetLastError();
+            }
+        }
+    }
+    CloseHandle(overlapped.hEvent);
+    return error;
+}
+
 /* Server pipe as the DLL's own service code creates it (0x1800aae50): inbound, message type. */
 static DWORD WINAPI listen_pipe(void *context)
 {
-    const char *name = context;
+    const Listener *listener = context;
+    const char *name = listener->name;
     char path[PIPE_NAME_LIMIT + 16];
     pipe_path(path, sizeof path, name);
-    for (;;) {
-        OVERLAPPED overlapped = {0};
-        DWORD ignored;
+    while (WaitForSingleObject(listener->stop, 0) == WAIT_TIMEOUT) {
         Session *session;
+        DWORD error;
         HANDLE pipe = CreateNamedPipeA(path, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
                                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                                        PIPE_UNLIMITED_INSTANCES, 0, SERVER_PIPE_IN_BUFFER,
                                        PIPE_DEFAULT_TIMEOUT_MS, NULL);
         if (pipe == INVALID_HANDLE_VALUE) {
             say("CreateNamedPipeA(%s) failed: %lu", path, GetLastError());
-            Sleep(1000);
+            WaitForSingleObject(listener->stop, 1000);
             continue;
         }
-        overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-        if (!ConnectNamedPipe(pipe, &overlapped)) {
-            DWORD error = GetLastError();
-            if (error == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(pipe, &overlapped, &ignored, TRUE))
-                    error = GetLastError();
-                else
-                    error = 0;
-            } else if (error == ERROR_PIPE_CONNECTED) {
-                error = 0;
-            }
-            if (error != 0) {
+        error = await_client(pipe, listener->stop);
+        if (error != 0) {
+            if (error != ERROR_CANCELLED)
                 say("ConnectNamedPipe(%s) failed: %lu", name, error);
-                CloseHandle(overlapped.hEvent);
-                CloseHandle(pipe);
-                continue;
-            }
+            CloseHandle(pipe);
+            continue;
         }
-        CloseHandle(overlapped.hEvent);
         session = calloc(1, sizeof *session);
         if (!session) {
             CloseHandle(pipe);
@@ -387,18 +438,30 @@ static int primary_monitor_instance_id(WCHAR *instance_id, ULONG size)
     return 0;
 }
 
-static void report_display_id(SOCKET control)
+/* Display enumeration can take seconds under a host display server, so it runs
+   once in the background and never delays the pipes. */
+static DWORD WINAPI find_display_id(void *unused)
 {
     WCHAR instance_id[256];
-    char utf8[512];
-    int length;
-    if (!primary_monitor_instance_id(instance_id, sizeof instance_id)) {
+    (void)unused;
+    if (!primary_monitor_instance_id(instance_id, sizeof instance_id)
+        || WideCharToMultiByte(CP_UTF8, 0, instance_id, -1, display_id, sizeof display_id,
+                               NULL, NULL) <= 1) {
+        display_id[0] = 0;
         say("primary monitor id unavailable; the service needs --display-id for window tracking");
-        return;
     }
-    length = WideCharToMultiByte(CP_UTF8, 0, instance_id, -1, utf8, sizeof utf8, NULL, NULL);
-    if (length > 1 && send_frame(control, FRAME_DISPLAY_ID, utf8, (UINT32)length - 1))
-        say("reported primary monitor %s", utf8);
+    SetEvent(display_id_known);
+    return 0;
+}
+
+static DWORD WINAPI report_display_id(void *context)
+{
+    DisplayReport *report = context;
+    HANDLE waits[2] = {display_id_known, report->stop};
+    if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 && display_id[0]
+        && send_frame(report->control, FRAME_DISPLAY_ID, display_id, (UINT32)strlen(display_id)))
+        say("reported primary monitor %s", display_id);
+    return 0;
 }
 
 static SOCKET attach_to_service(char **names_out, UINT32 *size_out)
@@ -423,36 +486,250 @@ static SOCKET attach_to_service(char **names_out, UINT32 *size_out)
     return INVALID_SOCKET;
 }
 
-int main(int argc, char **argv)
+/* Serves one set of pipes until the service closes the control connection. */
+static void serve_pipes(SOCKET control, char *names, UINT32 size)
+{
+    Listener listeners[MAX_PIPES];
+    HANDLE threads[MAX_PIPES + 1];
+    HANDLE stop = CreateEventA(NULL, TRUE, FALSE, NULL);
+    DisplayReport report = {control, stop};
+    const char *cursor;
+    char sink[16];
+    int count = 0, index;
+
+    for (cursor = names; cursor < names + size && *cursor && count < MAX_PIPES;
+         cursor += strlen(cursor) + 1) {
+        snprintf(listeners[count].name, sizeof listeners[count].name, "%s", cursor);
+        listeners[count].stop = stop;
+        threads[count] = CreateThread(NULL, 0, listen_pipe, &listeners[count], 0, NULL);
+        if (threads[count]) {
+            say("serving \\\\.\\pipe\\%s", cursor);
+            count++;
+        }
+    }
+    SetEvent(first_serving);
+    threads[count] = CreateThread(NULL, 0, report_display_id, &report, 0, NULL);
+    if (threads[count])
+        count++;
+    while (recv(control, sink, sizeof sink, 0) > 0)
+        ;
+    SetEvent(stop);
+    WaitForMultipleObjects((DWORD)count, threads, TRUE, INFINITE);
+    for (index = 0; index < count; index++)
+        CloseHandle(threads[index]);
+    CloseHandle(stop);
+}
+
+/* Persistent relay: attaches, serves, and attaches again whenever the service restarts. */
+static DWORD WINAPI relay_forever(void *unused)
+{
+    int waiting_logged = 0;
+    (void)unused;
+    for (;;) {
+        char *names = NULL;
+        UINT32 size = 0;
+        SOCKET control = attach_to_service(&names, &size);
+        if (control == INVALID_SOCKET) {
+            if (!waiting_logged)
+                say("no PRP service at %s:%s yet; still trying", service_host, service_port);
+            waiting_logged = 1;
+            Sleep(1000);
+            continue;
+        }
+        waiting_logged = 0;
+        serve_pipes(control, names, size);
+        closesocket(control);
+        free(names);
+        say("PRP service closed the control connection; reconnecting");
+    }
+    return 0;
+}
+
+/* Marks this process as a Wine system process; returns the event Wine signals when
+   only system processes remain, or NULL outside Wine. */
+static HANDLE become_wine_system_process(void)
+{
+    typedef LONG (NTAPI *SetInformationProcess)(HANDLE, ULONG, void *, ULONG);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    FARPROC function = GetProcAddress(ntdll, "NtSetInformationProcess");
+    SetInformationProcess set_information;
+    HANDLE prefix_idle = NULL;
+    if (!function || !GetProcAddress(ntdll, "wine_get_version"))
+        return NULL;
+    memcpy(&set_information, &function, sizeof set_information);
+    if (set_information(GetCurrentProcess(), WINE_MAKE_PROCESS_SYSTEM, &prefix_idle,
+                        sizeof(HANDLE *)) != 0)
+        return NULL;
+    return prefix_idle;
+}
+
+/* Appends one argument with the quoting CommandLineToArgvW reverses. */
+static void append_argument(WCHAR *line, size_t *used, const WCHAR *argument)
+{
+    size_t backslashes = 0;
+    const WCHAR *each;
+    line[(*used)++] = L'"';
+    for (each = argument; *each; each++) {
+        if (*each == L'\\') {
+            backslashes++;
+            continue;
+        }
+        if (*each == L'"')
+            backslashes = backslashes * 2 + 1;
+        while (backslashes) {
+            line[(*used)++] = L'\\';
+            backslashes--;
+        }
+        line[(*used)++] = *each;
+    }
+    for (backslashes *= 2; backslashes; backslashes--)
+        line[(*used)++] = L'\\';
+    line[(*used)++] = L'"';
+    line[(*used)++] = L' ';
+}
+
+static WCHAR *dos_path_of_unix_path(const WCHAR *unix_path)
+{
+    typedef WCHAR *(CDECL *GetDosFileName)(const char *);
+    FARPROC function = GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_dos_file_name");
+    GetDosFileName get_dos_file_name;
+    char utf8[4 * MAX_PATH];
+    if (unix_path[0] != L'/' || !function
+        || !WideCharToMultiByte(CP_UTF8, 0, unix_path, -1, utf8, sizeof utf8, NULL, NULL))
+        return NULL;
+    memcpy(&get_dos_file_name, &function, sizeof get_dos_file_name);
+    return get_dos_file_name(utf8);
+}
+
+static WCHAR *program_command_line(WCHAR **arguments, int count)
+{
+    WCHAR *dos_program = dos_path_of_unix_path(arguments[0]);
+    size_t capacity = 1, used = 0;
+    WCHAR *line;
+    int index;
+    for (index = 0; index < count; index++)
+        capacity += 3 + 2 * wcslen(index == 0 && dos_program ? dos_program : arguments[index]);
+    line = malloc(capacity * sizeof *line);
+    if (!line)
+        return NULL;
+    for (index = 0; index < count; index++)
+        append_argument(line, &used, index == 0 && dos_program ? dos_program : arguments[index]);
+    line[used ? used - 1 : 0] = 0;
+    if (dos_program)
+        HeapFree(GetProcessHeap(), 0, dos_program);
+    return line;
+}
+
+static HANDLE start_program(WCHAR **arguments, int count)
+{
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    WCHAR *line = program_command_line(arguments, count);
+    BOOL started;
+    memset(&startup, 0, sizeof startup);
+    startup.cb = sizeof startup;
+    started = line && CreateProcessW(NULL, line, NULL, NULL, FALSE, 0, NULL, NULL,
+                                          &startup, &process);
+    if (!started) {
+        say("cannot start %ls: %lu", arguments[0], GetLastError());
+        free(line);
+        return NULL;
+    }
+    say("started %ls", line);
+    free(line);
+    CloseHandle(process.hThread);
+    return process.hProcess;
+}
+
+static int separator_index(WCHAR **arguments, int count)
+{
+    int index;
+    for (index = 1; index < count; index++)
+        if (!wcscmp(arguments[index], L"--"))
+            return index;
+    return count;
+}
+
+/* Runs the relay as a system process until the prefix's ordinary processes are gone. */
+static int run_until_prefix_exits(WCHAR **program, int program_count)
+{
+    HANDLE relay = CreateThread(NULL, 0, relay_forever, NULL, 0, NULL);
+    HANDLE child = NULL, prefix_idle, wait_for;
+    DWORD exit_code = 0;
+    if (!relay)
+        return 1;
+    if (WaitForSingleObject(first_serving, FIRST_ATTACH_TIMEOUT_MS) != WAIT_OBJECT_0)
+        say("going on without head tracking until the service appears");
+    if (program_count > 0) {
+        child = start_program(program, program_count);
+        if (!child)
+            return 1;
+    }
+    prefix_idle = become_wine_system_process();
+    wait_for = prefix_idle ? prefix_idle : child ? child : relay;
+    WaitForSingleObject(wait_for, INFINITE);
+    if (child && GetExitCodeProcess(child, &exit_code) && exit_code == STILL_ACTIVE)
+        exit_code = 0;
+    say("prefix has no running programs left; exiting");
+    return (int)exit_code;
+}
+
+static void open_log_file(void)
+{
+    WCHAR path[MAX_PATH], *dos_path;
+    if (GetEnvironmentVariableW(L"TOBII_LINUX_BRIDGE_LOG", path, MAX_PATH) - 1u >= MAX_PATH - 1u)
+        return;
+    dos_path = dos_path_of_unix_path(path);
+    log_file = _wfopen(dos_path ? dos_path : path, L"a");
+    if (dos_path)
+        HeapFree(GetProcessHeap(), 0, dos_path);
+}
+
+int main(void)
 {
     WSADATA wsa;
+    int count = 0, separator, positional = 0, index;
+    WCHAR **arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    static char host[256], port[32];
+    int persistent = 0;
     SOCKET control;
-    char *names = NULL, *cursor, sink[16];
+    char *names = NULL;
     UINT32 size = 0;
-    int count = 0;
 
     InitializeCriticalSection(&log_lock);
-    if (argc > 1)
-        service_host = argv[1];
-    if (argc > 2)
-        service_port = argv[2];
+    open_log_file();
+    first_serving = CreateEventA(NULL, TRUE, FALSE, NULL);
+    display_id_known = CreateEventA(NULL, TRUE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 0, find_display_id, NULL, 0, NULL));
+    if (!arguments)
+        return 1;
+    separator = separator_index(arguments, count);
+    for (index = 1; index < separator; index++) {
+        if (!wcscmp(arguments[index], L"--until-prefix-exits")) {
+            persistent = 1;
+        } else if (positional == 0) {
+            WideCharToMultiByte(CP_UTF8, 0, arguments[index], -1, host, sizeof host, NULL, NULL);
+            service_host = host;
+            positional++;
+        } else if (positional == 1) {
+            WideCharToMultiByte(CP_UTF8, 0, arguments[index], -1, port, sizeof port, NULL, NULL);
+            service_port = port;
+            positional++;
+        }
+    }
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         say("WSAStartup failed");
         return 1;
     }
+    if (persistent || separator < count)
+        return run_until_prefix_exits(arguments + separator + 1, count - separator - 1);
+
     control = attach_to_service(&names, &size);
     if (control == INVALID_SOCKET) {
         say("no PRP service at %s:%s", service_host, service_port);
         return 1;
     }
-    report_display_id(control);
-    for (cursor = names; cursor < names + size && *cursor && count < MAX_PIPES;
-         cursor += strlen(cursor) + 1, count++) {
-        say("serving \\\\.\\pipe\\%s", cursor);
-        CloseHandle(CreateThread(NULL, 0, listen_pipe, cursor, 0, NULL));
-    }
-    while (recv(control, sink, sizeof sink, 0) > 0)
-        ;
+    serve_pipes(control, names, size);
     say("PRP service closed the control connection; exiting");
     return 0;
 }

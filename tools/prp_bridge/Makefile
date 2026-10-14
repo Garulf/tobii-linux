@@ -4,8 +4,9 @@ LDFLAGS = -static -s
 
 all: prp_bridge.exe prp_test_client.exe tgi_test_client.exe
 
-prp_bridge.exe: prp_bridge.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lws2_32
+# GUI subsystem: Proton's steam.exe gives console programs a new console window.
+prp_bridge.exe: prp_bridge.c Makefile
+	$(CC) $(CFLAGS) -mwindows -o $@ $< $(LDFLAGS) -lws2_32 -lshell32
 
 prp_test_client.exe: prp_test_client.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)

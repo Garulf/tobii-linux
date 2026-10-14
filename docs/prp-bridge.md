@@ -12,7 +12,9 @@ through two pieces:
   the service over loopback TCP.
 
 The pipe protocol it serves is described in
-[service-transport.md](service-transport.md). Pipe discovery under Wine is
+[service-transport.md](service-transport.md). User presence, property
+notifications and what happens when the tracker is unplugged, stalls or the
+host sleeps are in [service-behaviour.md](service-behaviour.md). Pipe discovery under Wine is
 handled separately by a Wine patch
 ([wine-pipe-enumeration.md](wine-pipe-enumeration.md)); without it the test
 client needs an explicit `tobii-prp://` URL.
@@ -42,6 +44,8 @@ Evidence labels:
 | Property replies (display area, display id, model, properties 2 and 4, user presence subscribe, refusals, unsubscribe) | byte-identical to the real service except one uninitialised padding byte in the model string | live (Windows), unit |
 | Gaze streams 3, 29 and 4 ([gaze-host.md](gaze-host.md)): packages, stream start/stop and the refusals of streams 5, 6 and 33 | byte-identical to the real service | live (Windows), unit |
 | Gaze points through both client DLLs and `GetGazePoints` of the game integration layer, synthetic service | every package delivered; the layer returns the same `(2x - 1, 1 - 2y)` as on Windows | live (Wine 11.0 + patch) |
+| User presence from the device stream, operation 2 change notifications, commands 5 and 6 for properties 1 to 24 ([service-behaviour.md](service-behaviour.md)) | notification framing byte-identical to a real operation 2; subscription answers byte-identical except uninitialised bytes | emulation, live (Windows), unit |
+| Tracker unplugged and attached again under `cli serve`, two clients, SIGTERM ([service-behaviour.md](service-behaviour.md)) | clients disconnected while it is gone, as the real server shuts down; the game layer reconnects and streams again | live (Wine 11.0 + patch) |
 
 ## Architecture
 
@@ -224,7 +228,11 @@ make -C tools/prp_bridge
 ```
 
 This produces `prp_bridge.exe`, `prp_test_client.exe` and `tgi_test_client.exe`,
-all static and dependency-free. `tgi_test_client.exe <game dll> [first|window|rectangle|displays|<url>] [seconds]`
+all static and dependency-free. `nix/bridge.nix` builds the same files with
+`pkgsCross.mingwW64`. The bridge is a GUI-subsystem program: Proton's
+`steam.exe` gives console programs a console window of their own, and Wine
+still passes a GUI program the terminal's stderr when started from a shell.
+`tgi_test_client.exe <game dll> [first|window|rectangle|displays|<url>] [seconds]`
 drives the game integration layer through its C exports and prints the trackers
 it found and every head pose.
 
@@ -254,6 +262,36 @@ Bridge in the game's prefix, started before the game:
 ```sh
 WINEPREFIX=... wine tools/prp_bridge/prp_bridge.exe 127.0.0.1 7760
 ```
+
+Started this way, the bridge exits when the service closes the control
+connection. Two other modes keep it alive for a whole game session; games are
+normally launched through `tools/prp_bridge/tobii-linux-wine-run`, which picks
+one ([game-launch.md](game-launch.md)):
+
+```sh
+wine prp_bridge.exe --until-prefix-exits [host [port]]
+wine prp_bridge.exe [host [port]] -- <program> [arguments...]
+```
+
+- `--until-prefix-exits`: once the pipes are up (or after 10 s without a
+  service, which it then keeps looking for), the bridge makes itself a Wine
+  system process (`NtSetInformationProcess` class 1000,
+  `ProcessWineMakeProcessSystem`, which Proton's `steam.exe` also uses) and
+  waits for the event Wine signals when only system processes remain. It
+  therefore exits when the last ordinary program of the prefix exits, and it
+  does not keep the wineserver alive by itself. If the service closes the
+  control connection, the bridge stops its listeners, reconnects (it retries
+  every 200 ms until the service is back) and serves the new pipe names.
+- `-- <program>`: the same, and the bridge starts the program at that point
+  (a Unix path is converted with `wine_get_dos_file_name`) and returns its
+  exit code. This is how it runs under Proton, where it has to be the program
+  Proton starts.
+
+The primary monitor id is looked up on its own thread, because display
+enumeration can take seconds (10 s under GE-Proton with WSLg), and is sent
+when known. With `TOBII_LINUX_BRIDGE_LOG=<file>` the bridge also appends its
+log to that file; the wrapper sets it under Proton, where stderr is not
+visible.
 
 Test client in the same prefix:
 
@@ -417,7 +455,34 @@ Full logs: `wine-test-stream-engine-1.txt`, `wine-test-game-dll-1.txt` (with
 every relayed message, `PRP_DEBUG=1`), `wine-test-final.txt`,
 `wine-test-final-2.txt`.
 
+## Launch modes
+
+Live on albedo's WSL2 Ubuntu, synthetic service, Star Citizen's
+`tobii_gameintegration_x64.dll` through `prp_test_client.exe`
+(`evidence/private/launch-work/`):
+
+| Run | Wine | Result |
+| --- | --- | --- |
+| `--until-prefix-exits`, client, service restarted, client again | patched 11.0 | discovery and 99/100 samples per 3 s both times; the bridge reconnected 0.2 s after the restart and exited by itself 6 s after the last client |
+| `-- <Unix path of client> discover` | patched 11.0 | path converted, discovery, 99 samples, bridge exit status 0 once the client ended |
+| `-- <client>` with the service started 4 s later | patched 11.0 | the bridge waited for the service, then started the client: 100 samples |
+| `tobii-linux-wine-run .../proton waitforexitandrun <client>` | GE-Proton 11-9 (stock) | `steam.exe` started the bridge, the bridge the client; 91 head-pose and 91 gaze samples per 3 s with the explicit URL |
+| `tobii-linux-wine-run umu-run <client>`, umu-launcher 1.4.4 | GE-Proton 11-9 in the Steam Linux Runtime 4 container | bridge copy in the prefix found inside the container, relay to the service on the host, 90 samples per 3 s |
+
+Under GE-Proton in WSL2, every display call of a process started by Proton's
+`steam.exe` or umu's `umu.exe` hung (WSLg; console windows of console programs
+too), and a second
+`explorer.exe /desktop` stayed a non-system process, so the prefix never went
+idle and the bridge did not exit by itself there; the same happened with a
+bridge build without the display lookup. The client was run through a small
+windowless launcher for that reason.
+
 ## Tests
+
+`tests/test_wine_run.py` runs `tobii-linux-wine-run` against stub `wine`,
+`proton`, `reaper` and `umu-run` programs: the rewritten Steam and umu command
+lines, the bridge copy, the order bridge, game, bridge exit in wine mode, the
+`--wine`/`$WINE` choice, `--require-service` and `--service-command`.
 
 `tests/test_prp_service.py` (unit) drives the service over real TCP with a
 simulated bridge and the client-side `prp_session` codecs: pipe list, the
@@ -438,8 +503,9 @@ stream start/stop and timesync responses and the handshake information.
   patch ([game-integration-layer.md](game-integration-layer.md)). Open: whether
   Star Citizen tracks its window (then the service needs `--display-id` equal to
   the monitor instance id in the game's prefix), `TrackWindow` itself (no Wine
-  build with a display driver was available), property notifications, and
-  passing the display options through `tobii_linux.cli serve`.
+  build with a display driver was available), notifications for properties
+  other than user presence, and passing the display options through
+  `tobii_linux.cli serve`.
 - **Licensed connect**: the game may use `tobii_device_create_ex` with license
   keys (0x180008820). The service returns one result 0 per license, which
   satisfies device_create statically, but this was not run.
@@ -448,9 +514,11 @@ stream start/stop and timesync responses and the handshake information.
   of the tracker during that run, so only invalid samples reached the game
   DLL. Valid output of the same pipeline was checked offline on recorded
   frames.
-- **Startup**: the bridge has to run in the game's prefix and wineserver before
-  the game connects, for example from a Lutris or Proton launch script. Proton
-  was not tested.
+- **Startup**: `tobii-linux-wine-run` starts the bridge for plain Wine, Lutris,
+  umu and Steam's Proton ([game-launch.md](game-launch.md)). Through GE-Proton
+  11-9's `proton` script, directly and inside umu's Steam Linux Runtime
+  container, it relayed 90 to 91 samples per 3 s; a real Steam client and
+  Lutris were not exercised (see "Launch modes").
 - **Unknown fields**: meanings of `list_a` to `list_d`, `groups`, `mode`, the
   nine words and the extended strings, and how the real service answers
   unsupported streams, repeated starts or unknown commands.

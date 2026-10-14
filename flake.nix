@@ -9,7 +9,10 @@
       pkgs = import nixpkgs { inherit system; };
       lib = pkgs.lib;
       repoModels = ./models/tobii-et5;
+      bridge = import ./nix/bridge.nix { inherit pkgs; };
     in rec {
+      prp-bridge = bridge.prpBridge;
+      wine-run = bridge.wineRun;
       default = pkgs.python3Packages.buildPythonApplication {
         pname = "tobii-linux";
         version = "0.1.0";
@@ -41,6 +44,7 @@
       '';
     });
     nixosModules.default = import ./nix/module.nix self;
+    overlays.wine = import ./nix/wine.nix;
     checks = forAllSystems (system: let
       pkgs = import nixpkgs { inherit system; };
       machine = nixpkgs.lib.nixosSystem {
@@ -68,6 +72,8 @@
     in {
       package = self.packages.${system}.default;
       nixos-module = assert installed && ruled && served; pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
+    } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+      wine-run = self.packages.${system}.wine-run;
     });
   };
 }

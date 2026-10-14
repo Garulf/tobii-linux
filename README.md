@@ -77,9 +77,11 @@ Three pieces are needed:
 
 1. A Wine build with the named-pipe listing patch, so the game's Tobii DLL can
    discover the service: `patches/wine/apply.sh <wine-source>` for Wine 10.0
-   or later, then build Wine as usual
+   or later, wine-staging, wine-tkg and LUG runners, and Proton 9 to 11 or
+   GE-Proton (it picks the matching variant), then build Wine as usual
    ([details](docs/wine-pipe-enumeration.md)). The game's integration layer
-   only tracks discovered trackers, so this is not optional.
+   only tracks discovered trackers, so this is not optional; stock Proton
+   lists pipes only partially and is not enough either.
 2. The service on Linux, with the same display area as above:
 
    ```sh
@@ -88,14 +90,23 @@ Three pieces are needed:
    ```
 
    It serves the tracker's gaze from the same session as well; `--no-gaze`
-   serves head pose only. Pass `--wine-clock raw` when the game's Wine is
-   10.16 or older. The bridge tells the service which monitor is primary
+   serves head pose only. Pass `--wine-clock raw` when the game runs under
+   Proton or GE-Proton, or a Wine 10.16 or older. The bridge tells the service which monitor is primary
    inside the prefix; if
    the game runs on another monitor, pass that monitor's id with
    `--display-id` ([game integration layer](docs/game-integration-layer.md)).
-3. The bridge, started in the game's Wine prefix before the game:
-   `wine tools/prp_bridge/prp_bridge.exe 127.0.0.1 7760` (build it with
-   `make -C tools/prp_bridge`, which needs MinGW-w64).
+3. The bridge in the game's Wine prefix. `tools/prp_bridge/tobii-linux-wine-run`
+   starts it with the game: put it in front of the game command, as a Lutris
+   command prefix, in Steam's launch options or in a launch script
+   ([launching games](docs/game-launch.md)):
+
+   ```sh
+   tobii-linux-wine-run --start-service %command%          # Steam, Proton
+   tobii-linux-wine-run wine "C:\...\RSI Launcher.exe"     # plain Wine
+   ```
+
+   Build the bridge with `make -C tools/prp_bridge` (MinGW-w64) or
+   `nix/bridge.nix`.
 
 See [the bridge document](docs/prp-bridge.md) for the protocol and test
 results. Under a patched Wine 11.0, the game DLL's integration layer
@@ -118,15 +129,18 @@ nix build path:.#default
 ```
 
 Import `inputs.tobii-linux.nixosModules.default` and set
-`hardware.tobii-eye-tracker-5.enable = true;` to install the command and a udev
-rule granting the active seat user access to `2104:0313`. To run the game
+`hardware.tobii-eye-tracker-5.enable = true;` to install the command,
+`tobii-linux-wine-run` with the bridge (x86-64), and a udev
+rule granting the active seat user access to `2104:0313`. `nix/wine.nix` is an
+overlay with patched nixpkgs Wine builds for Lutris
+([launching games](docs/game-launch.md#nixos)). To run the game
 service in the background as a systemd user service:
 
 ```nix
 hardware.tobii-eye-tracker-5.headPoseService = {
   enable = true;
   displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
-  # wineClock = "raw"; # for Wine 10.16 and older
+  # wineClock = "raw"; # for Proton, GE-Proton and Wine 10.16 and older
 };
 ```
 
@@ -139,7 +153,7 @@ evaluation), but no NixOS machine has run them yet.
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)
-- [Game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [game integration layer](docs/game-integration-layer.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
+- [Launching games](docs/game-launch.md), [game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [game integration layer](docs/game-integration-layer.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
 - [models](models/README.md)
 - [Managed API](docs/managed-api.md), [Linux inference](docs/linux-inference.md)
 

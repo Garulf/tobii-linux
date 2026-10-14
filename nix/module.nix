@@ -2,6 +2,7 @@ self: { config, lib, pkgs, ... }:
 let
   cfg = config.hardware.tobii-eye-tracker-5;
   package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  wineRun = (import ./bridge.nix { inherit pkgs; }).wineRun;
   serveArguments = [
     "serve"
     "--display"
@@ -32,7 +33,8 @@ in {
         default = "boottime";
         description = ''
           Clock behind the game's Wine QueryPerformanceCounter: boottime for
-          Wine 10.17 and later, raw for older releases.
+          Wine 10.17 and later, raw for older releases and for every Proton
+          and GE-Proton.
         '';
       };
       port = lib.mkOption {
@@ -58,7 +60,9 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ package ];
+    # tobii-linux-wine-run carries prp_bridge.exe, which only x86-64 Wine runs.
+    environment.systemPackages = [ package ]
+      ++ lib.optional pkgs.stdenv.hostPlatform.isx86_64 wineRun;
     # Runs before 73-seat-late.rules; logind grants the active local seat user
     # access. This deliberately does not grant all users write access.
     services.udev.packages = [ (pkgs.writeTextFile {

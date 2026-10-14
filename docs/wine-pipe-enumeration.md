@@ -221,20 +221,136 @@ Only 11.0 and master were built and run.
 
 ```sh
 patches/wine/apply.sh path/to/wine-source
+patches/wine/apply.sh --emit [path/to/wine-source] > tobii-pipe-listing.mypatch
 ```
 
-The script refuses trees without the named pipe root directory object (Wine
+The script picks one of three variants from the tree:
+
+| Variant | Tree | Selected when |
+| --- | --- | --- |
+| `0001-...patch` | upstream Wine 10.0 or later, wine-staging, wine-tkg | default |
+| `proton/0001-...patch` | Valve's Proton 10 and 11, GE-Proton | `dlls/ntdll/unix/file.c` has Proton's `server_query_directory_file` |
+| `proton-9.0/0001-...patch` | Proton 9 (Wine 9.0) | Proton tree without the pipe root directory object |
+
+It refuses other trees without the named pipe root directory object (Wine
 9.20 and older), drops the hunks for the three generated protocol files,
-applies the rest with `patch --fuzz=2` and runs `tools/make_requests` to
-regenerate them. Build Wine as usual afterwards. The patched ntdll and
-wineserver change the server protocol together, so both must come from the
-same build; a game runner that ships its own wineserver needs the patched one.
+applies the rest with `patch --fuzz=2`, checks that the hunks that fuzz could
+misplace landed in the right functions, and runs `tools/make_requests` to
+regenerate the protocol files. Build Wine as usual afterwards. The patched
+ntdll and wineserver change the server protocol together, so both must come
+from the same build; a game runner that ships its own wineserver needs the
+patched one.
+
+`--emit` prints the selected variant without the generated files, for build
+systems that apply user patches before running `tools/make_requests`
+themselves; wine-tkg does so for `*.mypatch` files in `wine-tkg-userpatches/`
+(`wine-tkg-scripts/prepare.sh`, user patches before `tools/make_requests`).
+
+### Proton's own pipe listing
+
+Valve's Wine already answers `NtQueryDirectoryFile` on `\Device\NamedPipe\`,
+since Proton 9 (commit 55436bd6d3, "ntdll: Partially support querying
+directory entries for '\\Device\\NamedPipe\\'",
+https://github.com/ValveSoftware/wine/commit/55436bd6d374a3f70781bd45458aff5bde6cafb5).
+It returns one name per call and only for `FileDirectoryInformation`; any
+other class gets `STATUS_NOT_SUPPORTED`. `FindFirstFileExW` asks for
+`FileBothDirectoryInformation` with several entries per call, so the listing
+still fails: `pipelist.exe` under stock GE-Proton 11-9 printed
+`FindFirstFileA failed: error 50` (`ERROR_NOT_SUPPORTED`). The Proton variants
+answer every class through the new request first and keep Valve's request as a
+fallback; Valve's own `test_pipe_directory_listing` expectations (access
+check, length check, single entries, `STATUS_NO_MORE_FILES`) hold for the new
+code as well.
+
+## Runner sources
+
+Sources were fetched on 2026-10-14 and removed after the checks; the `apply.sh`
+output is `evidence/private/wine-forks/apply-matrix.txt`. Builds ran on albedo's WSL2
+Ubuntu 24.04 with `--without-x --without-freetype`
+(`evidence/private/launch-work/`).
+
+| Runner source | Commit | Variant | `apply.sh` | Built and tested |
+| --- | --- | --- | --- | --- |
+| Wine 11.0 (nixpkgs `wineWow64Packages.stable`) | `wine-11.0` | upstream | applies, one hunk with fuzz 1 | earlier, see Results |
+| Wine 11.19 (nixpkgs `unstable`) | `wine-11.19` | upstream | applies | Nix patch phase only |
+| wine-staging 11.19 on 11.19 (nixpkgs `staging`) | staging `v11.19` | upstream | applies after all staging patchsets | Nix patch phase only |
+| LUG runner, `lug-wine` default preset, wine-tkg, Wine 11.19 | lug-wine `42f45c8e`, wine-tkg `ca3f1a3c`, LUG patches `01a904b6` | upstream, as a `.mypatch` (`--emit`) | applied by wine-tkg with the 20 LUG patches | compiled, see below |
+| Proton 11 (`proton_11.0`) | `e60892cc` | proton | applies without fuzz | yes, see below |
+| Proton 10 (`proton_10.0`) | `b8fdff8e` | proton | applies without fuzz | no |
+| GE-Proton11-9 (its Wine after `protonprep-valve-staging.sh`) | wine `981e2f0b`, staging `6cc805ea` | proton | applies without fuzz | no |
+| Proton 9 (`proton_9.0`) | `015230dc` | proton-9.0 | applies without fuzz | not completed |
+| Proton 8 (`proton_8.0`), Lutris `wine-ge-8` | | | refused (no pipe root directory, no Valve listing) | |
+| Ubuntu Wine 9.0, upstream before 9.21 | | | refused | |
+
+Builds of the patched trees (Valve's 11.0 tree with `--enable-win64
+--without-ffmpeg`; its `winedmo` does not build against Ubuntu's FFmpeg):
+
+| Build | ntdll `pipe` tests | kernel32 `pipe` tests | `pipelist.exe` | Discovery, `PRP_URL=discover` |
+| --- | --- | --- | --- | --- |
+| Proton 11 + proton variant | 2489, 0 failures (Valve's `test_pipe_directory_listing` and ours) | 38466, 0 failures | lists `TOBIIPRP-test` and 11 system pipes | game DLL: `tobii-prp://ET5-LINUX`, 97 head-pose and gaze samples per 3 s |
+
+The LUG tree (wine-tkg with the 20 LUG patches and ours as a `.mypatch`)
+applied and compiled as a 64-bit-only build, but Wine 11.19 starts programs
+through the 32-bit loader by default, so that build could not run anything; a
+build with both PE architectures was still running when the test host went
+offline. The Proton 9 build was in progress at the same time.
+
+GE-Proton and Valve's Proton were not built as complete Proton packages; their
+build system runs in Valve's SDK container. The Proton builds above are the
+patched Valve Wine trees on their own, after the steps Proton's makefile runs
+first (`make_vulkan`, `make_specfiles`, `autoreconf`).
+
+nixpkgs (`7fd4004d`): `nix/wine.nix` overrides `wineWow64Packages.{stable,
+staging,unstable}` with `postPatch = "patchShebangs tools/make_requests; bash
+.../apply.sh ."`; staging's own patches run in `prePatch`, so ours apply on
+top of them. The three derivations evaluate, and `patchedSourceCheck.*`
+(unpack and patch phases only) built for all three. A full Wine build through
+the overlay was not run.
+
+## Without a Wine patch
+
+Star Citizen uses Easy Anti-Cheat, so nothing may be loaded into or patched in
+the game process. Under that constraint:
+
+- **Stock Wine, wine-staging, wine-tkg**: nothing answers
+  `NtQueryDirectoryFile` on the pipe root (no staging patchset touches it), and
+  the call fails inside the game process (ntdll, kernelbase) on a handle whose
+  type the wineserver decides. A DLL override changes only processes that load
+  the DLL, and the listing happens in the game process, so no override outside
+  it can make the call succeed.
+- **Stock Proton and GE-Proton**: Valve's partial listing does not cover
+  `FindFirstFile` (above).
+- **Redirecting `\??\pipe`**: the symbolic link that `FindFirstFile` follows
+  is the same one `CreateFile` and `WaitNamedPipe` use for the pipes
+  themselves, so pointing it at a listable directory would break the
+  connection the listing is meant to find.
+- **A wineserver-only change**: `NtQueryDirectoryFile` lists Unix directories
+  through the descriptor `get_handle_fd` returns. A wineserver that handed out
+  a real directory mirroring the pipe names for the pipe root would be listed
+  by an unmodified ntdll, and without a protocol change such a wineserver could
+  replace the one of an existing runner of the same version. This is still a
+  Wine modification and was not tried.
+- **The TCP discovery route**: the game DLL's enumeration also connects to
+  `127.0.0.1:4455` and reports `tet-tcp://127.0.0.1` for a listener there
+  (live, stock Ubuntu Wine 9.0, both client DLLs). One connection carried a TTP
+  request, kind `0x51`, command 1000 (protocol upgrade), in the framing
+  `src/tobii_linux/ttp.py` decodes. `device_create` opens such URLs with the
+  in-process platform module instead of PRP
+  ([service-transport.md](service-transport.md#discovery)). A native TTP
+  service on that port would need no bridge and no Wine change, but whether
+  that module provides head pose for such a device, and what it asks of the
+  device, is unknown and would need its own investigation.
+- **`\\.\pipe\ETDefaultPIPE`**: the default enumeration never called it
+  (no request reached a listener on that pipe in the same run).
+
+Evidence: `evidence/private/launch-work/test-nopatch-1.txt`,
+`evidence/private/launch-work/nopatch/`.
 
 ## Limitations
 
 - Field values for instance counts follow PipeList's documented output, not a
   Windows trace; `NtQueryDirectoryFile` on `\Device\NamedPipe\` was not run on
   Windows for this work.
-- Wine 10.0, 10.20 and 11.19 were only checked for a clean apply, not built.
-- Proton and runners derived from wine-staging or wine-tkg were not tried.
+- Wine 10.0, 10.20 and 11.19 upstream were only checked for a clean apply, not
+  built; Proton 10 and GE-Proton only for a clean apply.
 - Star Citizen itself was not run; the game DLL was driven by the test client.
