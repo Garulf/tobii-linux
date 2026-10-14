@@ -9,6 +9,10 @@ Modes (JSON lines on stdout):
   restore FILE [--dry-run]                    apply FILE (1110) and check the device id
   calibrate --before B --after A [--dry-run]  back up to B, run the Tobii Experience 7-target
                                               sequence, save the result to A
+  profiles list                               list saved calibration profiles; no device access
+  profiles save NAME [--overwrite]            save the device calibration as profile NAME; reads only
+  profiles switch NAME [--dry-run]            apply profile NAME (3160, 1110) as the Tobii engine does
+                                              on a profile change; --directory picks the store
 
 calibrate shows its targets on a page served at http://localhost:PORT/ (open it
 fullscreen on the display the tracker is mounted on; under WSL a Windows
@@ -27,6 +31,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
 from tobii_linux import calibration as cal  # noqa: E402
+from tobii_linux import calibration_profiles as profiles_store  # noqa: E402
 from tobii_linux import driver  # noqa: E402
 from tobii_linux import gaze_device as gd  # noqa: E402
 
@@ -40,12 +45,20 @@ def digest(data):
 
 
 def open_session(args, stack):
-    """The startup the read-only query tool uses: upgrade, unlock_ppu, realm 0x2712 with hardware info."""
+    """The startup the read-only query tool uses: upgrade, unlock_ppu, realm 0x2712 with hardware info.
+
+With --raw-log every USB transfer is recorded (tobii_linux.traffic_log).
+"""
     from tobii_linux.usb import USBContext
     from tobii_linux.usb_channel import USBChannel
     context = stack.enter_context(USBContext())
     device = context.probe()[args.index]
     transport = stack.enter_context(context.open_transport(bus=device['bus'], address=device['address']))
+    if args.raw_log:
+        from tobii_linux.traffic_log import LoggingTransport, TrafficLog
+        log = TrafficLog(args.raw_log)
+        stack.callback(log.close)
+        transport = LoggingTransport(transport, log)
     channel = stack.enter_context(USBChannel(transport, args.channel))
     session = driver.TrackerSession(channel)
     session.initialize()
@@ -173,13 +186,36 @@ def run_and_save(session, args, calibrator, before, page):
     return 0
 
 
-MODES = {'backup': backup, 'verify': verify, 'restore': restore, 'calibrate': calibrate}
+def list_profiles(store):
+    current = store.current()
+    for name in store.names():
+        profile = store.load(name)
+        emit('profile', name=name, current=name == current, path=str(profile.path),
+             calibration_id=hex(profile.calibration.calibration_id), blob=digest(profile.calibration.blob))
+    return 0
+
+
+def profiles(session, args):
+    store = profiles_store.ProfileStore(args.directory)
+    if args.action == 'save':
+        profile = profiles_store.save_from_device(session, store, args.name, overwrite=args.overwrite)
+        emit('profile_saved', name=profile.name, path=str(profile.path),
+             calibration_id=hex(profile.calibration.calibration_id), blob=digest(profile.calibration.blob))
+        return 0
+    result = profiles_store.switch(dry_run(session, args.dry_run), store, args.name)
+    emit('profile_switch', name=result.profile, device_id_before=hex(result.device_id_before),
+         device_id_after=hex(result.device_id_after), applied=result.applied, dry_run=args.dry_run)
+    return 0
+
+
+MODES = {'backup': backup, 'verify': verify, 'restore': restore, 'calibrate': calibrate, 'profiles': profiles}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--channel', type=int, default=0)
     parser.add_argument('--index', type=int, default=0)
+    parser.add_argument('--raw-log', help='record every USB transfer in hex to this JSON lines file')
     modes = parser.add_subparsers(dest='mode', required=True)
     p = modes.add_parser('backup')
     p.add_argument('output')
@@ -202,10 +238,20 @@ def main():
     p.add_argument('--settle-s', type=float, default=0.2)
     p.add_argument('--display-timeout-s', type=float, default=120.0)
     p.add_argument('--overwrite', action='store_true')
+    p = modes.add_parser('profiles')
+    p.add_argument('action', choices=('list', 'save', 'switch'))
+    p.add_argument('name', nargs='?')
+    p.add_argument('--directory', help='profile store, default $XDG_DATA_HOME/tobii-linux/profiles')
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
     if args.mode == 'calibrate' and args.ui == 'none' and not args.dry_run:
         parser.error('calibrate without a display needs --dry-run')
+    if args.mode == 'profiles' and args.action != 'list' and not args.name:
+        parser.error(f'profiles {args.action} needs a profile name')
     try:
+        if args.mode == 'profiles' and args.action == 'list':
+            return list_profiles(profiles_store.ProfileStore(args.directory))
         with ExitStack() as stack:
             session = open_session(args, stack)
             return MODES[args.mode](session, args)

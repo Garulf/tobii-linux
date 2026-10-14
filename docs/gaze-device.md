@@ -217,8 +217,9 @@ device.
 
 None of these were sent from Linux:
 
-- 1440 `set_display_area` (the runtime sends it at every start with values the
-  device already holds).
+- 1440 `set_display_area` with new values (the runtime sends it at every start
+  with values the device already holds; Linux has since sent exactly that
+  rewrite once, see [display setup](display-setup.md)).
 - 1110 `calibration_apply` (the runtime skips it while ids match; the device
   already holds `0xbc381a37`).
 - 1010/1020 clear, all collect/compute commands, 3070/3090 persistent files,
