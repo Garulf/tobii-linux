@@ -65,6 +65,41 @@ Cancel).
 - When the screen resolution does not have the panel's aspect ratio, a box
   ("We're sorry...", Yes opens the display settings) comes before Mapping.
 
+### Moving to another monitor (`MonitorMappingModel`, `VirtualScreen`)
+
+- Which monitor first (`InitSelectedMonitor`): the only one; else the
+  persisted monitor of the tracker's last mapping, if it is still there;
+  else the primary one (`PrimaryDisplayDevice`: bounds at 0, 0). The window
+  covers that monitor's bounds.
+- The switcher: two buttons in the Done row, the left one in the first
+  column (15 px from the left edge), the right one in the last (15 px from
+  the right edge), each 134 px wide (`ChangeScreenButtonBaseStyle`) holding
+  the `Screen` monitor icon with a 42 x 84 arrow 30 units beside it (left
+  arrow before the monitor, right arrow after it), scaled to 134 x 68 px.
+  Arrow and monitor are `#AFC4CD`, white on hover; pressing moves the drawing
+  1 px down. A button is shown (`HasPreviousDisplay`, `HasNextDisplay`)
+  only when there is a monitor on that side, otherwise it is hidden but
+  keeps its place. They show on the intro and on the lines. The reference
+  capture of albedo (left portrait monitor) has the left one at x 15 to 147,
+  y 613 to 679.
+- Order (`GetPreviousDisplayDevice`, `GetNextDisplayDevice`): previous is the
+  monitor whose left edge is the nearest one left of the current monitor's
+  left edge, next the nearest one to the right; only the left edges count.
+- Clicking (`MoveToPreviousDisplay`, `MoveToNextDisplay`, `Restart`) closes
+  the window and starts the mapping again on that monitor: a new full-screen
+  window there, Loading (spinner), the aspect check, then the intro (if no
+  monitor is persisted) or the lines with their page-load animations. The
+  initial lines come from the stored mapping of that tracker and that
+  monitor (`TryGetDisplaySetupForEyeTrackerAndMonitor`), else from that
+  monitor's EDID size or 376.3 mm. Any display settings change restarts the
+  mapping the same way.
+- Done saves the area and the display id of the chosen monitor
+  (`MonitorMappingDeviceBase.WriteDisplaySetupToTracker`): its device
+  instance id, `##eId:` and EDID bytes 8 to 17 in hex, `#or:` and the
+  rotation (`MonitorRotation`: 1 normal, 2 90 degrees, 3 180, 4 270), `#v:1.0`.
+  The game's window tracking matches the part before `##`
+  ([game integration layer](game-integration-layer.md)).
+
 ### Eye positioning (`EyesPositioningViewModel`, `EyesPositioningView`)
 
 - A faint track box (white at 3 %) of golden ratio: height
@@ -131,10 +166,11 @@ PYTHONPATH=src python3 -m tobii_linux.setup [--display auto|always|never] [--no-
     [--save-display] [--dry-run] [--profile NAME] [--port 8777] [--no-browser] [--simulate mapped|unmapped]
 ```
 
-(also `tobii-linux setup`). The command starts the page server first, then
-opens the browser (on WSL Edge in kiosk mode through `cmd.exe /c start`, so
-the page fills the screen without a click; on Linux `xdg-open`), then opens
-the tracker. The page shows "Connecting to the eye tracker..." until the
+(also `tobii-linux setup`, plus `--monitor NAME`). The command starts the
+page server first, then opens the browser (on WSL Edge in kiosk mode through
+`cmd.exe /c start`, so the page fills the screen without a click; on Linux
+`xdg-open`, or a Chromium-family browser in kiosk mode when the page has to
+go on a particular monitor), then opens the tracker. The page shows "Connecting to the eye tracker..." until the
 tracker answers, so it is never blank. Steps:
 
 1. **Display setup** (`--display auto`: only when the device holds no
@@ -150,6 +186,37 @@ tracker answers, so it is never blank. Steps:
    the old area is saved to `$XDG_DATA_HOME/tobii-linux/backups/` first.
    Tobii's separate "Sit in an upright position" screen becomes a line at the
    top of the positioning screen.
+
+   **More than one monitor.** `monitors.py` reads the desktop's monitors:
+   on WSL through `powershell.exe` (screen bounds in physical pixels,
+   rotation, the monitor's device instance id from `EnumDisplayDevices` and
+   its EDID from the registry, all read only), on Linux from `xrandr --prop`
+   (output geometry, rotation, primary flag, EDID), falling back to the DRM
+   EDIDs without geometry. The setup starts on Tobii's monitor (the one of
+   `$XDG_DATA_HOME/tobii-linux/display-setup.json`, else the primary one, or
+   `--monitor`) and shows Tobii's switcher with Tobii's order rule. A page
+   cannot move itself to another monitor, so a click asks the server to open
+   the page again on that monitor: a new kiosk browser at the monitor's
+   position (`--window-position`, Edge on WSL, a Chromium-family browser on
+   Linux under X11 or XWayland), with a profile of its own per monitor and
+   `?monitor=` naming it. The old page shows a spinner until the new one
+   reports in; from then on only the new page is listened to and the old one
+   closes itself (or says that the setup continues on the other display).
+   If the new page does not report within 30 s, the setup stays where it
+   was. This needs no browser permission and works in kiosk mode; the
+   Window Management API (`getScreenDetails`, `requestFullscreen({screen})`)
+   would need a permission prompt that a kiosk window cannot show. On the
+   new monitor the lines come from the device's area only when it is the
+   monitor of the last display setup, otherwise from that monitor's EDID
+   size (rotated monitors use it rotated), and the aspect check runs as in
+   Tobii: "We're sorry..." with Yes (stop, set the native resolution first)
+   and No (go on). Without positions (Wayland without xrandr, no
+   Chromium-family browser, `--no-browser`) or with one monitor there is no
+   switcher and nothing changes. When the user confirms a display setup,
+   `display-setup.json` records the monitor, the display arguments and, on
+   WSL, Tobii's display id string; `tobii-linux setup` prints the instance
+   id for `serve --display-id`. Under Wine the monitor instance id is Wine's
+   own, which is not derived here (open question).
 2. **Eye positioning**: `eye_positioning.py` ports the calculator and the
    hint and advance rules above; the flow subscribes gaze and reads it
    continuously, the page draws the eyes 30 times a second. It advances by
@@ -185,8 +252,9 @@ once per screen and never cleared and rewritten, so nothing flickers. The
 page reports its size, the screen size and fullscreen state with every event.
 
 Differences from Tobii, all deliberate: one page instead of separate
-windows; no monitor switching (the browser window is on one display); no
-aspect-ratio warning; the display area is only written after the user
+windows (a move opens a new browser window on the other monitor); the
+aspect warning's Yes stops the setup instead of opening the display
+settings; no restart on display settings changes; the display area is only written after the user
 confirms (or `--save-display`); keyboard nudging on the display step and
 no Tobii logo; the "Good" line on the positioning screen; the restart limit;
 the previous calibration put back on cancel (Tobii's runtime restores it
@@ -206,6 +274,30 @@ start are not reproduced.
   positioning writing nothing, profile name rules, dry run; the page channel;
   the browser launch command; gaze-chosen target order and the attention
   watch).
+- Monitors: `tests/test_monitors.py` (the Windows query output with
+  albedo's instance ids and EDIDs gives exactly albedo's stored display id
+  `DISPLAY\GSM5B7F\5&5028A6B&0&UID41221##eId:1E6D7F5B0B220100061E#or:1#v:1.0`,
+  the encoded query fits a command line, xrandr parsing with rotation and
+  EDID, the DRM fallback, previous/next/initial rules, the aspect check) and
+  `MonitorTests` in `tests/test_setup_flow.py` (moving to the portrait
+  monitor estimates 336 mm from its EDID and records it, an unchanged area
+  records the display id, a page that never opens keeps the setup, one
+  monitor shows no switcher, the aspect warning). On albedo (read only, over
+  ssh): WMI and the registry list the two monitors `...UID41219` and
+  `...UID41221` with the EDIDs above, and EDID bytes 8 to 17 of `UID41221`
+  equal the `eId` in `displayinfo.setpm`. The screen bounds query needs the
+  interactive session: over ssh Windows reports only `WinDisc` 1024 x 768.
+- Two monitors in headless Chromium (`two_monitor_check.mjs` with
+  `serve_two_monitors.py`, albedo's layout, one headless browser per
+  monitor): on the primary monitor only the left switcher shows and turns
+  white on hover; it opens the page on the portrait monitor, which shows
+  only the right one; the old page gives way; back on the primary monitor
+  Done finishes. Screenshots `monitors-2560-*.png`.
+- Against Tobii (`ref/tobii-lines-2560.png`, albedo, lines put where Tobii
+  had them): tracker, lines, triangles, switcher, Done and close X match to
+  within a pixel (`alignment-compare-2560-side.png`, `-overlay.png`); the
+  remaining differences are the font (Segoe UI Light is not installed here)
+  and the Tobii logo, which is left out.
 - Headless Chromium (2026-10-14, `evidence/private/ui-fix/flow-check.mjs`
   and `failure-check.mjs` against `--simulate unmapped` and a failing
   simulated tracker, 2560 x 1440 and 1280 x 720, screenshots in

@@ -252,12 +252,18 @@ Look (XAML of `ScreenPlaneSetupControl`, `DisplaySetupLineHandleView`,
   lens, a centre mark and the two slanted guide marks whose lower ends are
   exactly where the lines start.
 - A line handle is 60 px wide in three 20 px columns: a left-pointing filled
-  white triangle (0,30 14,16 14,44) in the first column, the 1 px dashed line
-  (dash 5) at x 30, a V arrowhead (M4,0 L10,10 L16,0, 1 px) at the bottom of
-  the screen, and a right-pointing triangle (14,30 0,16 0,44) starting at
-  x 40. The triangles sit at the vertical middle of the handle. Line and V
-  are `#AFC4CD`, white while the mouse is over the handle; the triangles are
-  always white. There is no selected or dragging look.
+  white triangle (0,30 14,16 14,44), the 1 px dashed line (dash 5) in the
+  middle, a V arrowhead (M4,0 L10,10 L16,0, 1 px) at the bottom of the
+  screen, and a right-pointing triangle (14,30 0,16 0,44). On the reference
+  capture the triangles span 10 to 24 px on either side of the line with
+  their tips 7.5 px below the handle's middle (the polygons are centred as
+  45 px high shapes). Line and V are `#AFC4CD`, white while the mouse is
+  over the handle; the triangles are always white. There is no selected or
+  dragging look.
+- The close X is the title bar's 60 x 60 path stretched over a 55 px square
+  at the top right (a 27 px X, 1 px, `#AFC4CD`).
+- With more than one monitor, Tobii's monitor switcher sits left and right
+  of the Done row; see [setup flow](setup-flow.md#moving-to-another-monitor-monitormappingmodel-virtualscreen).
 - Intro: the `Screen` monitor icon (400 px wide, `#AFC4CD` body and stand,
   black screen) at the top of the canvas and the flat `EyeTracker5OnScreen`
   drawing (250 px wide) 222 px below the canvas top on its bezel. "This
@@ -357,7 +363,10 @@ networking) and waits for the user:
 - The screen is Tobii's (`setup/static/alignment.js`, shared with the setup
   page): the layout, the `EyeTracker5` and intro drawings redrawn from their
   XAML paths, the handles, colours, text, Done placement and the animations
-  listed above. Dragging works as in the app, with the same limits: pressing
+  listed above, compared with a capture of Tobii's screen on albedo
+  (`evidence/private/ui-fix/alignment-compare-2560-*.png`: tracker, lines,
+  triangles, switcher, Done and X within a pixel). Dragging works as in the
+  app, with the same limits: pressing
   near a line (the nearest one when both are close) below its top drags that
   line; pressing on the tracker drags both. The Tobii logo is left out (it is
   Tobii's mark, not ours), and a font close to Segoe UI Light is used where

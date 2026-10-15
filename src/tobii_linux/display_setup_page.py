@@ -43,12 +43,12 @@ PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Eye tracker display setup</title>
 <style>
 html,body{margin:0;height:100%;background:#021419;overflow:hidden}
-#close{position:absolute;top:0;right:0;z-index:10;width:35px;height:30px;padding:5px 5px 0 0;border:0;
+#close{position:absolute;top:0;right:0;z-index:10;width:55px;height:55px;padding:0;border:0;
 background:transparent;color:#afc4cd;cursor:pointer}
 #close:hover{color:#fff}
 </style></head>
-<body tabindex="-1"><button id="close" title="Cancel (Esc)" aria-label="Cancel"><svg viewBox="0 0 60 60" width="25" height="25">
-<path d="M15,15 L45,45 M15,45 L45,15" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+<body tabindex="-1"><button id="close" title="Cancel (Esc)" aria-label="Cancel"><svg viewBox="0 0 60 60" width="55" height="55">
+<path d="M15,15 L45,45 M15,45 L45,15" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg></button>
 <script src="/alignment.js"></script>
 <script>
 const auto = location.pathname === '/auto';

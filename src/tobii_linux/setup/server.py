@@ -57,10 +57,13 @@ class PageChannel:
         self.view = None
         self.last_contact = None
         self.cancel_requested = False
+        self.monitor = None
+        self.page_monitor = None
 
     def show(self, name, **data):
         with self.condition:
-            self.screen = {'seq': self.screen['seq'] + 1, 'name': name, **data}
+            placed = {'monitor': self.monitor} if self.monitor else {}
+            self.screen = {'seq': self.screen['seq'] + 1, 'name': name, **placed, **data}
             self.actions.clear()
             self.condition.notify_all()
             return self.screen['seq']
@@ -79,10 +82,24 @@ class PageChannel:
         with self.condition:
             self.cancel_requested = False
 
-    def page_event(self, event):
-        """An acknowledgement or action from the page; returns False for one made on an older screen."""
+    def follow_monitor(self, key):
+        """Accept events only from pages opened for monitor `key` (None: from any page)."""
         with self.condition:
+            self.monitor = key
+            self.page_monitor = None
+
+    def page_event(self, event):
+        """An acknowledgement or action from the page; returns False for one made on an older screen.
+
+Once the setup moved to another monitor, events from a page opened for a
+different monitor (or for none) are ignored; that page closes itself when it
+sees a screen placed on another monitor.
+"""
+        with self.condition:
+            if self.monitor and event.get('monitor') != self.monitor:
+                return False
             self.last_contact = self.clock()
+            self.page_monitor = event.get('monitor')
             if isinstance(event.get('view'), dict):
                 self.view = event['view']
             seq = event.get('seq')

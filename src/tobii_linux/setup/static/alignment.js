@@ -43,6 +43,9 @@ const TrackerAlignment = (() => {
     stand: 'M64.2 84.8v14.9c0 0.7-0.5 1.3-1.2 1.3l-23.7 1.8c-0.4 0-0.7 0.4-0.7 0.7v3.3c0 0.4 0.3 0.7 0.7 0.7c0 0 31.4 0.4 32.5 0.4s32.5-0.4 32.5-0.4c0.4 0 0.7-0.3 0.7-0.7v-3.3c0-0.4-0.3-0.7-0.7-0.7l-23.7-1.8c-0.7-0.1-1.2-0.6-1.2-1.3V84.8H64.2z',
     screen: [7.3, 7.6, 128.9, 72.5]};
   const INTRO_MONITOR_WIDTH = 400, INTRO_TRACKER_TOP = 222, INTRO_TRACKER_WIDTH = 250;
+  // The previous/next monitor buttons: Screen.xaml with its 42 x 84 arrow 30 units beside the monitor, in a
+  // Viewbox 134 px wide (ChangeScreenButtonBaseStyle), 15 px from the screen edge, centred on the Done row.
+  const SWITCHER = {width: 134, margin: 15, content: [42 + 30 + MONITOR.width, MONITOR.height]};
 
   const STYLE = `
     .tracker-alignment { position: absolute; inset: 0; background: ${COLOURS.background}; overflow: hidden;
@@ -62,7 +65,24 @@ const TrackerAlignment = (() => {
     .tracker-alignment button:disabled { background: ${COLOURS.disabled}; color: ${COLOURS.disabledText};
       cursor: default; transform: scale(0.95); }
     .tracker-alignment .ta-done { margin-right: 60px; }
+    .tracker-alignment .ta-switch { position: absolute; width: ${SWITCHER.width}px; min-width: 0; min-height: 0;
+      padding: 0; border-radius: 0; background: transparent; color: ${COLOURS.foreground}; transform: none; }
+    .tracker-alignment .ta-switch:hover { background: transparent; color: ${COLOURS.highlight}; transform: none; }
+    .tracker-alignment .ta-switch:active { background: transparent; transform: translateY(1px); }
+    .tracker-alignment .ta-switch:disabled { background: transparent; color: ${COLOURS.foreground}; transform: none; }
+    .tracker-alignment .ta-switch svg { display: block; width: 100%; height: auto; }
   `;
+
+  function switcherIcon(side) {
+    const [width, height] = SWITCHER.content, monitorX = side === 'previous' ? 72 : 0;
+    const arrow = side === 'previous' ? '0,42 42,0 42,84' : '173,0 215,42 173,84';
+    const [sx, sy, sw, sh] = MONITOR.screen;
+    return `<svg viewBox="0 0 ${width} ${height}" aria-hidden="true">
+      <polygon points="${arrow}" fill="currentColor" stroke="currentColor" stroke-width="1"/>
+      <g transform="translate(${monitorX} 0)"><path d="${MONITOR.body}" fill="currentColor"/>
+        <rect x="${sx}" y="${sy}" width="${sw}" height="${sh}" fill="${COLOURS.screenBlack}"/>
+        <path d="${MONITOR.stand}" fill="currentColor"/></g></svg>`;
+  }
 
   function easeQuadraticInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
 
@@ -92,7 +112,7 @@ const TrackerAlignment = (() => {
   }
 
   class TrackerAlignment {
-    /* options: onDone(left, right), onThisDisplay(), canFinish() -> bool (Done enabled) */
+    /* options: onDone(left, right), onThisDisplay(), onMove('previous' | 'next'), canFinish() -> bool */
     constructor(container, options = {}) {
       addStyle();
       this.options = options;
@@ -103,7 +123,16 @@ const TrackerAlignment = (() => {
       this.thisDisplayButton = element('button', 'ta-this-display', TEXTS.thisDisplay);
       this.doneButton = element('button', 'ta-done', TEXTS.done);
       this.buttons.append(this.thisDisplayButton, this.doneButton);
-      this.root.append(this.canvas, this.text, this.buttons);
+      this.switchers = {};
+      for (const [side, label] of [['previous', 'Left monitor'], ['next', 'Right monitor']]) {
+        const button = element('button', 'ta-switch');
+        button.innerHTML = switcherIcon(side);
+        button.setAttribute('aria-label', label);
+        button.style.visibility = 'hidden';
+        button.addEventListener('click', () => this.switchMonitor(side));
+        this.switchers[side] = button;
+      }
+      this.root.append(this.canvas, this.text, this.buttons, this.switchers.previous, this.switchers.next);
       container.appendChild(this.root);
       this.paths = new Map();
       this.config = null;
@@ -134,6 +163,24 @@ const TrackerAlignment = (() => {
       Object.assign(this.text.style, {top: rows[1].top + 'px', height: rows[1].height + 'px'});
       Object.assign(this.buttons.style, {top: rows[2].top + 'px', height: rows[2].height + 'px',
                                          left: w / 5 + 'px', width: w * 3 / 5 + 'px'});
+      const height = SWITCHER.width * SWITCHER.content[1] / SWITCHER.content[0];
+      const top = rows[2].top + (rows[2].height - height) / 2 + 'px';
+      Object.assign(this.switchers.previous.style, {top: top, left: SWITCHER.margin + 'px'});
+      Object.assign(this.switchers.next.style, {top: top, right: SWITCHER.margin + 'px'});
+    }
+
+    /* Tobii shows the arrows (hidden, not collapsed) only when there is a monitor on that side. */
+    showSwitchers(config) {
+      for (const side of ['previous', 'next']) {
+        this.switchers[side].style.visibility = config[side] ? 'visible' : 'hidden';
+        this.switchers[side].disabled = false;
+      }
+    }
+
+    switchMonitor(side) {
+      if (!this.config || !this.config[side] || !this.options.onMove) return;
+      for (const button of Object.values(this.switchers)) button.disabled = true;
+      this.options.onMove(side);
     }
 
     show(config) {
@@ -141,6 +188,7 @@ const TrackerAlignment = (() => {
       this.left = config.left; this.right = config.right;
       this.hover = null; this.drag = null; this.keyboardLine = null; this.trackerTop = null;
       this.layout();
+      this.showSwitchers(config);
       this.text.replaceChildren();
       if (config.intro) {
         this.state = 'intro';
@@ -205,6 +253,7 @@ const TrackerAlignment = (() => {
     setText(lines) {
       this.text.replaceChildren(...lines.filter(Boolean).map((line, i) => element('p', i ? 'ta-headline' : 'ta-explaining', line)));
       this.buttons.hidden = true;
+      for (const button of Object.values(this.switchers)) button.style.visibility = 'hidden';
     }
 
     // Geometry --------------------------------------------------------------------------------------
@@ -330,7 +379,9 @@ const TrackerAlignment = (() => {
     }
 
     drawHandle(ctx, side, lineTop) {
-      const x = Math.round(this[side] * window.innerWidth) + 0.5, h = window.innerHeight, middle = (lineTop + h) / 2;
+      // The triangles' polygons (y 16 to 44, tip at 30, 1 px outline) are centred in the handle as 45 high, so
+      // their tips sit 7.5 px below its middle; on screen they span 10 to 24 px from the line (reference capture).
+      const x = Math.round(this[side] * window.innerWidth) + 0.5, h = window.innerHeight, middle = (lineTop + h) / 2 + 7.5;
       const active = this.hover === side || this.keyboardLine === side || (this.drag && this.drag.kind === side && this.hover === side);
       const colour = active ? COLOURS.highlight : COLOURS.foreground;
       ctx.strokeStyle = colour; ctx.lineWidth = 1;
@@ -339,9 +390,8 @@ const TrackerAlignment = (() => {
       ctx.setLineDash([]);
       ctx.beginPath(); ctx.moveTo(x - 6, h - 10); ctx.lineTo(x, h); ctx.lineTo(x + 6, h - 10); ctx.stroke();
       ctx.fillStyle = COLOURS.highlight; ctx.strokeStyle = COLOURS.highlight;
-      const left = x - 30, right = x + 10;
-      for (const points of [[[left, middle], [left + 14, middle - 14], [left + 14, middle + 14]],
-                            [[right + 14, middle], [right, middle - 14], [right, middle + 14]]]) {
+      for (const points of [[[x - 24, middle], [x - 10, middle - 14], [x - 10, middle + 14]],
+                            [[x + 24, middle], [x + 10, middle - 14], [x + 10, middle + 14]]]) {
         ctx.beginPath(); ctx.moveTo(...points[0]); ctx.lineTo(...points[1]); ctx.lineTo(...points[2]); ctx.closePath();
         ctx.fill(); ctx.stroke();
       }

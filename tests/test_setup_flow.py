@@ -32,8 +32,9 @@ function of the screen returning one), and looks at the first calibration
 target on screen that has not exploded yet.
 """
 
-    def __init__(self, channel, answers=None, view=FULLSCREEN_VIEW):
+    def __init__(self, channel, answers=None, view=FULLSCREEN_VIEW, monitor=None):
         super().__init__(daemon=True)
+        self.monitor = monitor
         self.channel = channel
         self.answers = {'positioning': {'action': 'continue'}, **(answers or {})}
         self.view = view
@@ -55,19 +56,21 @@ target on screen that has not exploded yet.
 
     def run(self):
         last = None
-        self.channel.page_event({'seq': -1, 'view': self.view})
+        self.channel.page_event({'seq': -1, 'view': self.view, 'monitor': self.monitor})
         while not self.stopped.is_set():
             screen = self.channel.snapshot()
+            if screen.get('monitor') and screen['monitor'] != self.monitor:
+                return
             if screen['seq'] != last:
                 last = screen['seq']
                 self.seen.append((screen['name'], screen.get('phase')))
                 if screen['name'] == 'calibration':
                     self.follow_targets(screen)
-                self.channel.page_event({'seq': last, 'ack': True, 'view': self.view})
+                self.channel.page_event({'seq': last, 'ack': True, 'view': self.view, 'monitor': self.monitor})
                 answer = self.answers.get(screen['name'])
                 event = answer(screen) if callable(answer) else answer
                 if event:
-                    self.channel.page_event({'seq': last, 'view': self.view, **event})
+                    self.channel.page_event({'seq': last, 'view': self.view, 'monitor': self.monitor, **event})
             time.sleep(0.005)
 
     def names(self):
@@ -79,16 +82,18 @@ def done_with(left_delta=0.0):
 
 
 class FlowHarness:
-    def __init__(self, test, tracker=None, answers=None, **options):
+    def __init__(self, test, tracker=None, answers=None, desktop=None, **options):
         self.tracker = tracker or SimulatedTracker(user=SimulatedUser(seated_after_s=0.2), **FAST)
         self.channel = PageChannel()
         directory = Path(tempfile.mkdtemp())
         test.addCleanup(lambda: [p.unlink() for p in directory.rglob('*') if p.is_file()])
         self.profiles = directory/'profiles'
         self.reports = []
+        self.record = directory/'display-setup.json'
         self.options = setup_flow.SetupOptions(profiles_directory=self.profiles, backups_directory=directory/'backups',
-                                               **options)
-        self.page = ScriptedPage(self.channel, answers)
+                                               display_record=self.record, **options)
+        self.desktop = desktop
+        self.page = ScriptedPage(self.channel, answers, monitor=desktop.current.key if desktop else None)
         self.tracker.looking_at = self.page.looking_at
 
     @contextmanager
@@ -98,7 +103,8 @@ class FlowHarness:
     def run(self):
         self.page.start()
         flow = setup_flow.SetupFlow(self.channel, self.session, self.options,
-                                    report=lambda kind, **values: self.reports.append((kind, values)))
+                                    report=lambda kind, **values: self.reports.append((kind, values)),
+                                    desktop=self.desktop)
         try:
             outcome = flow.run()
             self.channel.wait_ack(self.channel.screen['seq'], 2)
@@ -244,6 +250,91 @@ class FlowTests(unittest.TestCase):
                   GazeCommand.CALIBRATION_APPLY}
         self.assertFalse(writes & set(harness.commands()))
         self.assertEqual(setup_flow.profiles.ProfileStore(harness.profiles).names(), [])
+
+
+class MonitorTests(unittest.TestCase):
+    def albedo(self):
+        from test_monitors import WINDOWS_OUTPUT
+        from tobii_linux import monitors
+        primary, portrait = monitors.parse_windows_monitors(WINDOWS_OUTPUT)
+        return primary, portrait
+
+    def test_previous_moves_the_page_to_the_portrait_monitor_and_records_it(self):
+        primary, portrait = self.albedo()
+        opened = []
+        pages = []
+
+        def open_on(monitor):
+            opened.append(monitor.key)
+            page = ScriptedPage(harness.channel, {'display': done_with(), 'display-save': {'action': 'save'}},
+                                view={**FULLSCREEN_VIEW, 'width': 1440, 'height': 2560, 'screen_width': 1440,
+                                      'screen_height': 2560, 'screen_px': [1440, 2560]}, monitor=monitor.key)
+            pages.append(page)
+            page.start()
+            return True
+        desktop = setup_flow.Desktop([portrait, primary], primary, open_on)
+        harness = FlowHarness(self, answers={'display': {'action': 'previous'}}, desktop=desktop,
+                              display='always', calibrate=False)
+        self.addCleanup(lambda: [page.stopped.set() for page in pages])
+        displays = []
+        harness.page.answers['display'] = lambda screen: displays.append(screen) or {'action': 'previous'}
+        outcome = harness.run()
+        self.assertEqual(opened, [portrait.key])
+        self.assertTrue(displays[0]['previous'])
+        self.assertFalse(displays[0]['next'])
+        self.assertEqual(len(displays), 1)
+        self.assertEqual(outcome.status, 'finished')
+        self.assertIn(GazeCommand.SET_DISPLAY_AREA, harness.commands())
+        record = json.loads(harness.record.read_text())
+        self.assertEqual(record['monitor']['key'], portrait.key)
+        self.assertEqual(record['display_id'], portrait.display_id)
+        size = [r for kind, r in harness.reports if kind == 'display_confirmed'][0]['size_mm']
+        self.assertAlmostEqual(size[0], 336.0, places=3)
+
+    def test_unchanged_area_on_the_mapped_monitor_records_its_display_id(self):
+        primary, portrait = self.albedo()
+        desktop = setup_flow.Desktop([portrait, primary], primary, lambda monitor: True)
+        harness = FlowHarness(self, answers={'display': done_with()}, desktop=desktop, display='always',
+                              calibrate=False)
+        outcome = harness.run()
+        self.assertNotIn(GazeCommand.SET_DISPLAY_AREA, harness.commands())
+        self.assertEqual(outcome.monitor['display_id'], 'DISPLAY\\GSM5B7F\\5&5028A6B&0&UID41221##eId:'
+                                                       '1E6D7F5B0B220100061E#or:1#v:1.0')
+
+    def test_a_page_that_never_opens_keeps_the_setup_where_it_was(self):
+        primary, portrait = self.albedo()
+        desktop = setup_flow.Desktop([portrait, primary], primary, lambda monitor: False)
+        answers = iter([{'action': 'previous'}, None])
+        displays = []
+
+        def display(screen):
+            displays.append(screen)
+            return next(answers) or done_with()(screen)
+        harness = FlowHarness(self, answers={'display': display}, desktop=desktop, display='always', calibrate=False)
+        outcome = harness.run()
+        self.assertEqual(outcome.status, 'finished')
+        self.assertEqual(len(displays), 2)
+        self.assertEqual(outcome.monitor['key'], primary.key)
+
+    def test_a_single_monitor_shows_no_switcher(self):
+        primary, _ = self.albedo()
+        displays = []
+        harness = FlowHarness(self, answers={'display': lambda s: displays.append(s) or done_with()(s)},
+                              desktop=setup_flow.Desktop([primary], primary, lambda monitor: True),
+                              display='always', calibrate=False)
+        harness.run()
+        self.assertEqual((displays[0]['previous'], displays[0]['next']), (False, False))
+
+    def test_aspect_warning_yes_stops_the_setup(self):
+        primary, _ = self.albedo()
+        harness = FlowHarness(self, answers={'aspect-warning': {'action': 'yes'}},
+                              desktop=setup_flow.Desktop([primary], primary), display='always', calibrate=False)
+        harness.page.view = {**FULLSCREEN_VIEW, 'screen_px': [1280, 1024]}
+        outcome = harness.run()
+        self.assertEqual(outcome.status, 'cancelled')
+        self.assertIn('aspect-warning', harness.page.names())
+        self.assertNotIn('display', harness.page.names())
+        self.assertEqual(harness.channel.screen['title'], 'Change the screen resolution first')
 
 
 class ProfileNameTests(unittest.TestCase):

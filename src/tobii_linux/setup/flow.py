@@ -26,13 +26,16 @@ subscribed it never pauses reading (see docs/gaze-calibration.md).
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import getpass
+import json
 import logging
 from pathlib import Path
 import time
+from typing import Callable
 
 from .. import calibration as cal
 from .. import calibration_profiles as profiles
 from .. import display_setup as ds
+from .. import monitors as desktop_monitors
 from ..eye_positioning import PositioningGuide, guide_sample
 from ..gaze import gaze_message
 from ..display_setup_page import valid_lines
@@ -41,6 +44,8 @@ from ..ttp_commands import (STREAM_DATA_KIND, Command, Stream, subscribe_stream,
 from .server import Cancelled, PageGone
 
 ACK_TIMEOUT_S = 15.0
+MOVE_TIMEOUT_S = 30.0
+DISPLAY_RECORD = 'display-setup.json'
 PAGE_FIRST_SEEN_TIMEOUT_S = 180.0
 READ_SLICE_MS = 100
 PROFILE_NAME_LENGTH = 15
@@ -60,6 +65,25 @@ class SetupOptions:
     profiles_directory: Path | None = None
     backups_directory: Path | None = None
     size_hint_mm: tuple | None = None
+    display_record: Path | None = None
+
+
+@dataclass
+class Desktop:
+    """The monitors the page can be on, the one it is on, and `open_on(monitor)` to show it on another.
+
+Without `open_on`, or with fewer than two monitors with known positions,
+the setup stays on the monitor it started on and shows no monitor switcher.
+"""
+    monitors: list = field(default_factory=list)
+    current: object = None
+    open_on: Callable | None = None
+
+    def neighbour(self, direction):
+        if self.open_on is None:
+            return None
+        pick = desktop_monitors.previous_monitor if direction == 'previous' else desktop_monitors.next_monitor
+        return pick(self.monitors, self.current)
 
 
 @dataclass
@@ -70,10 +94,35 @@ class SetupOutcome:
     profile: str | None = None
     backups: list = field(default_factory=list)
     message: str = ''
+    monitor: dict | None = None
 
 
 def default_backups_directory():
     return profiles.default_directory().parent/'backups'
+
+
+def default_display_record():
+    return profiles.default_directory().parent/DISPLAY_RECORD
+
+
+def load_display_record(path):
+    """The monitor and display area of the last display setup, or {}."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_display_record(path, monitor, area):
+    """Host-side note of where the display setup was made: the monitor (and its display id) and the area."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {'monitor': monitor.record() if monitor else None, 'display_args': list(area.floats),
+              'display_id': monitor.display_id if monitor else None, 'saved': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    temporary = path.with_name(path.name + '.partial')
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    temporary.replace(path)
+    return record
 
 
 def profile_name_problem(name, existing):
@@ -105,6 +154,10 @@ def suggested_profile_name(existing):
 def read_device_messages(session, timeout_ms=READ_SLICE_MS):
     data = session.read(timeout_ms)
     return session.decoder.feed(data) if data else []
+
+
+class ScreenSettingsWanted(RuntimeError):
+    """The user wants to change the screen resolution first (the aspect ratio warning's Yes)."""
 
 
 class PageCalibrationUI(cal.CalibrationUI):
@@ -145,8 +198,9 @@ class PageCalibrationUI(cal.CalibrationUI):
 class SetupFlow:
     """Runs the steps against one tracker session; `open_session()` is a context manager yielding it."""
 
-    def __init__(self, channel, open_session, options=None, report=None, clock=time.monotonic):
+    def __init__(self, channel, open_session, options=None, report=None, clock=time.monotonic, desktop=None):
         self.channel = channel
+        self.desktop = desktop or Desktop()
         self.open_session = open_session
         self.options = options or SetupOptions()
         self.report = report or (lambda kind, **values: None)
@@ -154,6 +208,7 @@ class SetupFlow:
         self.outcome = SetupOutcome()
         self.store = profiles.ProfileStore(self.options.profiles_directory)
         self.backups = Path(self.options.backups_directory or default_backups_directory())
+        self.display_record = Path(self.options.display_record or default_display_record())
         self.session = None
         self.device = None
         self.calibration_before = None
@@ -167,6 +222,9 @@ class SetupFlow:
                 self._steps()
         except Cancelled:
             self._finish_cancelled()
+        except ScreenSettingsWanted:
+            self._finish_cancelled(title='Change the screen resolution first',
+                                   text='Set this screen to its native resolution, then run the setup again.')
         except PageGone as gone:
             self._finish_cancelled(str(gone))
         except Exception as error:
@@ -207,27 +265,81 @@ class SetupFlow:
         size = (area.width_mm, area.height_mm)
         return f'Screen {size[0]:.0f} x {size[1]:.0f} mm ({(size[0] ** 2 + size[1] ** 2) ** 0.5 / 25.4:.1f} in)'
 
+    def _mapped_here(self, area):
+        """Whether the device's area belongs to the current monitor (Tobii keeps one mapping per monitor)."""
+        if not ds.is_mapped(area):
+            return False
+        current = self.desktop.current
+        recorded = (load_display_record(self.display_record).get('monitor') or {}).get('key')
+        return current is None or recorded is None or recorded == current.key
+
+    def _size_hint(self):
+        if self.options.size_hint_mm:
+            return self.options.size_hint_mm
+        return self.desktop.current.size_mm if self.desktop.current else None
+
+    def _check_aspect(self):
+        """CheckResolutionAndWarnIfNotNative, before the lines: Yes stops the setup, No goes on."""
+        monitor = self.desktop.current
+        if monitor is None or desktop_monitors.has_recommended_aspect(monitor, self._screen_px()):
+            return
+        self.channel.show('aspect-warning')
+        if self.channel.wait_action(('yes', 'no'))['action'] == 'yes':
+            raise ScreenSettingsWanted()
+
+    def _move(self, direction):
+        """Show the setup on the previous or next monitor; False when the page did not open there."""
+        target = self.desktop.neighbour(direction)
+        if target is None:
+            return False
+        previous_filter = self.channel.monitor
+        self.report('move_monitor', direction=direction, to=target.key)
+        self.channel.show('moving', to=target.key)
+        self.channel.follow_monitor(target.key)
+        try:
+            if not self.desktop.open_on(target):
+                raise TimeoutError('no browser to open on that monitor')
+            self.channel.wait_action((), MOVE_TIMEOUT_S, ready=lambda: self.channel.page_monitor == target.key)
+        except TimeoutError as error:
+            self.report('move_failed', to=target.key, error=str(error))
+            self.channel.follow_monitor(previous_filter)
+            return False
+        self.desktop.current = target
+        return True
+
     def _display_step(self, area, mounting):
-        mapped = ds.is_mapped(area)
-        lines = ds.initial_lines(mounting, area if mapped else None, self.options.size_hint_mm, self._screen_px())
-        self.report('initial_lines', left=lines.left, right=lines.right, source=lines.source)
-        left, right, intro = lines.left, lines.right, not mapped
         while True:
-            self.channel.show('display', intro=intro, left=left, right=right, aspect=lines.aspect,
-                              tracker_width_mm=mounting.width_mm, picture_proportion=ds.picture_proportion(mounting),
-                              instructions=ds.line_instructions(mounting))
-            event = self.channel.wait_action(('done',))
-            left, right = ds.clamp_lines(float(event.get('left', left)), float(event.get('right', right)))
-            if valid_lines(left, right) and self.channel.fullscreen:
-                break
-            intro = False
+            self._check_aspect()
+            mapped_here = self._mapped_here(area)
+            lines = ds.initial_lines(mounting, area if mapped_here else None, self._size_hint(), self._screen_px())
+            self.report('initial_lines', left=lines.left, right=lines.right, source=lines.source,
+                        monitor=self.desktop.current.key if self.desktop.current else None)
+            left, right, intro = lines.left, lines.right, not ds.is_mapped(area)
+            while True:
+                self.channel.show('display', intro=intro, left=left, right=right, aspect=lines.aspect,
+                                  tracker_width_mm=mounting.width_mm, picture_proportion=ds.picture_proportion(mounting),
+                                  instructions=ds.line_instructions(mounting),
+                                  previous=self.desktop.neighbour('previous') is not None,
+                                  next=self.desktop.neighbour('next') is not None)
+                event = self.channel.wait_action(('done', 'previous', 'next'))
+                if event['action'] != 'done':
+                    if self._move(event['action']):
+                        break
+                    continue
+                left, right = ds.clamp_lines(float(event.get('left', left)), float(event.get('right', right)))
+                if valid_lines(left, right) and self.channel.fullscreen:
+                    return self._confirm_display(area, mounting, lines, left, right, mapped_here)
+                intro = False
+
+    def _confirm_display(self, area, mounting, lines, left, right, mapped_here):
         size, offset, wanted = ds.area_from_lines(left, right, lines.aspect, mounting)
         self.report('display_confirmed', left=left, right=right, size_mm=list(size), tracker_offset_mm=offset)
-        if mapped and wanted.almost_equals(area):
+        if mapped_here and wanted.almost_equals(area):
+            self._record_display(area)
             return area
         if not self.options.save_display_without_asking:
             self.channel.show('display-save', summary=self._display_summary(wanted),
-                              offset_mm=round(offset, 1), first=not mapped)
+                              offset_mm=round(offset, 1), first=not ds.is_mapped(area))
             if self.channel.wait_action(('save', 'skip'))['action'] == 'skip':
                 return area
         self.channel.show('busy', title='Saving the display setup...')
@@ -235,7 +347,17 @@ class SetupFlow:
         stored = ds.apply_display_area(self.device, wanted)
         self.outcome.display_written = not self.options.dry_run
         self.report('display_written', dry_run=self.options.dry_run, stored_matches=stored.almost_equals(wanted))
-        return wanted if self.options.dry_run else stored
+        if self.options.dry_run:
+            return wanted
+        self._record_display(stored)
+        return stored
+
+    def _record_display(self, area):
+        if self.options.dry_run:
+            return
+        record = save_display_record(self.display_record, self.desktop.current, area)
+        self.outcome.monitor = record['monitor']
+        self.report('display_record', path=str(self.display_record), display_id=record['display_id'])
 
     def _backup_display_area(self, area):
         if not ds.is_mapped(area):
@@ -346,18 +468,19 @@ class SetupFlow:
         self.outcome.message = title
         self.channel.show('finished', title=title, text=text)
 
-    def _finish_cancelled(self, reason=''):
+    def _finish_cancelled(self, reason='', title='Setup cancelled', text=None):
         self.channel.clear_cancel()
         restored = self._safely(self._restore_calibration)
         self.outcome.status = 'cancelled'
-        self.outcome.message = reason or 'Cancelled'
+        self.outcome.message = reason or title
+        self.channel.show('cancelled', title=title, text=text or self._what_was_kept(restored))
+
+    def _what_was_kept(self, restored):
         if restored:
-            text = 'Your previous calibration is back.'
-        elif self.outcome.display_written:
-            text = 'The new display setup was kept.'
-        else:
-            text = 'Nothing was changed.'
-        self.channel.show('cancelled', title='Setup cancelled', text=text)
+            return 'Your previous calibration is back.'
+        if self.outcome.display_written:
+            return 'The new display setup was kept.'
+        return 'Nothing was changed.'
 
     def _fail(self, error):
         restored = self._safely(self._restore_calibration)

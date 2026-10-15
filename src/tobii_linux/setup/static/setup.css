@@ -61,10 +61,11 @@ button:disabled, button:disabled:hover { background: #2b3940; color: #637279; cu
 
 .close {
   position: absolute; top: 0; right: 0; z-index: 10;
-  min-width: 0; min-height: 0; width: 35px; height: 30px; padding: 5px 5px 0 0;
+  min-width: 0; min-height: 0; width: 55px; height: 55px; padding: 0;
   background: transparent; color: var(--foreground); border-radius: 0;
 }
 .close:hover { background: transparent; color: #fff; }
+.close svg { display: block; }
 
 .banner {
   position: absolute; top: 0; left: 0; right: 0; z-index: 9;
@@ -81,6 +82,17 @@ button:disabled, button:disabled:hover { background: #2b3940; color: #637279; cu
 @keyframes spinner-fade { 0% { opacity: 1; } 75%, 100% { opacity: .1; } }
 
 #display-save .subtext { margin-top: 1.2em; }
+
+/* CustomMessageBoxWindow: the aspect ratio warning. */
+.message-box { position: relative; min-width: 154px; max-width: 470px; padding: 15px 15px 20px 30px;
+               background: var(--background); border: 1px solid rgba(29, 76, 95, .3); }
+.box-close { position: absolute; top: 6px; right: 6px; min-width: 0; min-height: 0; width: 15px; height: 15px;
+             padding: 0; background: transparent; color: #fff; font-size: 12px; border-radius: 0; }
+.box-close:hover { background: transparent; }
+.box-title { font-size: 21.3px; color: var(--headline); margin: 15px 0 10px; }
+.box-body { font-size: 16px; color: var(--text); max-width: 500px; line-height: 1.4; margin-right: 15px; }
+.box-buttons { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; padding-top: 15px;
+               border-top: 1px solid rgba(29, 76, 95, .3); }
 
 /* Eye positioning: a faint track box of golden ratio in the middle, the eyes as circles inside it. */
 #positioning-upright { position: absolute; top: 9%; left: 0; right: 0; text-align: center; }

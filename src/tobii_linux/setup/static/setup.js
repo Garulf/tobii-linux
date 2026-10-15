@@ -4,14 +4,19 @@
 
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 30;
-const SECTIONS = {connecting: 'connecting', busy: 'busy', display: 'display', 'display-save': 'display-save',
+const SECTIONS = {connecting: 'connecting', busy: 'busy', moving: 'busy', display: 'display', 'display-save': 'display-save',
+                  'aspect-warning': 'aspect-warning', elsewhere: 'finished',
                   positioning: 'positioning', calibration: 'calibration', 'calibration-failed': 'calibration-failed',
                   profile: 'profile', finished: 'finished', cancelled: 'finished', error: 'finished'};
-const NOT_CANCELLABLE = new Set(['finished', 'cancelled', 'error']);
+const NOT_CANCELLABLE = new Set(['finished', 'cancelled', 'error', 'elsewhere']);
 const NEEDS_FULLSCREEN = new Set(['display', 'positioning', 'calibration']);
+
+// The monitor this page was opened for (?monitor=KEY) when the setup can move between monitors.
+const MY_MONITOR = new URLSearchParams(location.search).get('monitor');
 
 let current = {seq: -1, name: null};
 let live = {};
+let retired = false;
 
 // Page state and the server ------------------------------------------------------------------
 
@@ -29,7 +34,7 @@ function viewReport() {
 
 async function send(event) {
   try {
-    await fetch('/event', {method: 'POST', body: JSON.stringify({...event, view: viewReport()})});
+    await fetch('/event', {method: 'POST', body: JSON.stringify({...event, monitor: MY_MONITOR, view: viewReport()})});
   } catch (error) { /* the next poll shows whether the server is still there */ }
 }
 
@@ -90,11 +95,15 @@ const alignment = new TrackerAlignment($('display'), {
   canFinish: fullscreen,
   onDone: (left, right) => act('done', {left: left, right: right}),
   onThisDisplay: enterFullscreen,
+  onMove: (direction) => act(direction),
 });
 
 window.addEventListener('mousemove', () => { if (current.name === 'positioning') updateCursor(); });
 $('display-save-yes').addEventListener('click', () => act('save'));
 $('display-save-no').addEventListener('click', () => act('skip'));
+$('aspect-yes').addEventListener('click', () => act('yes'));
+$('aspect-no').addEventListener('click', () => act('no'));
+$('aspect-close').addEventListener('click', () => act('no'));
 
 // Eye positioning -----------------------------------------------------------------------------
 
@@ -316,6 +325,8 @@ $('close').addEventListener('click', (event) => { event.stopPropagation(); act('
 const RENDERERS = {
   connecting: (s) => ack(s.seq),
   busy: (s) => { setText('busy-title', s.title || ''); ack(s.seq); },
+  moving: (s) => { setText('busy-title', ''); ack(s.seq); },
+  'aspect-warning': (s) => { $('aspect-yes').focus(); ack(s.seq); },
   display: (s) => { alignment.show(s); ack(s.seq); },
   'display-save': (s) => { setText('display-save-summary', s.summary || ''); $('display-save-yes').focus(); ack(s.seq); },
   positioning: renderPositioning,
@@ -327,7 +338,19 @@ const RENDERERS = {
   error: (s) => { renderEnd(s); ack(s.seq); },
 };
 
+// Tobii closes the setup window and opens it again on the chosen monitor; here the page opened for the
+// other monitor takes over, and this one closes once the flow shows a screen placed there.
+function retire() {
+  retired = true;
+  showSection('elsewhere');
+  setText('finished-title', 'The setup continues on the other display.');
+  setText('finished-text', '');
+  $('finished-close').hidden = true;
+  window.close();
+}
+
 function render(screenState, previous) {
+  if (screenState.monitor && screenState.monitor !== MY_MONITOR) { retire(); return; }
   if (screenState.name !== previous.name) showSection(screenState.name);
   updateCursor();
   const renderer = RENDERERS[screenState.name];
@@ -343,6 +366,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key !== 'Enter') return;
   if (current.name === 'calibration-failed') act('retry');
   else if (current.name === 'display-save') act('save');
+  else if (current.name === 'aspect-warning') act('yes');
   else if (current.name === 'profile') saveProfile();
   else if (NOT_CANCELLABLE.has(current.name)) closePage();
 });
@@ -368,7 +392,7 @@ async function poll() {
     }
     if (current.name === 'positioning') renderPositioningLive();
   } catch (error) { /* keep polling: the server may be starting or the flow restarting */ }
-  setTimeout(poll, POLL_MS);
+  if (!retired) setTimeout(poll, POLL_MS);
 }
 
 makeSpinners();

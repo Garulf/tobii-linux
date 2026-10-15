@@ -8,9 +8,12 @@ import sys
 import tempfile
 import time
 
+from urllib.parse import quote
+
 from .. import display_setup as ds
-from ..browser import open_page
-from .flow import SetupFlow, SetupOptions, tracker_session
+from .. import monitors as desktop_monitors
+from ..browser import can_place_on_monitor, open_page
+from .flow import Desktop, SetupFlow, SetupOptions, default_display_record, load_display_record, tracker_session
 from .server import PageChannel, SetupServer
 
 DEFAULT_PORT = 8777
@@ -44,6 +47,8 @@ def build_parser(prog='tobii-linux setup'):
     parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'HTTP port (default {DEFAULT_PORT})')
     parser.add_argument('--no-browser', dest='browser', action='store_false',
                         help='Only print the address; open it yourself, fullscreen on the tracker\'s display')
+    parser.add_argument('--monitor', help='Start on this monitor (output name such as DP-1, or the Windows '
+                                          'monitor id); default: the one of the last display setup, else the primary')
     parser.add_argument('--index', type=int, default=0, help='Device index from probe')
     parser.add_argument('--channel', type=int, default=0, help='USB channel carrying TTP')
     parser.add_argument('--simulate', choices=('mapped', 'unmapped'),
@@ -95,7 +100,26 @@ def options_from(args):
         backups_directory = backups_directory or scratch/'backups'
     return SetupOptions(display=args.display, calibrate=args.calibrate, save_display_without_asking=args.save_display,
                         dry_run=args.dry_run, profile=args.profile, profiles_directory=profiles_directory,
-                        backups_directory=backups_directory, size_hint_mm=size_hint(args))
+                        backups_directory=backups_directory, size_hint_mm=size_hint(args),
+                        display_record=(profiles_directory.parent/'display-setup.json' if args.simulate
+                                        else default_display_record()))
+
+
+def page_url(base, monitor):
+    return base if monitor is None else f'{base}?monitor={quote(monitor.key, safe="")}'
+
+
+def choose_desktop(args, options, base_url):
+    """The monitors, the one to start on (Tobii's rule, or --monitor) and how to open the page on another."""
+    monitors = [] if args.simulate else desktop_monitors.desktop_monitors()
+    wanted = args.monitor or (load_display_record(options.display_record).get('monitor') or {}).get('key')
+    named = [m for m in monitors if args.monitor in (m.key, m.name)] if args.monitor else []
+    current = named[0] if named else desktop_monitors.initial_monitor(monitors, wanted)
+    movable = args.browser and len([m for m in monitors if m.bounds]) > 1 and can_place_on_monitor()
+
+    def open_on(monitor):
+        return open_page(page_url(base_url, monitor), monitor=monitor) is not None
+    return Desktop(monitors, current, open_on if movable else None)
 
 
 def wait_for_final_screen(channel, seconds=FINAL_SCREEN_S):
@@ -120,9 +144,11 @@ def main(argv=None, prog='tobii-linux setup'):
         return 1
     try:
         print(f'Setup page: {server.url}', flush=True)
-        if args.browser and open_page(server.url) is None:
+        desktop = choose_desktop(args, options, server.url)
+        start_on = desktop.current if desktop.open_on else None
+        if args.browser and open_page(page_url(server.url, start_on), monitor=start_on) is None:
             print('No browser launcher found; open the address above yourself.', flush=True)
-        flow = SetupFlow(channel, session_opener(args), options, report=json_reporter(args.log))
+        flow = SetupFlow(channel, session_opener(args), options, report=json_reporter(args.log), desktop=desktop)
         outcome = flow.run()
         wait_for_final_screen(channel)
     finally:
@@ -130,6 +156,8 @@ def main(argv=None, prog='tobii-linux setup'):
     print(f'{outcome.status}: {outcome.message}', flush=True)
     for path in outcome.backups:
         print(f'backup: {path}', flush=True)
+    if outcome.monitor and outcome.monitor.get('instance_id'):
+        print(f'monitor: {outcome.monitor["instance_id"]} (serve --display-id for window tracking)', flush=True)
     return EXIT_CODES[outcome.status]
 
 

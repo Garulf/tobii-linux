@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="/setup.css">
 </head>
 <body tabindex="-1">
-<button id="close" class="close" title="Cancel (Esc)" aria-label="Cancel"><svg viewBox="0 0 60 60" width="25" height="25"><path d="M15,15 L45,45 M15,45 L45,15" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+<button id="close" class="close" title="Cancel (Esc)" aria-label="Cancel"><svg viewBox="0 0 60 60" width="55" height="55"><path d="M15,15 L45,45 M15,45 L45,15" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg></button>
 <div id="fullscreen-banner" class="banner" hidden>This page has to fill the screen. Click anywhere or press F11.</div>
 
 <section id="connecting" class="screen centred">
@@ -28,6 +28,16 @@
   <div class="buttons">
     <button class="primary" id="display-save-yes">Save</button>
     <button id="display-save-no">Keep the old one</button>
+  </div>
+</section>
+
+<section id="aspect-warning" class="screen centred">
+  <div class="message-box" role="dialog" aria-labelledby="aspect-title">
+    <button id="aspect-close" class="box-close" aria-label="Close">&#x2715;</button>
+    <p class="box-title" id="aspect-title">We&rsquo;re sorry...</p>
+    <p class="box-body">Eye tracking may not work as expected with this screen resolution. Do you want to change the
+      screen settings before continuing?</p>
+    <div class="box-buttons"><button id="aspect-yes">Yes</button><button id="aspect-no">No</button></div>
   </div>
 </section>
 

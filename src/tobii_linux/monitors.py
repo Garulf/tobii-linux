@@ -1,0 +1,309 @@
+"""The monitors of the desktop the setup page runs on, and Tobii's rules for moving between them.
+
+Tobii's display setup (VirtualScreen, MonitorMappingModel; docs/setup-flow.md)
+starts on the only monitor, else on the one the tracker was mapped to, else
+on the primary one (the monitor at 0, 0). Its "previous" monitor is the one
+whose left edge is the nearest to the left of the current one's, "next" the
+nearest to the right; only the left edge counts.
+
+Sources, all read only:
+
+- Linux under X11 (or XWayland): `xrandr --prop`, which gives each connected
+  output's geometry, rotation, primary flag and EDID.
+- Linux without xrandr: the EDIDs under /sys/class/drm. There is no
+  geometry then, so the page cannot be moved between monitors.
+- WSL: the Windows desktop through powershell.exe: each screen's bounds in
+  physical pixels, the monitor's device instance id (what Tobii stores as the
+  monitor id and the game's window tracking matches) and its EDID from the
+  registry.
+"""
+from dataclasses import dataclass, field
+import base64
+import gzip
+import json
+import re
+import shutil
+import subprocess
+
+from . import display_setup as ds
+
+EDID_ID = slice(8, 18)
+ROTATIONS = {'normal': 0, 'left': 90, 'inverted': 180, 'right': 270}
+WINDOWS_ROTATIONS = {0: 0, 1: 90, 2: 180, 3: 270}
+QUERY_TIMEOUT_S = 20.0
+
+
+@dataclass(frozen=True)
+class Monitor:
+    """One monitor: `key` names it stably (Windows instance id, else the output name)."""
+    key: str
+    name: str
+    bounds: tuple | None = None
+    primary: bool = False
+    rotation: int = 0
+    edid: bytes | None = field(default=None, repr=False)
+    instance_id: str | None = None
+
+    @property
+    def left(self):
+        return self.bounds[0] if self.bounds else None
+
+    @property
+    def resolution_px(self):
+        return tuple(self.bounds[2:]) if self.bounds else None
+
+    @property
+    def size_mm(self):
+        """The EDID size hint in the orientation the monitor is used in, or None."""
+        try:
+            width, height = ds.edid_size_mm(self.edid) if self.edid else (0, 0)
+        except ValueError:
+            return None
+        if not (width and height):
+            return None
+        return (height, width) if self.rotation in (90, 270) else (width, height)
+
+    @property
+    def native_resolution(self):
+        try:
+            return ds.edid_native_resolution(self.edid) if self.edid else None
+        except ValueError:
+            return None
+
+    @property
+    def edid_id(self):
+        """EDID bytes 8 to 17 (manufacturer, product, serial, week, year) in hex, as Tobii's display id keeps them."""
+        return self.edid[EDID_ID].hex().upper() if self.edid and len(self.edid) >= EDID_ID.stop else None
+
+    @property
+    def display_id(self):
+        """Tobii's display id string (displayinfo.setpm) when the Windows instance id is known."""
+        if not self.instance_id:
+            return None
+        rotation = {0: 1, 90: 2, 180: 3, 270: 4}[self.rotation]
+        return f'{self.instance_id}##eId:{self.edid_id or ""}#or:{rotation}#v:1.0'
+
+    def record(self):
+        return {'key': self.key, 'name': self.name, 'bounds': list(self.bounds) if self.bounds else None,
+                'primary': self.primary, 'rotation': self.rotation, 'instance_id': self.instance_id,
+                'edid_id': self.edid_id, 'size_mm': list(self.size_mm) if self.size_mm else None,
+                'display_id': self.display_id}
+
+
+def same_aspect_ignoring_orientation(a, b, tolerance=0.001):
+    """AspectRatio.IsSameIgnoreOrientation."""
+    if not a or not b or not all(a) or not all(b):
+        return True
+    ratio, other = a[0] / a[1], b[0] / b[1]
+    return abs(ratio - other) <= tolerance or abs(ratio - 1 / other) <= tolerance
+
+
+def has_recommended_aspect(monitor, resolution_px=None):
+    """VirtualScreen.MonitorHasRecommendedAspectRatio: the mode's aspect equals the panel's native one."""
+    return same_aspect_ignoring_orientation(resolution_px or monitor.resolution_px, monitor.native_resolution)
+
+
+def primary(monitors):
+    placed = [m for m in monitors if m.bounds and m.bounds[:2] == (0, 0)]
+    return next((m for m in monitors if m.primary), placed[0] if placed else (monitors[0] if monitors else None))
+
+
+def initial_monitor(monitors, persisted_key=None):
+    """InitSelectedMonitor: the only monitor, else the persisted one, else the primary one."""
+    if len(monitors) == 1:
+        return monitors[0]
+    persisted = next((m for m in monitors if persisted_key and m.key == persisted_key), None)
+    return persisted or primary(monitors)
+
+
+def previous_monitor(monitors, current):
+    """GetPreviousDisplayDevice: the largest left edge below the current one's."""
+    if current is None or current.left is None or len(monitors) < 2:
+        return None
+    candidates = [m for m in monitors if m.left is not None and m.left < current.left]
+    return max(candidates, key=lambda m: m.left, default=None)
+
+
+def next_monitor(monitors, current):
+    """GetNextDisplayDevice: the smallest left edge above the current one's."""
+    if current is None or current.left is None or len(monitors) < 2:
+        return None
+    candidates = [m for m in monitors if m.left is not None and m.left > current.left]
+    return min(candidates, key=lambda m: m.left, default=None)
+
+
+# xrandr ------------------------------------------------------------------------------------------
+
+OUTPUT_LINE = re.compile(r'^(?P<name>\S+) connected(?P<primary> primary)?'
+                         r'(?: (?P<w>\d+)x(?P<h>\d+)\+(?P<x>-?\d+)\+(?P<y>-?\d+))?'
+                         r'(?: (?P<rotation>normal|left|inverted|right))?')
+
+
+def parse_xrandr(text):
+    """Connected outputs of `xrandr --prop`, with their EDID when listed."""
+    monitors, current, edid_lines, in_edid = [], None, [], False
+
+    def finish():
+        if current is not None:
+            edid = bytes.fromhex(''.join(edid_lines)) if edid_lines else None
+            monitors.append(Monitor(**{**current, 'edid': edid}))
+
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            finish()
+            current, edid_lines, in_edid = None, [], False
+            match = OUTPUT_LINE.match(line)
+            if match:
+                bounds = (tuple(int(match[k]) for k in ('x', 'y', 'w', 'h')) if match['w'] else None)
+                current = {'key': match['name'], 'name': match['name'], 'bounds': bounds,
+                           'primary': bool(match['primary']), 'rotation': ROTATIONS.get(match['rotation'] or 'normal', 0)}
+            continue
+        stripped = line.strip()
+        if stripped.startswith('EDID:'):
+            in_edid = True
+            continue
+        if in_edid and re.fullmatch(r'[0-9a-fA-F]+', stripped):
+            edid_lines.append(stripped)
+        else:
+            in_edid = False
+    finish()
+    return [m for m in monitors if m.bounds is not None]
+
+
+def drm_fallback(root='/sys/class/drm'):
+    """Connected DRM connectors with their EDID but no geometry (Wayland without xrandr)."""
+    from pathlib import Path
+    monitors = []
+    for edid_path in sorted(Path(root).glob('*/edid')):
+        status = edid_path.parent/'status'
+        if status.exists() and status.read_text().strip() != 'connected':
+            continue
+        edid = edid_path.read_bytes()
+        if edid:
+            name = edid_path.parent.name.split('-', 1)[-1]
+            monitors.append(Monitor(name, name, edid=edid))
+    return monitors
+
+
+def linux_monitors(run=subprocess.run):
+    if shutil.which('xrandr'):
+        result = run(['xrandr', '--prop'], capture_output=True, text=True, timeout=QUERY_TIMEOUT_S)
+        if result.returncode == 0:
+            monitors = parse_xrandr(result.stdout)
+            if monitors:
+                return monitors
+    return drm_fallback()
+
+
+# Windows (from WSL) ------------------------------------------------------------------------------
+
+WINDOWS_QUERY = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class TobiiLinuxDisplays {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct DisplayDevice {
+    public int cb;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+    public int StateFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct DevMode {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+    public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+    public short dmLogPixels;
+    public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2;
+    public int dmPanningWidth, dmPanningHeight;
+  }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  public static extern bool EnumDisplayDevices(string device, int index, ref DisplayDevice info, int flags);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  public static extern bool EnumDisplaySettings(string device, int mode, ref DevMode info);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  public static string MonitorInterface(string adapter) {
+    var info = new DisplayDevice(); info.cb = Marshal.SizeOf(info);
+    return EnumDisplayDevices(adapter, 0, ref info, 1) ? info.DeviceID : null;
+  }
+  public static int Orientation(string adapter) {
+    var mode = new DevMode(); mode.dmSize = (short)Marshal.SizeOf(mode);
+    return EnumDisplaySettings(adapter, -1, ref mode) ? mode.dmDisplayOrientation : 0;
+  }
+}
+"@
+[TobiiLinuxDisplays]::SetProcessDPIAware() | Out-Null
+$screens = foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+  $interface = [TobiiLinuxDisplays]::MonitorInterface($screen.DeviceName)
+  $edid = $null
+  if ($interface) {
+    $instance = ($interface -replace '^\\\\\?\\', '' -replace '#\{[^}]*\}$', '') -replace '#', '\'
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$instance\Device Parameters"
+    $value = Get-ItemProperty -Path $key -Name EDID -ErrorAction SilentlyContinue
+    if ($value) { $edid = [Convert]::ToBase64String($value.EDID) }
+  }
+  [pscustomobject]@{ name = $screen.DeviceName; primary = $screen.Primary;
+    bounds = @($screen.Bounds.X, $screen.Bounds.Y, $screen.Bounds.Width, $screen.Bounds.Height);
+    orientation = [TobiiLinuxDisplays]::Orientation($screen.DeviceName); interface = $interface; edid = $edid }
+}
+ConvertTo-Json -Compress -Depth 3 @($screens)
+'''
+
+
+def instance_id_from_interface(interface):
+    """\\\\?\\DISPLAY#GSM5B7F#5&5028a6b&0&UID41221#{guid} -> DISPLAY\\GSM5B7F\\5&5028A6B&0&UID41221."""
+    if not interface:
+        return None
+    path = re.sub(r'^\\\\\?\\', '', interface)
+    path = re.sub(r'#\{[^}]*\}$', '', path)
+    return path.replace('#', '\\').upper()
+
+
+def parse_windows_monitors(text):
+    """Monitors from the JSON WINDOWS_QUERY prints."""
+    items = json.loads(text)
+    if isinstance(items, dict):
+        items = [items]
+    monitors = []
+    for item in items:
+        instance_id = instance_id_from_interface(item.get('interface'))
+        edid = base64.b64decode(item['edid']) if item.get('edid') else None
+        monitors.append(Monitor(instance_id or item['name'], item['name'], tuple(int(v) for v in item['bounds']),
+                                bool(item.get('primary')), WINDOWS_ROTATIONS.get(item.get('orientation', 0), 0),
+                                edid, instance_id))
+    return monitors
+
+
+def encoded_command(script):
+    """-EncodedCommand text running `script` gzip-compressed, short enough for an 8191-character command line."""
+    packed = base64.b64encode(gzip.compress(script.encode())).decode()
+    bootstrap = ("$s = New-Object IO.MemoryStream(,[Convert]::FromBase64String('" + packed + "')); "
+                 "$z = New-Object IO.Compression.GzipStream($s, [IO.Compression.CompressionMode]::Decompress); "
+                 "Invoke-Expression (New-Object IO.StreamReader($z)).ReadToEnd()")
+    return base64.b64encode(bootstrap.encode('utf-16-le')).decode()
+
+
+def windows_monitors(run=subprocess.run):
+    result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded_command(WINDOWS_QUERY)],
+                 capture_output=True, text=True, timeout=QUERY_TIMEOUT_S)
+    if result.returncode != 0:
+        raise OSError(f'Windows monitor query failed: {result.stderr.strip()[:300]}')
+    return parse_windows_monitors(result.stdout.strip())
+
+
+def desktop_monitors(wsl=None):
+    """The monitors of the desktop the browser opens on; an empty list when they cannot be read."""
+    from .browser import running_under_wsl
+    try:
+        if running_under_wsl() if wsl is None else wsl:
+            return windows_monitors() if shutil.which('powershell.exe') else []
+        return linux_monitors()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
