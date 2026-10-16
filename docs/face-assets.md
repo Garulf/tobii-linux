@@ -5,7 +5,7 @@ unresolved items. Current state: LBF refinement and D1 crop/landmark components
 run natively; pose, live image acquisition and tracking remain unfinished.
 
 The supporting files now have native readers in
-`src/tobii_linux/face_assets.py`. These parse observed file layouts and validate
+`crates/tobii-models/src/face.rs` (wrapped by `src/tobii_linux/face_assets.py`). These parse observed file layouts and validate
 counts, finite coordinates, references and exact binary extents. They do not
 implement a pose solver or establish coordinate units.
 
@@ -57,7 +57,8 @@ The constructor is called at `0x140056f5a` and stored at parent offset `+0x38`.
 
 The `fa.lbf` and `fc.lbf` read paths use ordinary binary reads and codebook
 expansion. Native parser `src/tobii_linux/lbf.py` now accounts for every byte in
-both files and rejects trailing/truncated data. The separate `LBF/lv` layout now has its own `read_lv` reader (see continuation below).
+both files and rejects trailing/truncated data (the readers are now
+`crates/tobii-models/src/lbf.rs`). The separate `LBF/lv` layout now has its own `read_lv` reader (see continuation below).
 
 Evidence chain in the hash-bound platform runtime:
 
