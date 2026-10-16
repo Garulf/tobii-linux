@@ -9,7 +9,7 @@ use tobii_inference::{Error, Point, Runtime};
 
 use crate::convert::bytes_like;
 
-mod d1;
+pub mod d1;
 mod d1_quality;
 mod face_detect;
 mod legacy_ir;

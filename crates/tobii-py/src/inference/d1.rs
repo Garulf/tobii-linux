@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use tobii_inference::d1::{self, D1LandmarkModel, Point};
+use tobii_inference::d1::{self, D1LandmarkModel, D1Landmarks, Point};
 use tobii_inference::numeric::pack_f32;
 
 use super::{InferenceResult, affine, affine_bytes, float_bytes, points};
@@ -145,7 +145,7 @@ fn warp_grayscale<'py>(
 }
 
 /// Python's `isinstance(x, (int, np.integer))` for the four box values.
-fn integer_box(bounding_box: &Bound<'_, PyAny>) -> Option<[i64; 4]> {
+pub fn integer_box(bounding_box: &Bound<'_, PyAny>) -> Option<[i64; 4]> {
     let values: Vec<Bound<'_, PyAny>> = bounding_box.try_iter().ok()?.collect::<PyResult<_>>().ok()?;
     let values: Vec<i64> = values.iter().map(|v| v.extract::<i64>().ok()).collect::<Option<_>>()?;
     values.try_into().ok()
@@ -168,7 +168,14 @@ fn crop_transform<'py>(
     Ok(affine_bytes(py, &transform))
 }
 
-type Landmarks = (PointTuples, PointTuples, Vec<f64>, Vec<Vec<f64>>);
+pub type Landmarks = (PointTuples, PointTuples, Vec<f64>, Vec<Vec<f64>>);
+
+/// `(image_points, normalized_points, quality, image_to_crop)` of one frame.
+pub fn landmarks_tuple(landmarks: &D1Landmarks) -> Landmarks {
+    let transform = landmarks.image_to_crop.iter().map(|row| row.iter().map(|&v| f64::from(v)).collect()).collect();
+    let quality = landmarks.quality.iter().map(|&q| f64::from(q)).collect();
+    (tuples(&landmarks.image_points), tuples(&landmarks.normalized_points), quality, transform)
+}
 
 #[pyclass(frozen, name = "D1LandmarkModel", module = "tobii_linux._native.d1")]
 pub struct PyD1LandmarkModel(D1LandmarkModel);
@@ -215,9 +222,7 @@ impl PyD1LandmarkModel {
             self.0.predict_frame(&pixels, width, height, bounding_box, roll_degrees, compensate)
         })
         .py()?;
-        let transform = landmarks.image_to_crop.iter().map(|row| row.iter().map(|&v| f64::from(v)).collect()).collect();
-        let quality = landmarks.quality.iter().map(|&q| f64::from(q)).collect();
-        Ok((tuples(&landmarks.image_points), tuples(&landmarks.normalized_points), quality, transform))
+        Ok(landmarks_tuple(&landmarks))
     }
 }
 

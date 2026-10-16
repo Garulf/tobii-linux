@@ -1,4 +1,5 @@
-//! tobii_linux head-pose modules: one submodule per Python module, over tobii-headpose.
+//! tobii_linux head-pose modules: one submodule per Python module, over tobii-headpose
+//! (`head_pose_processor` holds driver.HeadPoseProcessor).
 //!
 //! float32 arrays cross the boundary as little-endian bytes in numpy's C order; the Python
 //! wrappers rebuild the arrays and keep the dataclasses.
@@ -8,8 +9,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tobii_headpose::{Basis, Error, Matrix, PoseModel};
 
+mod d1_pose;
 mod eye_refine;
+mod face_tracking;
 mod head_pose_pipeline;
+mod head_pose_processor;
 mod landmark_smoothing;
 mod lbf_features;
 mod lbf_predictor;
@@ -28,6 +32,7 @@ pub fn error(error: Error) -> PyErr {
         Error::Value(message) => PyValueError::new_err(message),
         Error::Unsupported(message) => PyNotImplementedError::new_err(message),
         Error::Models(error) => crate::models::error(error),
+        Error::Inference(error) => crate::inference::error(error),
         Error::Io(error) => error.into(),
     }
 }
@@ -162,5 +167,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::submodule(m, "lbf_predictor", lbf_predictor::register)?;
     crate::submodule(m, "eye_refine", eye_refine::register)?;
     crate::submodule(m, "landmark_smoothing", landmark_smoothing::register)?;
-    crate::submodule(m, "head_pose_pipeline", head_pose_pipeline::register)
+    crate::submodule(m, "head_pose_pipeline", head_pose_pipeline::register)?;
+    crate::submodule(m, "face_tracking", face_tracking::register)?;
+    crate::submodule(m, "headpose", d1_pose::register)?;
+    crate::submodule(m, "head_pose_processor", head_pose_processor::register)
 }

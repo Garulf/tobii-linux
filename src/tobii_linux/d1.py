@@ -119,6 +119,11 @@ acquire USB frames, estimate pose, update temporal roll or publish tracking to g
         self.reference = tuple(self._native.reference)
 
     def predict_frame(self, pixels, width, height, bounding_box, roll_degrees=0.0, compensate_roll=True):
-        image, normalized, quality, transform = self._native.predict_frame(
-            pixels, width, height, tuple(bounding_box), roll_degrees, compensate_roll)
-        return D1Landmarks(tuple(image), tuple(normalized), tuple(quality), tuple(tuple(row) for row in transform))
+        return landmarks_of(self._native.predict_frame(pixels, width, height, tuple(bounding_box), roll_degrees,
+                                                       compensate_roll))
+
+
+def landmarks_of(native):
+    """D1Landmarks from the native (image, normalized, quality, image_to_crop) tuple."""
+    image, normalized, quality, transform = native
+    return D1Landmarks(tuple(image), tuple(normalized), tuple(quality), tuple(tuple(row) for row in transform))

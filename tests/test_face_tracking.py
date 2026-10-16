@@ -4,6 +4,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT/'models/tobii-et5'
+RECORDED = ROOT/'evidence/private/e2e-person/linux-frames.jsonl'
+AREA = ((-296.62, 326.0, 111.82), (300.38, 326.0, 111.82), (-296.62, 10.27, -3.1))
 
 
 @unittest.skipUnless(importlib.util.find_spec('numpy'), 'Optional NumPy is not installed')
@@ -59,6 +61,32 @@ class FaceTrackerTests(unittest.TestCase):
         result = tracker.process(np.zeros((480, 640), np.uint8))
         self.assertEqual(tracker.state, SEARCHING)
         self.assertIsNone(result.fit)
+
+
+@unittest.skipUnless(importlib.util.find_spec('numpy') and importlib.util.find_spec('openvino') and RECORDED.exists(),
+                     'Needs NumPy, OpenVINO and the recorded frames in evidence/private/e2e-person')
+class RecordedHeadPoseTests(unittest.TestCase):
+    def test_processor_matches_the_tracker_and_output_stages(self):
+        from types import SimpleNamespace
+        import numpy as np
+        from tobii_linux.demo.sources import recorded_frames
+        from tobii_linux.driver import HeadPoseProcessor
+        from tobii_linux.face_tracking import FaceTracker, TRACKING
+        from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseOutput
+        calibration, frames = recorded_frames(RECORDED)
+        area = DisplayArea(*AREA)
+        processor = HeadPoseProcessor(MODELS, area)
+        processor.start(calibration)
+        tracker = FaceTracker(MODELS)
+        output = HeadPoseOutput(calibration.translation, calibration.angles, area)
+        for timestamp, width, height, path in frames[:12]:
+            pixels = path.read_bytes()
+            tracked = tracker.process(np.frombuffer(pixels, np.uint8).reshape(height, width), timestamp // 1000)
+            expected = output(None if tracked.fit is None else tracked.fit['rigid_state'], timestamp)
+            frame = SimpleNamespace(pixels=pixels, width=width, height=height, timestamp=timestamp)
+            self.assertEqual(processor(frame), expected)
+        self.assertEqual(tracker.state, TRACKING)
+        self.assertTrue(expected.valid)
 
 
 if __name__ == '__main__':

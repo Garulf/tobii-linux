@@ -3,7 +3,8 @@ use thiserror::Error;
 /// Failures of the head-pose math, with the messages of the Python modules.
 ///
 /// `Value` is a ValueError in Python and `Unsupported` a NotImplementedError: a branch of
-/// the original that needs tracker state this reconstruction does not have.
+/// the original that needs tracker state this reconstruction does not have. `Inference`
+/// carries a failure of the face finder or D1 network.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -12,6 +13,8 @@ pub enum Error {
     Unsupported(String),
     #[error(transparent)]
     Models(#[from] tobii_models::Error),
+    #[error(transparent)]
+    Inference(#[from] tobii_inference::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

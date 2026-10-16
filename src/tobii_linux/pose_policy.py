@@ -66,8 +66,12 @@ tracking. Optional extra parent models and temporal caller state are absent.
 """
     from .pose_model import _native_model
     points = _points(model, normalized_points, 'Expected complete finite normalized landmarks')
-    pose, shape, animation, valid, stages = _policy.fit_staged_landmarks(
-        _native_model(model), points.tobytes(), width, height)
+    return staged_fit(_policy.fit_staged_landmarks(_native_model(model), points.tobytes(), width, height), model)
+
+
+def staged_fit(native, model):
+    """The fit_staged_landmarks dict from the native (pose, shape, animation, valid, stages) tuple."""
+    pose, shape, animation, valid, stages = native
     return {'rigid_state': array(pose, 6), 'shape_coefficients': array(shape, len(model.shape_ranges)),
             'animation_coefficients': array(animation, len(model.animation_ranges)), 'valid': valid,
             'stages': [{'mode': mode, 'updates': updates, 'attempts': attempts, 'valid': ok}

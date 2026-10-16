@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use tobii_headpose::Vec3;
 use tobii_headpose::fit::FitMode;
-use tobii_headpose::temporal::{self, TemporalPoseFitter};
+use tobii_headpose::temporal::{self, TemporalFit, TemporalPoseFitter};
 
 use super::{HeadPoseResult, bytes, fixed, flat_bytes, floats, pose_model, rows};
 
@@ -67,6 +67,34 @@ fn reprojection_error(
     Ok(temporal::reprojection_error(&landmark_ids, &projected, &flipped, width, height, rectangle_width))
 }
 
+/// A frame's fit with float32 arrays as bytes; trace entries are dicts.
+pub fn fit_result<'py>(py: Python<'py>, fit: &TemporalFit) -> PyResult<Bound<'py, PyDict>> {
+    let trace = PyList::empty(py);
+    for entry in &fit.trace {
+        let item = PyDict::new(py);
+        item.set_item("mode", entry.mode.flag())?;
+        item.set_item("valid", entry.valid)?;
+        item.set_item("attempts", entry.attempts)?;
+        if let Some(measure) = entry.measure {
+            item.set_item("facing", f64::from(measure.facing))?;
+            item.set_item("error", f64::from(measure.error))?;
+            item.set_item("rectangle", PyTuple::new(py, measure.rectangle)?)?;
+        }
+        trace.append(item)?;
+    }
+    let result = PyDict::new(py);
+    result.set_item("valid", fit.valid)?;
+    result.set_item("rotation", bytes(py, &fit.rotation))?;
+    result.set_item("translation", bytes(py, &fit.translation))?;
+    result.set_item("rigid_state", bytes(py, &fit.rigid_state))?;
+    result.set_item("shape_coefficients", bytes(py, &fit.shape_coefficients))?;
+    result.set_item("animation_coefficients", bytes(py, &fit.animation_coefficients))?;
+    result.set_item("initialised", fit.initialised)?;
+    result.set_item("frontal", fit.frontal)?;
+    result.set_item("trace", trace)?;
+    Ok(result)
+}
+
 #[pyclass(name = "TemporalPoseFitter", module = "tobii_linux.pose_temporal")]
 struct PyTemporalPoseFitter(TemporalPoseFitter);
 
@@ -98,30 +126,7 @@ impl PyTemporalPoseFitter {
         let points = rows::<2>(points)?;
         let fitter = &mut self.0;
         let fit = crate::exit::detached(py, || fitter.process(&points, width, height)).py()?;
-        let trace = PyList::empty(py);
-        for entry in &fit.trace {
-            let item = PyDict::new(py);
-            item.set_item("mode", entry.mode.flag())?;
-            item.set_item("valid", entry.valid)?;
-            item.set_item("attempts", entry.attempts)?;
-            if let Some(measure) = entry.measure {
-                item.set_item("facing", f64::from(measure.facing))?;
-                item.set_item("error", f64::from(measure.error))?;
-                item.set_item("rectangle", PyTuple::new(py, measure.rectangle)?)?;
-            }
-            trace.append(item)?;
-        }
-        let result = PyDict::new(py);
-        result.set_item("valid", fit.valid)?;
-        result.set_item("rotation", bytes(py, &fit.rotation))?;
-        result.set_item("translation", bytes(py, &fit.translation))?;
-        result.set_item("rigid_state", bytes(py, &fit.rigid_state))?;
-        result.set_item("shape_coefficients", bytes(py, &fit.shape_coefficients))?;
-        result.set_item("animation_coefficients", bytes(py, &fit.animation_coefficients))?;
-        result.set_item("initialised", fit.initialised)?;
-        result.set_item("frontal", fit.frontal)?;
-        result.set_item("trace", trace)?;
-        Ok(result)
+        fit_result(py, &fit)
     }
 
     #[getter]
