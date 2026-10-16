@@ -20,15 +20,21 @@
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
-            ./pyproject.toml ./Cargo.toml ./Cargo.lock ./clippy.toml ./rustfmt.toml ./crates ./src ./tests
+            ./pyproject.toml ./Cargo.toml ./Cargo.lock ./clippy.toml ./rustfmt.toml ./crates ./src ./tests ./tools
           ];
         };
         cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
         nativeBuildInputs = with pkgs.rustPlatform; [ cargoSetupHook maturinBuildHook ];
+        preConfigure = ''
+          export HOME="$NIX_BUILD_TOP/home"
+          mkdir -p "$HOME"
+        '';
+        env.TOBII_OPENVINO_LIBRARY_DIR = "${lib.getLib pkgs.openvino}/lib";
         dependencies = with pkgs.python3Packages; [ numpy openvino ];
         makeWrapperArgs = [ "--set-default TOBII_LINUX_MODELS ${models}" ];
         checkPhase = ''
           runHook preCheck
+          mkdir -p models && ln -s ${models} models/tobii-et5
           cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
           runHook postCheck

@@ -168,7 +168,9 @@ The C library is loaded at run time with libloading, from the first of:
 2. directories the caller passes: the bindings pass the `libs` directory of an installed
    `openvino` wheel (found with `importlib.util.find_spec`, without importing it), so the
    process shares one OpenVINO with Python's; Rust tests pass `.local/inference/openvino/libs`;
-3. `libopenvino_c.so` through the dynamic loader's search path.
+3. the directory in `TOBII_OPENVINO_LIBRARY_DIR` at build time (the Nix package sets it
+   to nixpkgs' OpenVINO, whose Python wheel does not carry the C library);
+4. `libopenvino_c.so` through the dynamic loader's search path.
 
 A missing library is an ImportError in Python and `Error::Unavailable` in Rust; Rust tests
 that need it print why and skip. All foreign calls are in

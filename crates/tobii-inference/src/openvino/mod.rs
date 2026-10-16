@@ -3,7 +3,8 @@
 //! The library is found in this order: `TOBII_OPENVINO_LIBRARY` (the library file, or a
 //! directory holding `libopenvino_c.so*`), then the directories the caller passes (the
 //! Python bindings pass the `openvino/libs` directory of an installed OpenVINO wheel), then
-//! `libopenvino_c.so` through the dynamic loader's search path. Networks compile on the CPU
+//! the directory `TOBII_OPENVINO_LIBRARY_DIR` named at build time (the Nix package sets it),
+//! then `libopenvino_c.so` through the dynamic loader's search path. Networks compile on the CPU
 //! with float32 inference precision and two inference threads, as the Python runner did.
 
 mod ffi;
@@ -16,6 +17,7 @@ use crate::legacy_ir::{self, IrModel};
 
 pub const LIBRARY_VARIABLE: &str = "TOBII_OPENVINO_LIBRARY";
 const LIBRARY_NAME: &str = "libopenvino_c.so";
+const BUILD_DIRECTORY: Option<&str> = option_env!("TOBII_OPENVINO_LIBRARY_DIR");
 const DEVICE: &str = "CPU";
 const PROPERTIES: [(&str, &str); 2] = [("INFERENCE_PRECISION_HINT", "f32"), ("INFERENCE_NUM_THREADS", "2")];
 
@@ -55,7 +57,12 @@ impl Runtime {
                 Error::Unavailable(format!("{LIBRARY_VARIABLE} names {} without {LIBRARY_NAME}", configured.display()))
             });
         }
-        Ok(directories.iter().find_map(|d| library_in(d)).unwrap_or_else(|| PathBuf::from(LIBRARY_NAME)))
+        let build_directory = BUILD_DIRECTORY.filter(|d| !d.is_empty()).map(PathBuf::from);
+        Ok(directories
+            .iter()
+            .chain(build_directory.iter())
+            .find_map(|d| library_in(d))
+            .unwrap_or_else(|| PathBuf::from(LIBRARY_NAME)))
     }
 
     /// Loads the library at `library` and creates a core.
