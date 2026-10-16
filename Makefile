@@ -14,6 +14,7 @@ ORACLES := ttp_commands ttp_hwinfo ttp_reply gaze presence gaze_calibration gaze
 ORACLES += lbf_coeff lbf_tree d1_records pose_mesh
 ORACLES += d1_input d1_geometry d1_transform d1_warp d1_crop d1_quality face_detect
 ORACLES += pose_inverse pose_projection pose_jacobian pose_euler pose_geometry pose_filter pose_initialization pose_observations pose_fit pose_deformation_jacobian pose_deformation_fit pose_bounds pose_selection pose_configured pose_modes pose_policy pose_caller pose_temporal lbf_gather lbf_predictor eye_refine landmark_smoothing
+ORACLES += face_tracking
 BINARY_ORACLES := usb_framing ttp_encoder
 GAME_ORACLES := prp_encoder prp_session
 
