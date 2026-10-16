@@ -35,7 +35,9 @@ test: native
 
 oracles: native
 	@for oracle in $(ORACLES); do \
-		echo "== $$oracle"; PYTHONPATH=$(ORACLE_PATH) $(PYTHON) tools/$${oracle}_oracle.py | tail -n 1 || exit 1; \
+		echo "== $$oracle"; \
+		output=$$(PYTHONPATH=$(ORACLE_PATH) $(PYTHON) tools/$${oracle}_oracle.py) || { echo "$$output"; exit 1; }; \
+		echo "$$output" | tail -n 1; \
 	done
 	@for oracle in $(BINARY_ORACLES); do \
 		echo "== $$oracle"; PYTHONPATH=$(ORACLE_PATH) $(PYTHON) tools/$${oracle}_oracle.py $(RUNTIME) > /dev/null || exit 1; \
