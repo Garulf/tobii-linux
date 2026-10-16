@@ -3,15 +3,17 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tobii_linux::service::clock::{Clock, Clocks, wine_clock};
 use tobii_linux::service::{Options, PrpService};
 use tobii_service::prp::DEFAULT_MAX_PAYLOAD;
 use tobii_service::prp_service::{
-    FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_REPLY_PIPE, decode_frame_header, decode_names, encode_frame, encode_pipe_open,
+    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
+    decode_frame_header, decode_names, encode_frame, encode_pipe_open,
 };
 use tobii_service::prp_session::{
     ClientHello, HandshakeInfo, check_handshake_ack, decode_handshake_info, encode_client_hello, encode_client_pid,
@@ -150,6 +152,46 @@ impl RelayedChannel {
     }
 }
 
+/// A bridge control connection, after the hello and the pipe list.
+#[derive(Debug)]
+pub struct Bridge {
+    pub stream: TcpStream,
+    pub pipes: Vec<String>,
+    markers: u32,
+}
+
+impl Bridge {
+    pub async fn attach(port: u16) -> Self {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&encode_frame(FRAME_BRIDGE_HELLO, &1u32.to_le_bytes()).unwrap()).await.unwrap();
+        let (kind, payload) = read_frame(&mut stream).await.unwrap();
+        assert_eq!(kind, FRAME_PIPES);
+        Self { stream, pipes: decode_names(&payload).unwrap(), markers: 0 }
+    }
+
+    pub async fn send(&mut self, kind: u32, payload: &[u8]) {
+        self.stream.write_all(&encode_frame(kind, payload).unwrap()).await.unwrap();
+    }
+
+    /// Sends a QueryPerformanceCounter report and waits until the service has handled it.
+    pub async fn report(&mut self, service: &PrpService, payload: &[u8]) {
+        self.send(FRAME_QPC, payload).await;
+        self.sync(service).await;
+    }
+
+    /// Waits until the service has handled every frame sent so far.
+    ///
+    /// The service handles a bridge's frames in order, so a display id sent last shows
+    /// that the frames before it were handled.
+    pub async fn sync(&mut self, service: &PrpService) {
+        self.markers += 1;
+        let marker = format!("marker {}", self.markers);
+        self.send(FRAME_DISPLAY_ID, marker.as_bytes()).await;
+        let handled = eventually(|| service.reported_display_id().as_deref() == Some(marker.as_str())).await;
+        assert!(handled, "frames not handled");
+    }
+}
+
 /// Waits up to two seconds for `condition`.
 pub async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     for _ in 0..100 {
@@ -164,3 +206,44 @@ pub async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
 pub fn hex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
 }
+
+thread_local! {
+    static LOGGED: RefCell<Vec<(log::Level, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps the info and warning records of each thread; every test runs on its own thread.
+struct LogCapture;
+
+impl log::Log for LogCapture {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            LOGGED.with(|logged| logged.borrow_mut().push((record.level(), record.args().to_string())));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Starts capturing this thread's log records, dropping what was captured before.
+pub fn capture_logs() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        log::set_logger(&LogCapture).expect("no other logger in the test binary");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+    LOGGED.with(|logged| logged.borrow_mut().clear());
+}
+
+/// The messages logged on this thread at `level` or above since the last call, as
+/// `assertLogs` collects them.
+pub fn take_logs(level: log::Level) -> Vec<String> {
+    LOGGED.with(|logged| {
+        logged.borrow_mut().drain(..).filter(|(logged, _)| *logged <= level).map(|(_, message)| message).collect()
+    })
+}
+
+pub mod fake_tracker;

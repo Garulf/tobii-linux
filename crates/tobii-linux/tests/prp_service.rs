@@ -4,13 +4,15 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::*;
 use tobii_headpose::pipeline::HeadPoseSample;
+use tobii_linux::service::clock::{Clocks, now_us, wine_clock};
 use tobii_linux::service::{Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame};
 use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
-use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_head_body};
+use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
     FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, decode_names, encode_frame, error_response,
 };
@@ -23,6 +25,8 @@ use tobii_service::prp_session::{
     encode_connect_request, encode_property_request, encode_property_subscribe_request, encode_stream_request,
     encode_timesync_request,
 };
+use tobii_service::prp_streams::{PRP_GAZE_ORIGIN, PRP_GAZE_POINT, PRP_RESPONSIVE_GAZE_POINT};
+use tobii_service::qpc_clock::{ClockReader, LinuxClock, LinuxClocks};
 use tokio::io::AsyncWriteExt;
 
 const REAL_TIMESYNC_RESPONSE: &str = "5450525034000000605052500c000000010000000a000000040000000c0000000000000016000000040000000c000000cb000000c01fa7e80400000000000000";
@@ -141,7 +145,7 @@ fn sample(timestamp_us: i64, position: [f32; 3], rotation: [f32; 3]) -> HeadPose
 }
 
 #[test]
-fn bridge_learns_pipe_names_and_reports_the_display_id() {
+fn bridge_learns_pipe_names() {
     run(async {
         let fixture = Fixture::default().await;
         let mut bridge = tokio::net::TcpStream::connect(("127.0.0.1", fixture.port)).await.unwrap();
@@ -151,23 +155,34 @@ fn bridge_learns_pipe_names_and_reports_the_display_id() {
         let names = decode_names(&payload).unwrap();
         assert_eq!(names[..2], ["TOBIIPRP-ET5-TEST", "ET5-TEST"]);
         assert_eq!(names, fixture.service.pipe_names());
-        bridge
-            .write_all(&encode_frame(FRAME_DISPLAY_ID, b"DISPLAY\\DEFAULT_MONITOR\\0000&0000").unwrap())
-            .await
-            .unwrap();
-        assert!(eventually(|| fixture.service.reported_display_id().is_some()).await);
-        let mut session = fixture.session().await;
+    });
+}
+
+impl Fixture {
+    async fn display_id_answer(&self) -> String {
+        let mut session = self.session().await;
         let tag = session.next_tag();
         session.command.send_packet(&encode_property_request(tag, PROPERTY_DISPLAY_ID)).await;
-        let response = decode_property_response(&session.command.packet().await).unwrap();
-        assert_eq!(decode_string_value(&response).unwrap(), "DISPLAY\\DEFAULT_MONITOR\\0000&0000");
+        decode_string_value(&decode_property_response(&session.command.packet().await).unwrap()).unwrap()
+    }
 
+    async fn bridge_reports_display_id(&self, display_id: &str) {
+        let mut bridge = Bridge::attach(self.port).await;
+        bridge.send(FRAME_DISPLAY_ID, display_id.as_bytes()).await;
+        assert!(eventually(|| self.service.reported_display_id().as_deref() == Some(display_id)).await);
+    }
+}
+
+#[test]
+fn bridge_reported_display_id_is_used_unless_configured() {
+    run(async {
+        let fixture = Fixture::default().await;
+        fixture.bridge_reports_display_id("DISPLAY\\DEFAULT_MONITOR\\0000&0000").await;
+        assert_eq!(fixture.display_id_answer().await, "DISPLAY\\DEFAULT_MONITOR\\0000&0000");
         let configured =
             Fixture::new(Options { display_id: Some(REAL_DISPLAY_ID.into()), ..common::options("ET5-TEST") }).await;
-        let mut session = configured.session().await;
-        session.command.send_packet(&encode_property_request(3, PROPERTY_DISPLAY_ID)).await;
-        let response = decode_property_response(&session.command.packet().await).unwrap();
-        assert_eq!(decode_string_value(&response).unwrap(), REAL_DISPLAY_ID);
+        configured.bridge_reports_display_id("DISPLAY\\DEFAULT_MONITOR\\0000&0000").await;
+        assert_eq!(configured.display_id_answer().await, REAL_DISPLAY_ID);
     });
 }
 
@@ -193,26 +208,36 @@ fn handshake_matches_real_service_shape() {
     });
 }
 
+async fn connect_satisfies_device_create_with(fixture: Fixture) {
+    for licenses in [Vec::new(), vec![b"license-one".to_vec(), b"license-two".to_vec()]] {
+        let count = licenses.len();
+        let session = fixture.session_with(licenses, 1).await;
+        let payload = decode_envelope(&session.connect, DEFAULT_MAX_PAYLOAD).unwrap();
+        let response = decode_command_response(&session.connect, true).unwrap();
+        assert_eq!((response.tag, response.command, response.status), (1, COMMAND_CONNECT, 0));
+        assert_eq!(u32::from_le_bytes(payload[32..36].try_into().unwrap()) as usize, CONNECT_RESPONSE_BLOCK_EXTENDED);
+        let ResponseBody::Connect(connect) = response.body else { panic!("connect body") };
+        assert_eq!(connect.license_results, vec![0; count]);
+        assert!(!connect.firmware_upgrade_in_progress);
+        assert!(connect.streams.contains(&(HEAD_POSE as i32)));
+        assert!(connect.supported_commands.contains(&(COMMAND_TIMESYNC as i32)));
+    }
+}
+
 #[test]
 fn connect_satisfies_device_create() {
+    run(async { connect_satisfies_device_create_with(Fixture::default().await).await });
+}
+
+#[test]
+fn gaze_connect_satisfies_device_create() {
+    run(async { connect_satisfies_device_create_with(gaze_fixture().await).await });
+}
+
+#[test]
+fn connect_with_unknown_subscription_fails() {
     run(async {
         let fixture = Fixture::default().await;
-        for licenses in [Vec::new(), vec![b"license-one".to_vec(), b"license-two".to_vec()]] {
-            let count = licenses.len();
-            let session = fixture.session_with(licenses, 1).await;
-            let payload = decode_envelope(&session.connect, DEFAULT_MAX_PAYLOAD).unwrap();
-            let response = decode_command_response(&session.connect, true).unwrap();
-            assert_eq!((response.tag, response.command, response.status), (1, COMMAND_CONNECT, 0));
-            assert_eq!(
-                u32::from_le_bytes(payload[32..36].try_into().unwrap()) as usize,
-                CONNECT_RESPONSE_BLOCK_EXTENDED
-            );
-            let ResponseBody::Connect(connect) = response.body else { panic!("connect body") };
-            assert_eq!(connect.license_results, vec![0; count]);
-            assert!(!connect.firmware_upgrade_in_progress);
-            assert!(connect.streams.contains(&(HEAD_POSE as i32)));
-            assert!(connect.supported_commands.contains(&(COMMAND_TIMESYNC as i32)));
-        }
         let mut command = fixture.channel("ET5-TEST").await;
         command.handshake(COMMAND_CHANNEL, "client_cmd", CLIENT_PID).await;
         command
@@ -229,34 +254,53 @@ fn connect_satisfies_device_create() {
     });
 }
 
-#[test]
-fn stream_start_pushes_samples_until_stop_and_disconnect_releases_it() {
-    run(async {
-        let fixture = Fixture::default().await;
-        let mut session = fixture.session().await;
-        let (tag, response) = session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
-        assert_eq!((response.tag, response.status, word(&response)), (tag, 0, HEAD_POSE as i32));
-        let pose = sample(FIXED_CLOCK_US + 5, [1.0, 2.0, 600.0], [0.1, -0.2, 0.3]);
-        fixture.service.hub().publish(&pose);
-        let package = session.subscription.packet().await;
-        assert_eq!(package, stream_package(&pose));
-        let payload = decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap();
-        let words: Vec<u32> = payload[..28].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        assert_eq!(words, [12, 0, 1, 4, 8, HEAD_POSE, 4]);
-        let body = decode_head_body(&payload[28..80]).unwrap();
-        assert_eq!((body.timestamp, body.rotation_valid), (pose.timestamp_us, [true; 3]));
-        assert!((body.rotation[1] + 0.2).abs() < 1e-6);
-        let (_, response) = session.stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
-        assert_eq!((response.status, word(&response)), (0, HEAD_POSE as i32));
-        assert_eq!(fixture.service.hub().subscribers(), 0);
-        fixture.service.hub().publish(&pose);
-        assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+async fn stream_start_pushes_samples_until_stop_with(fixture: Fixture) {
+    let mut session = fixture.session().await;
+    let (tag, response) = session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
+    assert_eq!((response.tag, response.status, word(&response)), (tag, 0, HEAD_POSE as i32));
+    let pose = sample(FIXED_CLOCK_US + 5, [1.0, 2.0, 600.0], [0.1, -0.2, 0.3]);
+    fixture.service.hub().publish(&pose);
+    let package = session.subscription.packet().await;
+    assert_eq!(package, stream_package(&pose));
+    let payload = decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap();
+    let words: Vec<u32> = payload[..28].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(words, [12, 0, 1, 4, 8, HEAD_POSE, 4]);
+    let body = decode_head_body(&payload[28..80]).unwrap();
+    assert_eq!((body.timestamp, body.rotation_valid), (pose.timestamp_us, [true; 3]));
+    assert!((body.rotation[1] + 0.2).abs() < 1e-6);
+    let (_, response) = session.stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
+    assert_eq!((response.status, word(&response)), (0, HEAD_POSE as i32));
+    assert_eq!(fixture.service.hub().subscribers(), 0);
+    fixture.service.hub().publish(&pose);
+    assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+}
 
-        session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
-        assert_eq!(fixture.service.hub().subscribers(), 1);
-        drop(session);
-        assert!(eventually(|| fixture.service.hub().subscribers() == 0 && fixture.service.subscriptions() == 0).await);
-    });
+#[test]
+fn stream_start_pushes_samples_until_stop() {
+    run(async { stream_start_pushes_samples_until_stop_with(Fixture::default().await).await });
+}
+
+#[test]
+fn gaze_stream_start_pushes_samples_until_stop() {
+    run(async { stream_start_pushes_samples_until_stop_with(gaze_fixture().await).await });
+}
+
+async fn client_disconnect_releases_stream_with(fixture: Fixture) {
+    let mut session = fixture.session().await;
+    session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
+    assert_eq!(fixture.service.hub().subscribers(), 1);
+    drop(session);
+    assert!(eventually(|| fixture.service.hub().subscribers() == 0 && fixture.service.subscriptions() == 0).await);
+}
+
+#[test]
+fn client_disconnect_releases_stream() {
+    run(async { client_disconnect_releases_stream_with(Fixture::default().await).await });
+}
+
+#[test]
+fn gaze_client_disconnect_releases_stream() {
+    run(async { client_disconnect_releases_stream_with(gaze_fixture().await).await });
 }
 
 #[test]
@@ -309,7 +353,11 @@ fn unknown_command_gets_nonzero_status_with_same_tag() {
         let request = tobii_service::prp::encode_envelope(&payload, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(tobii_service::prp_service::request_header(&request).unwrap(), (9, 2));
         session.command.send_packet(&request).await;
-        assert_eq!(session.command.packet().await, error_response(9, 2, 2));
+        let packet = session.command.packet().await;
+        assert_eq!(packet, error_response(9, 2, 2));
+        let payload = decode_envelope(&packet, DEFAULT_MAX_PAYLOAD).unwrap();
+        let words: Vec<u32> = payload[..28].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(words, [12, 9, 10, 4, 12, 2, 2]);
     });
 }
 
@@ -348,6 +396,14 @@ fn property_get_and_subscribe_keep_the_session() {
         assert_eq!(session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await.1.status, 0);
         fixture.service.hub().publish(&sample(FIXED_CLOCK_US, [0.0; 3], [0.0; 3]));
         assert!(!session.subscription.packet().await.is_empty());
+    });
+}
+
+#[test]
+fn unsupported_property_subscribe_carries_a_value_block() {
+    run(async {
+        let fixture = Fixture::default().await;
+        let mut session = fixture.session().await;
         let tag = session.next_tag();
         session
             .command
@@ -397,6 +453,14 @@ fn every_property_subscription_matches_the_real_service() {
                 }
             }
         }
+    });
+}
+
+#[test]
+fn licensed_presence_unsubscribe_matches_the_real_service() {
+    run(async {
+        let fixture = Fixture::default().await;
+        let mut session = fixture.session().await;
         let (tag, property_id, expected) = REAL_UNSUBSCRIBE_LICENSED;
         session
             .command
@@ -437,30 +501,36 @@ fn presence_changes_reach_only_subscribed_clients() {
     });
 }
 
+async fn two_clients_receive_every_sample_with(fixture: Fixture) {
+    let mut clients = vec![fixture.session().await, fixture.session().await];
+    for client in &mut clients {
+        assert_eq!(client.stream_request(COMMAND_STREAM_START, HEAD_POSE).await.1.status, 0);
+    }
+    let samples: Vec<HeadPoseSample> =
+        (0..3).map(|i| sample(FIXED_CLOCK_US + i, [i as f32, 0.0, 600.0], [0.0; 3])).collect();
+    for pose in &samples {
+        fixture.service.hub().publish(pose);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for client in &mut clients {
+        for pose in &samples {
+            assert_eq!(client.subscription.packet().await, stream_package(pose));
+        }
+    }
+    clients[0].stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
+    fixture.service.hub().publish(&samples[0]);
+    assert_eq!(clients[1].subscription.packet().await, stream_package(&samples[0]));
+    assert_eq!(clients[0].subscription.packet_within(Duration::from_millis(200)).await, None);
+}
+
 #[test]
 fn two_clients_receive_every_sample() {
-    run(async {
-        let fixture = Fixture::default().await;
-        let mut clients = vec![fixture.session().await, fixture.session().await];
-        for client in &mut clients {
-            assert_eq!(client.stream_request(COMMAND_STREAM_START, HEAD_POSE).await.1.status, 0);
-        }
-        let samples: Vec<HeadPoseSample> =
-            (0..3).map(|i| sample(FIXED_CLOCK_US + i, [i as f32, 0.0, 600.0], [0.0; 3])).collect();
-        for pose in &samples {
-            fixture.service.hub().publish(pose);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        for client in &mut clients {
-            for pose in &samples {
-                assert_eq!(client.subscription.packet().await, stream_package(pose));
-            }
-        }
-        clients[0].stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
-        fixture.service.hub().publish(&samples[0]);
-        assert_eq!(clients[1].subscription.packet().await, stream_package(&samples[0]));
-        assert_eq!(clients[0].subscription.packet_within(Duration::from_millis(200)).await, None);
-    });
+    run(async { two_clients_receive_every_sample_with(Fixture::default().await).await });
+}
+
+#[test]
+fn gaze_two_clients_receive_every_sample() {
+    run(async { two_clients_receive_every_sample_with(gaze_fixture().await).await });
 }
 
 #[test]
@@ -474,37 +544,43 @@ fn closing_the_command_channel_closes_its_subscription() {
     });
 }
 
-#[test]
-fn tracker_loss_closes_clients_until_it_is_back() {
-    run(async {
-        let fixture = Fixture::default().await;
-        let mut session = fixture.session().await;
-        session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
-        fixture.service.detach_tracker();
-        assert!(session.command.closed().await);
-        assert!(session.subscription.closed().await);
-        assert_eq!(fixture.service.hub().subscribers(), 0);
-        let mut refused = fixture.channel("ET5-TEST").await;
-        refused
-            .send(
-                &encode_client_hello(&ClientHello {
-                    channel: COMMAND_CHANNEL,
-                    reply_pipe: "client_cmd".into(),
-                    version: 1,
-                })
-                .unwrap(),
-            )
-            .await;
-        assert!(refused.closed().await);
-        fixture.attach();
-        let session = fixture.session().await;
-        assert_eq!(decode_command_response(&session.connect, true).unwrap().status, 0);
-        let _ = session.info;
-    });
+async fn tracker_loss_closes_clients_until_it_is_back_with(fixture: Fixture) {
+    let mut session = fixture.session().await;
+    session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
+    fixture.service.detach_tracker();
+    assert!(session.command.closed().await);
+    assert!(session.subscription.closed().await);
+    assert_eq!(fixture.service.hub().subscribers(), 0);
+    let mut refused = fixture.channel("ET5-TEST").await;
+    refused
+        .send(
+            &encode_client_hello(&ClientHello {
+                channel: COMMAND_CHANNEL,
+                reply_pipe: "client_cmd".into(),
+                version: 1,
+            })
+            .unwrap(),
+        )
+        .await;
+    assert!(refused.closed().await);
+    fixture.attach();
+    let session = fixture.session().await;
+    assert_eq!(decode_command_response(&session.connect, true).unwrap().status, 0);
+    let _ = session.info;
 }
 
 #[test]
-fn pid_mismatch_and_version_zero_hello_close_the_connection() {
+fn tracker_loss_closes_clients_until_it_is_back() {
+    run(async { tracker_loss_closes_clients_until_it_is_back_with(Fixture::default().await).await });
+}
+
+#[test]
+fn gaze_tracker_loss_closes_clients_until_it_is_back() {
+    run(async { tracker_loss_closes_clients_until_it_is_back_with(gaze_fixture().await).await });
+}
+
+#[test]
+fn pid_mismatch_closes_connection() {
     run(async {
         let fixture = Fixture::default().await;
         let mut command = fixture.channel("ET5-TEST").await;
@@ -521,6 +597,13 @@ fn pid_mismatch_and_version_zero_hello_close_the_connection() {
         check_handshake_ack(&command.receive().await).unwrap();
         command.send(&encode_client_pid(CLIENT_PID + 1)).await;
         assert_eq!(command.receive_within(TIMEOUT).await, Received::Closed);
+    });
+}
+
+#[test]
+fn version_zero_hello_closes_connection() {
+    run(async {
+        let fixture = Fixture::default().await;
         let mut command = fixture.channel("ET5-TEST").await;
         let mut hello = [0u32.to_le_bytes(), COMMAND_CHANNEL.to_le_bytes()].concat();
         hello.extend(b"client_cmd\0");
@@ -552,33 +635,101 @@ fn gaze_stream_responses_match_the_real_service() {
         let mut session = fixture.session().await;
         for (tag, command, stream, expected) in REAL_GAZE_STREAM_RESPONSES {
             session.command.send_packet(&encode_stream_request(tag, command, stream).unwrap()).await;
-            let packet = session.command.packet().await;
-            let payload = decode_envelope(&packet, DEFAULT_MAX_PAYLOAD).unwrap();
-            assert_eq!(payload[20..40], hex(expected), "{tag}");
+            let expected = format!(
+                "5450525030000000645052500c000000{tag:02x}0000000a000000040000000c000000{expected}0400000000000000"
+            );
+            assert_eq!(session.command.packet().await, hex(&expected), "{tag}");
         }
     });
 }
 
 #[test]
-fn gaze_streams_push_each_frame_until_stopped_and_are_independent_of_head_pose() {
+fn gaze_streams_push_each_frame_until_stopped() {
     run(async {
         let fixture = gaze_fixture().await;
         let mut session = fixture.session().await;
-        for stream in [3, 29, 4] {
+        let streams = [PRP_GAZE_POINT, PRP_RESPONSIVE_GAZE_POINT, PRP_GAZE_ORIGIN];
+        for stream in streams {
             assert_eq!(session.stream_request(COMMAND_STREAM_START, stream).await.1.status, 0);
         }
-        let frame = synthetic_gaze_frame(FIXED_CLOCK_US + 1000, FIXED_CLOCK_US);
+        let frame = synthetic_gaze_frame(FIXED_CLOCK_US + 9, FIXED_CLOCK_US);
         fixture.service.gaze_hub().unwrap().publish(&frame);
-        for stream in [3, 29, 4] {
-            assert_eq!(session.subscription.packet().await, gaze_package(&frame, stream).unwrap());
+        let mut packages = BTreeMap::new();
+        for _ in streams {
+            let package = session.subscription.packet().await;
+            let payload = decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap();
+            packages.insert(u32::from_le_bytes(payload[20..24].try_into().unwrap()), package);
         }
-        fixture.service.hub().publish(&sample(FIXED_CLOCK_US, [0.0; 3], [0.0; 3]));
-        assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
-        for stream in [3, 29, 4] {
+        let expected: BTreeMap<u32, Vec<u8>> =
+            streams.iter().map(|&stream| (stream, gaze_package(&frame, stream).unwrap())).collect();
+        assert_eq!(packages, expected);
+        let point =
+            decode_gaze_body(&decode_envelope(&packages[&PRP_GAZE_POINT], DEFAULT_MAX_PAYLOAD).unwrap()[28..52])
+                .unwrap();
+        assert_eq!(
+            (point.timestamp, point.valid, [point.x, point.y]),
+            (FIXED_CLOCK_US + 9, true, frame.device.combined_point.map(f64::from))
+        );
+        for stream in streams {
             assert_eq!(session.stream_request(COMMAND_STREAM_STOP, stream).await.1.status, 0);
         }
         assert_eq!(fixture.service.gaze_hub().unwrap().subscribers(), 0);
         fixture.service.gaze_hub().unwrap().publish(&frame);
         assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
     });
+}
+
+#[test]
+fn head_pose_and_gaze_streams_are_independent() {
+    run(async {
+        let fixture = gaze_fixture().await;
+        let mut session = fixture.session().await;
+        for stream in [HEAD_POSE, PRP_GAZE_POINT] {
+            session.stream_request(COMMAND_STREAM_START, stream).await;
+        }
+        session.stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
+        fixture.service.hub().publish(&sample(FIXED_CLOCK_US, [0.0, 0.0, 600.0], [0.0; 3]));
+        let frame = synthetic_gaze_frame(FIXED_CLOCK_US, FIXED_CLOCK_US);
+        fixture.service.gaze_hub().unwrap().publish(&frame);
+        assert_eq!(session.subscription.packet().await, gaze_package(&frame, PRP_GAZE_POINT).unwrap());
+        assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+    });
+}
+
+#[test]
+fn gaze_disconnect_releases_streams() {
+    run(async {
+        let fixture = gaze_fixture().await;
+        let mut session = fixture.session().await;
+        session.stream_request(COMMAND_STREAM_START, PRP_GAZE_POINT).await;
+        assert_eq!(fixture.service.gaze_hub().unwrap().subscribers(), 1);
+        drop(session);
+        assert!(eventually(|| fixture.service.gaze_hub().unwrap().subscribers() == 0).await);
+    });
+}
+
+#[test]
+fn gaze_stream_requests_for_other_streams_and_before_start() {
+    run(async {
+        let fixture = gaze_fixture().await;
+        let mut session = fixture.session().await;
+        assert_eq!(session.stream_request(COMMAND_STREAM_START, 7).await.1.status, 2);
+        assert_eq!(session.stream_request(COMMAND_STREAM_STOP, PRP_GAZE_POINT).await.1.status, 5);
+    });
+}
+
+#[test]
+fn clock_follows_the_wine_counter_source() {
+    for (name, source) in [("boottime", LinuxClock::Boottime), ("raw", LinuxClock::Raw)] {
+        let clock = wine_clock(name, Clocks::Host).unwrap();
+        let Ok(before) = LinuxClocks.read_us(source);
+        let value = now_us(&clock);
+        let Ok(after) = LinuxClocks.read_us(source);
+        assert!(before <= value && value <= after, "{name}: {before} {value} {after}");
+    }
+}
+
+#[test]
+fn unknown_clock_is_rejected() {
+    assert!(wine_clock("realtime", Clocks::Host).is_none());
 }
