@@ -17,6 +17,7 @@ mod exit;
 mod fields;
 mod frames;
 mod gaze;
+mod inference;
 mod logging;
 mod models;
 mod ttp;
@@ -46,5 +47,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "usb", usb::register)?;
     submodule(m, "device", device::register)?;
     models::register(m)?;
+    inference::register(m)?;
     Ok(())
 }
