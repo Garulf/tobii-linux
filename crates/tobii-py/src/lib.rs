@@ -8,16 +8,23 @@
 
 use pyo3::prelude::*;
 
+mod calibration;
+mod calibration_profiles;
 mod camera;
 mod commands;
 mod convert;
 mod device;
+mod display_setup;
 mod errors;
 mod exit;
+mod eye_positioning;
 mod fields;
 mod frames;
 mod gaze;
+mod gaze_device;
+mod gaze_operation;
 mod logging;
+mod monitors;
 mod ttp;
 mod usb;
 
@@ -44,5 +51,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "gaze", gaze::register)?;
     submodule(m, "usb", usb::register)?;
     submodule(m, "device", device::register)?;
+    submodule(m, "gaze_device", gaze_device::register)?;
+    submodule(m, "calibration", calibration::register)?;
+    submodule(m, "calibration_profiles", calibration_profiles::register)?;
+    submodule(m, "display_setup", display_setup::register)?;
+    submodule(m, "eye_positioning", eye_positioning::register)?;
+    submodule(m, "monitors", monitors::register)?;
     Ok(())
 }

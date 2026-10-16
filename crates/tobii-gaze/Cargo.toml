@@ -1,0 +1,16 @@
+[package]
+name = "tobii-gaze"
+description = "Eye Tracker 5 gaze configuration: calibration, profiles, display setup, eye positioning and monitors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+tobii-device.workspace = true
+tobii-protocol.workspace = true
+
+[lints]
+workspace = true

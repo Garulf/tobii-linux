@@ -446,6 +446,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-gaze"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "tobii-device",
+ "tobii-protocol",
+]
+
+[[package]]
 name = "tobii-protocol"
 version = "0.1.0"
 dependencies = [
@@ -462,6 +472,7 @@ dependencies = [
  "pyo3",
  "serde_json",
  "tobii-device",
+ "tobii-gaze",
  "tobii-protocol",
  "tobii-usb",
 ]
