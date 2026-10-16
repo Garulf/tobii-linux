@@ -15,15 +15,16 @@ There is no filtering, eye combination or coordinate transform on the host: the
 device's combined point (column 28) is the gaze point the game receives.
 tools/gaze_oracle.py runs the original code for every step; docs/gaze-host.md
 has the evidence. Steps 1 and 2 and presence decoding are implemented in
-crates/tobii-protocol/src/gaze.rs; the dataclasses here carry their results.
+crates/tobii-protocol/src/gaze.rs, step 3 and the PRP bodies in
+crates/tobii-service/src/prp_streams.rs; the dataclasses here carry their results.
 """
 from dataclasses import dataclass, fields as dataclass_fields, replace
 import json
 import struct
 
 from ._native import gaze as _gaze
+from ._native import prp as _prp
 from .frames import stream_columns
-from .prp import GazePoint, ProtocolError as PrpError, encode_envelope, encode_gaze_body
 from .ttp import Message
 from .ttp_commands import STREAM_DATA_KIND, Stream, wire_stream_id
 
@@ -36,14 +37,14 @@ PARSED_VEC3 = 10
 VEC2_STRUCT = _gaze.VEC2_STRUCT
 VEC3_STRUCT = _gaze.VEC3_STRUCT
 
-OPERATION_STREAM = 1
-OPERATION_COMPOUND_STREAM = 0xB
-PRP_GAZE_POINT = 3
-PRP_GAZE_ORIGIN = 4
-PRP_GAZE_DATA = 6
-PRP_RESPONSIVE_GAZE_POINT = 0x1D
-PRP_EYE_OPENNESS = 0x21
-PRP_COMPOUND_USER_POSITION_GUIDE = 2
+OPERATION_STREAM = _prp.OPERATION_STREAM
+OPERATION_COMPOUND_STREAM = _prp.OPERATION_COMPOUND_STREAM
+PRP_GAZE_POINT = _prp.PRP_GAZE_POINT
+PRP_GAZE_ORIGIN = _prp.PRP_GAZE_ORIGIN
+PRP_GAZE_DATA = _prp.PRP_GAZE_DATA
+PRP_RESPONSIVE_GAZE_POINT = _prp.PRP_RESPONSIVE_GAZE_POINT
+PRP_EYE_OPENNESS = _prp.PRP_EYE_OPENNESS
+PRP_COMPOUND_USER_POSITION_GUIDE = _prp.PRP_COMPOUND_USER_POSITION_GUIDE
 
 
 @dataclass(frozen=True)
@@ -256,22 +257,6 @@ class PrpRecord:
     native: bytes
 
 
-def _bool(value: int) -> int:
-    return 1 if value == 1 else 0
-
-
-def _pair_native(r: PairRecord) -> bytes:
-    return struct.pack('<qB3x3fB3x3f', r.timestamp, _bool(r.left_valid), *r.left,
-                       _bool(r.right_valid), *r.right)
-
-
-def _eye_native(e: EyeData) -> bytes:
-    return struct.pack('<B3x3fB3x3fB3x3f2fB3x3fB3xf', _bool(e.origin_valid), *e.origin,
-                       _bool(e.position_valid), *e.position, _bool(e.eye_valid),
-                       *e.gaze_point_3d, *e.gaze_point_2d, _bool(e.eyeball_valid),
-                       *e.eyeball_centre, _bool(e.pupil_valid), e.pupil_diameter)
-
-
 PRP_STREAMS = {
     'gaze_point': (OPERATION_STREAM, PRP_GAZE_POINT),
     'responsive_gaze_point': (OPERATION_STREAM, PRP_RESPONSIVE_GAZE_POINT),
@@ -283,65 +268,26 @@ PRP_STREAMS = {
 
 
 def prp_record(name: str, record) -> PrpRecord:
-    kind, stream = PRP_STREAMS[name]
-    if name in ('gaze_point', 'responsive_gaze_point'):
-        native = struct.pack('<qB3x2f', record.timestamp, _bool(record.valid), *record.point)
-    elif name == 'eye_openness':
-        native = struct.pack('<qB3xfB3xf', record.timestamp, _bool(record.left_valid),
-                             record.left, _bool(record.right_valid), record.right)
-    elif name in ('gaze_origin', 'user_position_guide'):
-        native = _pair_native(record)
-    else:
-        native = struct.pack('<q', record.timestamp) + _eye_native(record.left) + _eye_native(record.right)
-    return PrpRecord(kind, stream, native)
+    """The service callback's stream data for one platmod record, a validity kept only when 1."""
+    return PrpRecord(*_prp.prp_record(name, record.pack()))
 
 
 # PRP stream bodies and packets (game DLL serializer 0x180052e60, packet 0x18004f730) ---------
 
 
-def _timestamp_words(timestamp: int) -> tuple[int, int]:
-    value = timestamp & 0xFFFFFFFFFFFFFFFF
-    return value >> 32, value & 0xFFFFFFFF
-
-
 def pair_body(native: bytes) -> bytes:
     """Stream 4 (gaze origin) and compound stream 2 (user position guide) share this body."""
-    t, lv, lx, ly, lz, rv, rx, ry, rz = struct.unpack('<qB3x3fB3x3f', native)
-    return struct.pack('<IIII3fI3f', 44, *_timestamp_words(t), lv, lx, ly, lz, rv, rx, ry, rz)
-
-
-def _eye_words(native: bytes) -> tuple[bytes, int]:
-    v = struct.unpack('<B3x3fB3x3fB3x3f2fB3x3fB3xf', native)
-    origin_valid, origin, position_valid, position = v[0], v[1:4], v[4], v[5:8]
-    eye_valid, point_3d, point_2d = v[8], v[9:12], v[12:14]
-    eyeball_valid, eyeball, pupil_valid, pupil = v[14], v[15:18], v[18], v[19]
-    words = struct.pack('<I3f3fI3f2fI3fIf', origin_valid, *origin, *position, eye_valid,
-                        *point_3d, *point_2d, eyeball_valid, *eyeball, pupil_valid, pupil)
-    return words, position_valid
+    return _prp.stream_body(OPERATION_STREAM, PRP_GAZE_ORIGIN, native)
 
 
 def gaze_data_body(native: bytes, extended: bool) -> bytes:
     """Stream 6: 0xa4 bytes, or 0xac with the two position validities a newer peer reads."""
-    t = struct.unpack_from('<q', native)[0]
-    eye = struct.calcsize('<B3x3fB3x3fB3x3f2fB3x3fB3xf')
-    left, left_position_valid = _eye_words(native[8:8 + eye])
-    right, right_position_valid = _eye_words(native[8 + eye:8 + 2 * eye])
-    body = struct.pack('<III', 0xAC if extended else 0xA4, *_timestamp_words(t)) + left + right
-    return body + (struct.pack('<II', left_position_valid, right_position_valid) if extended else b'')
+    return _prp.stream_body(OPERATION_STREAM, PRP_GAZE_DATA, native, extended)
 
 
 def stream_body(record: PrpRecord, extended: bool = True) -> bytes | None:
     """Body the game DLL's serializer writes for this record, None where it has no case."""
-    if record.kind == OPERATION_COMPOUND_STREAM:
-        return pair_body(record.native) if record.stream == PRP_COMPOUND_USER_POSITION_GUIDE else None
-    if record.stream in (PRP_GAZE_POINT, PRP_RESPONSIVE_GAZE_POINT):
-        t, valid, x, y = struct.unpack('<qB3x2f', record.native)
-        return encode_gaze_body(GazePoint(t, bool(valid), x, y))
-    if record.stream == PRP_GAZE_ORIGIN:
-        return pair_body(record.native)
-    if record.stream == PRP_GAZE_DATA:
-        return gaze_data_body(record.native, extended)
-    return None
+    return _prp.stream_body(record.kind, record.stream, record.native, extended)
 
 
 def stream_packet(record: PrpRecord, message_tag: int = 0, extended: bool = True) -> bytes | None:
@@ -349,13 +295,7 @@ def stream_packet(record: PrpRecord, message_tag: int = 0, extended: bool = True
 
     Operation 1 for streams, 11 for compound streams; the framing is otherwise the same.
     """
-    body = stream_body(record, extended)
-    if body is None:
-        return None
-    if not 0 <= message_tag <= 0xFFFFFFFF:
-        raise PrpError('message tag is outside unsigned 32-bit range')
-    header = struct.pack('<7I', 12, message_tag, record.kind, 4, 8, record.stream, 4)
-    return encode_envelope(header + body + struct.pack('<II', 4, 0))
+    return _prp.stream_packet(record.kind, record.stream, record.native, message_tag, extended)
 
 
 # One device message to every gaze output ----------------------------------------------------

@@ -18,10 +18,13 @@ front to back after the root offset, vtables clustered at the end, fields in
 the order the builder adds them, fields equal to their default left out).
 The root table holds a sequence number (field 0), the payload type (field 1,
 u8) and the payload table (field 2). `encode_*` reproduce the original
-service builders byte for byte (tools/sesp_oracle.py).
+service builders byte for byte (tools/sesp_oracle.py). Implemented in
+crates/tobii-service/src/sesp.rs; tables are its native Table class.
 """
 from dataclasses import dataclass
 import struct
+
+from ._native import sesp as _sesp
 
 PIPE_NAME = "streamengineservices"
 URL = "tobii-sesp://" + PIPE_NAME
@@ -31,7 +34,7 @@ CHANNELS = range(0x2711, 0x2715)
 
 MAGIC = 0x70736573
 HEADER = struct.Struct("<III")
-MAX_MESSAGE = 1 << 20
+MAX_MESSAGE = _sesp.MAX_MESSAGE
 
 SIGNAL_INVALID_OPERATION = 1
 REQUEST_INITIALIZE = 2
@@ -70,38 +73,17 @@ VALID = 1
 INVALID = 0
 
 
-class SespError(ValueError):
-    pass
+SespError = _sesp.SespError
 
 
 # Framing ----------------------------------------------------------------------------------
 
 
 def frame(buffer: bytes) -> bytes:
-    return HEADER.pack(MAGIC, len(buffer), len(buffer) ^ MAGIC) + buffer
+    return _sesp.frame(buffer)
 
 
-class FrameDecoder:
-    """Reassembles messages from pipe reads of any size, as sesp_parse_message does."""
-
-    def __init__(self, limit: int = MAX_MESSAGE):
-        self.pending = b""
-        self.limit = limit
-
-    def feed(self, data: bytes) -> list[bytes]:
-        self.pending += data
-        buffers = []
-        while len(self.pending) >= HEADER.size:
-            magic, size, check = HEADER.unpack_from(self.pending)
-            if magic != MAGIC or size ^ MAGIC != check:
-                raise SespError("not a SESP message header")
-            if size > self.limit:
-                raise SespError("SESP message exceeds the local limit")
-            if len(self.pending) < HEADER.size + size:
-                break
-            buffers.append(self.pending[HEADER.size:HEADER.size + size])
-            self.pending = self.pending[HEADER.size + size:]
-        return buffers
+FrameDecoder = _sesp.FrameDecoder
 
 
 # flatcc-shaped buffer building ----------------------------------------------------------
@@ -121,72 +103,7 @@ class Reference:
     position: int
 
 
-class FlatccBuilder:
-    """Back-to-front FlatBuffers builder with flatcc's layout for small tables.
-
-    Objects are prepended to the front part; positions are kept relative to the
-    boundary between the front part and the vtable cluster, which grows in
-    creation order and shares identical vtables.
-    """
-
-    def __init__(self):
-        self.front: list[bytes] = []
-        self.front_size = 0
-        self.vtables: list[bytes] = []
-        self.vtable_size = 0
-        self.vtable_positions: dict[bytes, int] = {}
-
-    def _prepend(self, data: bytes, alignment: int = 4) -> int:
-        padding = -len(data) % alignment
-        self.front.append(data + bytes(padding))
-        self.front_size += len(data) + padding
-        return -self.front_size
-
-    def string(self, text: bytes) -> int:
-        return self._prepend(struct.pack("<I", len(text)) + text + b"\0")
-
-    def _vtable(self, entries: bytes) -> int:
-        if entries not in self.vtable_positions:
-            self.vtable_positions[entries] = self.vtable_size
-            self.vtables.append(entries)
-            self.vtable_size += len(entries)
-        return self.vtable_positions[entries]
-
-    def table(self, fields) -> int:
-        """Table of `fields` (Scalar or Reference) in the order the original builder adds them."""
-        layout = bytearray(4)
-        slots = {}
-        references = []
-        for field in fields:
-            size = 4 if isinstance(field, Reference) else struct.calcsize("<" + field.format)
-            layout += bytes(-len(layout) % size)
-            slots[field.index] = len(layout)
-            if isinstance(field, Reference):
-                references.append((len(layout), field.position))
-                layout += bytes(4)
-            else:
-                layout += struct.pack("<" + field.format, field.value)
-        count = max(slots, default=-1) + 1
-        entries = struct.pack(f"<HH{count}H", 4 + 2 * count, len(layout),
-                              *(slots.get(index, 0) for index in range(count)))
-        vtable = self._vtable(entries)
-        position = -(self.front_size + len(layout) + -len(layout) % 4)
-        struct.pack_into("<i", layout, 0, position - vtable)
-        for offset, target in references:
-            struct.pack_into("<I", layout, offset, target - (position + offset))
-        return self._prepend(bytes(layout))
-
-    def finish(self, root: int) -> bytes:
-        position = self._prepend(b"\0\0\0\0")
-        front = b"".join(reversed(self.front))
-        front = struct.pack("<I", root - position) + front[4:]
-        return front + b"".join(self.vtables)
-
-
-def _scalars(values) -> list[Scalar]:
-    """Fields (index, format, value, default) that differ from their default."""
-    return [Scalar(index, form, value) for index, form, value, default in values
-            if value != default]
+FlatccBuilder = _sesp.FlatccBuilder
 
 
 def message(sequence: int, kind: int, payload_fields, strings=()) -> bytes:
@@ -195,38 +112,30 @@ def message(sequence: int, kind: int, payload_fields, strings=()) -> bytes:
     `strings` are (field index, bytes) emitted before the payload table, which then
     refers to them.
     """
-    builder = FlatccBuilder()
-    references = [Reference(index, builder.string(text)) for index, text in strings]
-    payload = builder.table(sorted(references + list(payload_fields), key=lambda f: f.index))
-    root = builder.table(_scalars([(0, "I", sequence, 0)]) + [Reference(2, payload),
-                                                               Scalar(1, "B", kind)])
-    return frame(builder.finish(root))
+    return _sesp.message(sequence, kind, list(payload_fields), list(strings))
 
 
 # Service messages (ses_windows.dll builders) ---------------------------------------------
 
 
 def wire_error(error: int) -> int:
-    return error if error in WIRE_ERRORS else ERROR_INTERNAL
+    return _sesp.wire_error(error)
 
 
 def encode_initialize_response(sequence: int, error: int, capabilities=()) -> bytes:
     """Type 3: error, then capability flags 1..15 (`capabilities` lists the set ones)."""
-    flags = [(index, "B", 1 if index in capabilities else 0, 0)
-             for index in range(1, CAPABILITY_COUNT + 1)]
-    return message(sequence, RESPONSE_INITIALIZE,
-                   _scalars([(0, "I", wire_error(error), 0)] + flags))
+    return _sesp.encode_initialize_response(sequence, error, capabilities)
 
 
 def encode_error_response(sequence: int, kind: int, error: int) -> bytes:
     """Responses that carry only an error: head-pose start (5) and stop (7), send statistics
     (0x33) and the invalid-operation signal (1)."""
-    return message(sequence, kind, _scalars([(0, "I", wire_error(error), 0)]))
+    return _sesp.encode_error_response(sequence, kind, error)
 
 
 def encode_stream_status_response(sequence: int) -> bytes:
     """Type 0x1b, an empty table."""
-    return message(sequence, RESPONSE_NOTIFY_STREAM_STATUS, [])
+    return _sesp.encode_stream_status_response(sequence)
 
 
 @dataclass(frozen=True)
@@ -239,72 +148,15 @@ class HeadPose:
     rotation_validity: tuple = (VALID, VALID, VALID)
 
 
-def _float32(value: float) -> float:
-    return struct.unpack("<f", struct.pack("<f", value))[0]
-
-
 def encode_head_pose(sequence: int, pose: HeadPose) -> bytes:
     """Type 8: timestamp high and low words, position, rotation, then the validities."""
-    timestamp = pose.timestamp_us & 0xFFFFFFFFFFFFFFFF
-    values = [(0, "I", timestamp >> 32, 0), (1, "I", timestamp & 0xFFFFFFFF, 0)]
-    values += [(2 + i, "f", _float32(v), 0.0) for i, v in enumerate(pose.position)]
-    values += [(5 + i, "f", _float32(v), 0.0) for i, v in enumerate(pose.rotation)]
-    values += [(8, "i", 1 if pose.position_validity == VALID else 0, 1)]
-    values += [(9 + i, "i", 1 if v == VALID else 0, 1) for i, v in enumerate(pose.rotation_validity)]
-    return message(sequence, SUBSCRIPTION_HEADPOSE, _scalars(values))
+    return _sesp.encode_head_pose(sequence, pose)
 
 
 # Reading ----------------------------------------------------------------------------------
 
 
-class Table:
-    """Field access on one FlatBuffers table, bounds-checked."""
-
-    def __init__(self, buffer: bytes, position: int):
-        self.buffer, self.position = buffer, position
-        if position < 0 or position + 4 > len(buffer):
-            raise SespError("table outside the buffer")
-        vtable = position - struct.unpack_from("<i", buffer, position)[0]
-        if vtable < 0 or vtable + 4 > len(buffer):
-            raise SespError("vtable outside the buffer")
-        self.vtable_size, self.table_size = struct.unpack_from("<HH", buffer, vtable)
-        if vtable + self.vtable_size > len(buffer) or position + self.table_size > len(buffer):
-            raise SespError("vtable or table runs past the buffer")
-        self.vtable = vtable
-
-    def _slot(self, index: int) -> int | None:
-        entry = 4 + 2 * index
-        if entry + 2 > self.vtable_size:
-            return None
-        offset = struct.unpack_from("<H", self.buffer, self.vtable + entry)[0]
-        return self.position + offset if offset else None
-
-    def scalar(self, index: int, form: str, default=0):
-        slot = self._slot(index)
-        if slot is None:
-            return default
-        if slot + struct.calcsize("<" + form) > len(self.buffer):
-            raise SespError("field runs past the buffer")
-        return struct.unpack_from("<" + form, self.buffer, slot)[0]
-
-    def _target(self, index: int) -> int | None:
-        slot = self._slot(index)
-        return None if slot is None else slot + self.scalar(index, "I")
-
-    def table(self, index: int) -> "Table | None":
-        target = self._target(index)
-        return None if target is None else Table(self.buffer, target)
-
-    def string(self, index: int) -> bytes | None:
-        target = self._target(index)
-        if target is None:
-            return None
-        if target + 4 > len(self.buffer):
-            raise SespError("string outside the buffer")
-        size = struct.unpack_from("<I", self.buffer, target)[0]
-        if target + 4 + size > len(self.buffer):
-            raise SespError("string runs past the buffer")
-        return self.buffer[target + 4:target + 4 + size]
+Table = _sesp.Table
 
 
 @dataclass(frozen=True)
@@ -315,10 +167,7 @@ class Message:
 
 
 def decode(buffer: bytes) -> Message:
-    if len(buffer) < 4:
-        raise SespError("buffer too short for a root offset")
-    root = Table(buffer, struct.unpack_from("<I", buffer, 0)[0])
-    return Message(root.scalar(0, "I"), root.scalar(1, "B"), root.table(2))
+    return Message(*_sesp.decode(buffer))
 
 
 @dataclass(frozen=True)
@@ -329,33 +178,17 @@ class InitializeRequest:
 
 def initialize_request(message: Message) -> InitializeRequest:
     """Type 2: the client's device URL (field 0) and its subscription channel id (field 1)."""
-    if message.kind != REQUEST_INITIALIZE or message.payload is None:
-        raise SespError("not an initialize request")
-    url = message.payload.string(0) or b""
-    return InitializeRequest(url.decode("utf-8", "replace"), message.payload.scalar(1, "I"))
+    return InitializeRequest(*_sesp.initialize_request(message.kind, message.payload))
 
 
 def head_pose(message: Message) -> HeadPose:
     """Type 8 as the client reads it (0x18008b3a0): absent validities default to valid."""
-    if message.kind != SUBSCRIPTION_HEADPOSE or message.payload is None:
-        raise SespError("not a head-pose message")
-    table = message.payload
-    timestamp = table.scalar(0, "I") << 32 | table.scalar(1, "I")
-    if timestamp >= 1 << 63:
-        timestamp -= 1 << 64
-    return HeadPose(timestamp,
-                    tuple(table.scalar(i, "f", 0.0) for i in range(2, 5)),
-                    tuple(table.scalar(i, "f", 0.0) for i in range(5, 8)),
-                    table.scalar(8, "i", 1),
-                    tuple(table.scalar(i, "i", 1) for i in range(9, 12)))
+    return HeadPose(*_sesp.head_pose(message.kind, message.payload))
 
 
 def capabilities(message: Message) -> tuple[int, set[int]]:
     """Error and set capability flags of an initialize response."""
-    if message.kind != RESPONSE_INITIALIZE or message.payload is None:
-        raise SespError("not an initialize response")
-    table = message.payload
-    return table.scalar(0, "I"), {i for i in range(1, CAPABILITY_COUNT + 1) if table.scalar(i, "B")}
+    return _sesp.capabilities(message.kind, message.payload)
 
 
 # Transport handshake ----------------------------------------------------------------------
@@ -369,19 +202,13 @@ class Hello:
 
 def decode_hello(data: bytes) -> Hello:
     """First pipe message of a channel: u32 channel, reply pipe name, NUL (0x18008f470, flag 0)."""
-    if len(data) < 5 or not data.endswith(b"\0"):
-        raise SespError("malformed SESP hello")
-    channel = struct.unpack_from("<I", data)[0]
-    name = data[4:-1]
-    if channel not in CHANNELS or not name or b"\0" in name:
-        raise SespError("malformed SESP hello")
-    return Hello(channel, name.decode("ascii"))
+    return Hello(*_sesp.decode_hello(data))
 
 
 def encode_hello(channel: int, reply_pipe: str) -> bytes:
-    return struct.pack("<I", channel) + reply_pipe.encode("ascii") + b"\0"
+    return _sesp.encode_hello(channel, reply_pipe)
 
 
 def encode_slot(index: int) -> bytes:
     """The service's answer to a hello: its slot index for the connection."""
-    return struct.pack("<I", index)
+    return _sesp.encode_slot(index)
