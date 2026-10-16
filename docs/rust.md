@@ -42,6 +42,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-protocol` | USB channel framing, TTP messages and items, typed values and the reply reader, request builders, stream ids, column sets, image frames, camera hardware info, gaze and presence stream decoding with the platmod records. Pure: no I/O, clocks or threads. | `hmac`, `md-5` |
 | `crates/tobii-usb` | nusb backend: sysfs descriptor probe, `BulkTransport` on interface 0, `UsbChannel` (vendor open/close, framed writes, demultiplexed reads) with its continuous reader thread, the raw traffic log and its replay. | `tobii-protocol`, `nusb` |
 | `crates/tobii-device` | `TrackerSession` (startup, realms, calls, hardware info, image frames), `StreamReader` and `ItemPump` (subscriptions, demultiplexing, silence and suspend checks), `DeviceClockWatch`, `ClockMapper`, `TrackerLink` with `Backoff`, reader threads (`newest`, `drained`), `usb_session`. Generic over the `Channel` trait. | `tobii-protocol`, `tobii-usb`, `rustix` |
+| `crates/tobii-headpose` | Head-pose math rebuilt from the runtime's float32 code: the float32 inverse, face-model projection and Jacobians, mesh normalization, the installed fitting model (`load_pose_model`), the rigid, deformation and mode updates, the bounded retry policies, the temporal fitter (`TemporalPoseFitter`), LBF features, predictor and eye refinement, landmark smoothing (`LandmarkFilter`), Euler conversions, One Euro filters, the geometry stage and `HeadPoseOutput`. Plain types in and out; bound as `_native.pose_*`, `lbf_features`, `lbf_predictor`, `eye_refine`, `landmark_smoothing` and `head_pose_pipeline` from `tobii-py/src/headpose/`. | `tobii-models` |
 | `crates/tobii-py` | PyO3 bindings, one submodule per Python module (`_native.ttp`, `fields`, `commands`, `frames`, `camera_info`, `gaze`, `usb`, `device`). Nothing else depends on it. | all of the above, `pyo3` |
 
 Dependencies point down the table only. A later crate never reaches into the
@@ -63,6 +64,11 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `driver.py` (session, clock mapper) | `tobii_device::session`, `clock` | `TrackerSession` keeps `pending_streams`, `usb_device`; head-pose glue stays |
 | `streams.py` (reader, watches) | `tobii_device::streams` | `GazeAndImageStreams`, `serve_tracker` stay |
 | `supervisor.py` | `tobii_device::supervisor` | `TrackerLink` holds the Python callables |
+| `pose_linalg.py`, `pose_projection.py`, `pose_mesh.py`, `pose_geometry.py`, `pose_output.py` | `tobii_headpose::{linalg, projection, mesh, geometry, output}` | arrays cross as float32 bytes (`_arrays.py`); filters wrap native objects |
+| `pose_fit.py`, `pose_model.py`, `pose_policy.py`, `pose_temporal.py` | `tobii_headpose::{fit, model, policy, temporal}` | `PreparedPoseModel` stays a dataclass, packed per call; `TemporalPoseFitter` wraps the native fitter and exposes its state |
+| `lbf_features.py`, `lbf_predictor.py`, `eye_refine.py` | `tobii_headpose::{lbf, eye_refine}` | the `read_lbf` dicts are converted per call; `refine_eye_landmarks` keeps the caller's refine callable |
+| `landmark_smoothing.py` | `tobii_headpose::smoothing` | `LandmarkRecord` stays a dataclass; least squares are solved in double-double, so coordinates may differ from the former NumPy/LAPACK path by a few float32 ulps |
+| `head_pose_pipeline.py` | `tobii_headpose::pipeline` | `HeadPoseSample`, `DisplayArea` dataclasses in Python; `headpose.py` stays Python glue over D1 |
 
 ## Conventions
 
@@ -152,7 +158,9 @@ Makefile `ORACLES` list, this document) take one line per phase.
 | Phase | New crate | Python modules it replaces | Depends on | Parallel with |
 | --- | --- | --- | --- | --- |
 | Game service: PRP, SESP, tet-tcp | `tobii-service` | `prp.py`, `prp_session.py`, `prp_service.py`, `sesp.py`, `sesp_service.py`, `tet_tcp.py`, `tet_tcp_service.py`, `qpc_clock.py`, PRP part of `gaze.py` | `tobii-protocol::gaze`, `tobii-device` | all |
-| Head-pose pipeline incl. OpenVINO | `tobii-headpose` | `face_detect.py`, `face_tracking.py`, `d1*.py`, `lbf*.py`, `eye_refine.py`, `landmark_smoothing.py`, `pose_*.py`, `head_pose_pipeline.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-device::session` (camera calibration, frames) | all |
+| Head-pose inference: OpenVINO, face detection, D1 | `tobii-inference` | `legacy_ir.py`, `face_detect.py`, `d1.py`, `d1_quality.py` | `tobii-models` | all |
+| Head-pose math (done) | `tobii-headpose` | `lbf_features.py`, `lbf_predictor.py`, `eye_refine.py`, `landmark_smoothing.py`, `pose_*.py`, `head_pose_pipeline.py` (`headpose.py` stays glue) | `tobii-models` | all |
+| Face tracking and HeadPoseProcessor | (in `tobii-headpose` or the binary) | `face_tracking.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-inference`, `tobii-headpose`, `tobii-device::session` | after both |
 | Gaze device and calibration, display setup | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
 | Setup app (gtk4-rs) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
 | Binary | `tobii-linux` (bin) | `cli.py`, `streams.GazeAndImageStreams`, `serve_tracker`, `demo/` | everything | last |
