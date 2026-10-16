@@ -277,7 +277,7 @@ impl FlatccBuilder {
         self.prepend(layout)
     }
 
-    pub fn finish(mut self, root: i64) -> Vec<u8> {
+    pub fn finish(&mut self, root: i64) -> Vec<u8> {
         let position = self.prepend(vec![0; 4]);
         let mut buffer: Vec<u8> = self.front.iter().rev().flatten().copied().collect();
         buffer[..4].copy_from_slice(&((root - position) as u32).to_le_bytes());

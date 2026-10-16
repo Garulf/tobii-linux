@@ -18,6 +18,14 @@ mod fields;
 mod frames;
 mod gaze;
 mod logging;
+mod prp;
+mod prp_service;
+mod prp_session;
+mod qpc_clock;
+mod sesp;
+mod sesp_service;
+mod tet_tcp;
+mod tet_tcp_service;
 mod ttp;
 mod usb;
 
@@ -44,5 +52,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "gaze", gaze::register)?;
     submodule(m, "usb", usb::register)?;
     submodule(m, "device", device::register)?;
+    submodule(m, "prp", prp::register)?;
+    submodule(m, "prp_session", prp_session::register)?;
+    submodule(m, "prp_service", prp_service::register)?;
+    submodule(m, "qpc_clock", qpc_clock::register)?;
+    submodule(m, "sesp", sesp::register)?;
+    submodule(m, "sesp_service", sesp_service::register)?;
+    submodule(m, "tet_tcp", tet_tcp::register)?;
+    submodule(m, "tet_tcp_service", tet_tcp_service::register)?;
     Ok(())
 }
