@@ -12,6 +12,10 @@ miniz_oxide.workspace = true
 roxmltree.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+ureq = { workspace = true, optional = true }
+
+[features]
+download = ["dep:ureq"]
 
 [lints]
 workspace = true
