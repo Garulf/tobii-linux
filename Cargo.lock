@@ -584,6 +584,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-setup"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_json",
+ "thiserror",
+ "tobii-device",
+ "tobii-gaze",
+ "tobii-protocol",
+ "tobii-usb",
+]
+
+[[package]]
 name = "tobii-usb"
 version = "0.1.0"
 dependencies = [
