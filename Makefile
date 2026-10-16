@@ -12,6 +12,7 @@ RUNTIME := evidence/private/binaries/platform_runtime_IS5LEYETRACKER5_service.ex
 GAME_DLL := evidence/private/binaries/tobii_gameintegration_x64.dll
 ORACLES := ttp_commands ttp_hwinfo ttp_reply gaze presence gaze_calibration gaze_device display_setup sesp
 ORACLES += lbf_coeff lbf_tree d1_records pose_mesh
+ORACLES += d1_input d1_geometry d1_transform d1_warp d1_crop d1_quality face_detect
 BINARY_ORACLES := usb_framing ttp_encoder
 GAME_ORACLES := prp_encoder prp_session
 
