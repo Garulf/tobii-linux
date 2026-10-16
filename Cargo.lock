@@ -496,6 +496,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-headpose"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tobii-models",
+]
+
+[[package]]
 name = "tobii-models"
 version = "0.1.0"
 dependencies = [
