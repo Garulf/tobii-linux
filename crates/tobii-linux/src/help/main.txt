@@ -1,0 +1,19 @@
+usage: tobii-linux [-h] {probe,demo,setup,headpose,serve} ...
+
+Native Eye Tracker 5 driver (experimental)
+
+positional arguments:
+  {probe,demo,setup,headpose,serve}
+    probe               Inspect standard USB descriptors without claiming
+                        interfaces
+    demo                Serve the live browser demo; see demo --help for its
+                        options
+    setup               Guided display setup and calibration in the browser;
+                        see setup --help
+    headpose            Start the tracker and print head-pose samples as JSON
+                        lines
+    serve               Serve tracker head pose and gaze to Windows games
+                        through the Wine pipe bridge
+
+options:
+  -h, --help            show this help message and exit

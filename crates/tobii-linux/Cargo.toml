@@ -1,0 +1,30 @@
+[package]
+name = "tobii-linux"
+description = "The tobii-linux command: descriptor probe, head-pose session, the game service and the browser demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tobii-linux"
+path = "src/main.rs"
+
+[dependencies]
+jiff.workspace = true
+log.workspace = true
+miniz_oxide.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tobii-device.workspace = true
+tobii-gaze.workspace = true
+tobii-headpose.workspace = true
+tobii-inference.workspace = true
+tobii-models.workspace = true
+tobii-protocol.workspace = true
+tobii-service.workspace = true
+tobii-usb.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

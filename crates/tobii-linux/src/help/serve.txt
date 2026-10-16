@@ -1,0 +1,37 @@
+usage: tobii-linux serve [-h] --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+                         [--models MODELS] [--channel CHANNEL] [--index INDEX]
+                         [--host HOST] [--port PORT] [--name NAME]
+                         [--display-id DISPLAY_ID]
+                         [--wine-clock {auto,boottime,raw}] [--no-gaze]
+                         [--tet-tcp] [--sesp-positions {prp,windows}]
+
+options:
+  -h, --help            show this help message and exit
+  --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+                        Display area corners in millimetres: top-left, top-
+                        right, bottom-left
+  --models MODELS
+  --channel CHANNEL     USB channel carrying TTP
+  --index INDEX         Device index from probe
+  --host HOST
+  --port PORT           TCP port the bridge connects to
+  --name NAME           Device name in tobii-prp://<name>
+  --display-id DISPLAY_ID
+                        Monitor device instance id the game's window tracking
+                        matches (the part before '##'); needed only when the
+                        game tracks a window
+  --wine-clock {auto,boottime,raw}
+                        Clock behind the game's Wine QueryPerformanceCounter:
+                        auto follows what the bridge reports (default),
+                        boottime is upstream Wine 10.17 and later, raw older
+                        Wine and every Proton
+  --no-gaze             Serve head pose only, without subscribing the gaze
+                        stream
+  --tet-tcp             Serve the route that needs no Wine patch instead of
+                        the PRP pipes: gaze on TCP 127.0.0.1:4455, head pose
+                        over the bridge's streamengineservices pipe
+                        (experimental)
+  --sesp-positions {prp,windows}
+                        With --tet-tcp: send head positions the game layer
+                        turns into the PRP route's positions (prp, default),
+                        or unchanged as the Windows service does (windows)
