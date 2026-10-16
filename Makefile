@@ -11,6 +11,7 @@ ORACLE_PATH := .local/python:.local/inference:src
 RUNTIME := evidence/private/binaries/platform_runtime_IS5LEYETRACKER5_service.exe
 ORACLES := ttp_commands ttp_hwinfo ttp_reply gaze presence gaze_calibration gaze_device display_setup
 ORACLES += lbf_coeff lbf_tree d1_records pose_mesh
+ORACLES += d1_input d1_geometry d1_transform d1_warp d1_crop d1_quality face_detect
 BINARY_ORACLES := usb_framing ttp_encoder
 
 .PHONY: native native-debug rust-test rust-lint test oracles check clean-native
