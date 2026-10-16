@@ -56,6 +56,9 @@
         postInstall = ''
           install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/tobii-linux $out/bin/tobii-linux
         '';
+        postFixup = ''
+          ln -s ${lib.getExe tobii-setup} $out/bin/tobii-linux-setup
+        '';
         checkPhase = ''
           runHook preCheck
           mkdir -p models && ln -s ${models} models/tobii-et5
