@@ -46,7 +46,7 @@
           ];
         };
         cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
-        nativeBuildInputs = with pkgs.rustPlatform; [ cargoSetupHook maturinBuildHook ];
+        nativeBuildInputs = with pkgs.rustPlatform; [ cargoSetupHook maturinBuildHook pkgs.makeWrapper ];
         preConfigure = ''
           export HOME="$NIX_BUILD_TOP/home"
           mkdir -p "$HOME"
@@ -61,6 +61,7 @@
           install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/tobii-linux $out/bin/tobii-linux
         '';
         postFixup = ''
+          wrapProgram $out/bin/tobii-linux --set-default TOBII_LINUX_MODELS ${models}
           ln -s ${lib.getExe tobii-setup} $out/bin/tobii-linux-setup
         '';
         checkPhase = ''
