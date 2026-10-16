@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Run original 0x14007e440 over persistent synthetic frame sequences."""
 from dataclasses import replace
-import inspect
 import json
 from pathlib import Path
-import textwrap
 import struct
 import numpy as np
 from unicorn import UC_HOOK_CODE
@@ -14,7 +12,6 @@ from ttp_encoder_oracle import SHA256
 from tobii_linux.pose_model import load_pose_model
 from tobii_linux.pose_projection import model_jacobian
 from tobii_linux.pose_temporal import FLOAT_PI,TemporalPoseFitter
-import tobii_linux.pose_fit as pose_fit
 ROOT=Path(__file__).resolve().parents[1]
 HEAP,HEAP_END=0x66000000,0x6c000000
 FIT_RETURNS={0x14007ed53:'initial',0x14007ef57:'temporal'}
@@ -162,13 +159,6 @@ TOLERANCES={'rigid_state':1e-5,'rotation':1e-5,'translation':1e-5,'shape_coeffic
 KEYS=('rigid_state','shape_coefficients','animation_coefficients','rotation','translation')
 
 
-def float32_accumulation_step():
-    """mode_step with float32 instead of float64 matrix accumulation, to measure sensitivity."""
-    source=textwrap.dedent(inspect.getsource(pose_fit.mode_step)).replace('np.float64','np.float32')
-    namespace={};exec(compile(source,'float32_mode_step','exec'),pose_fit.__dict__,namespace)
-    return namespace['mode_step']
-
-
 def compare(actual,expected,sensitivity):
     errors={key:float(np.max(np.abs(actual[key]-expected[key]))) for key in KEYS}
     measured=[x for x in actual['trace'] if 'error' in x];predicted=[x for x in expected['trace'] if 'error' in x]
@@ -187,10 +177,10 @@ def main():
     base=load_pose_model(ROOT/'models/tobii-et5/support')
     binary=(ROOT/'evidence/private/binaries/platform_runtime_IS5LEYETRACKER5_service.exe').read_bytes()
     report={'runtime_sha256':SHA256,'entry':'0x14007e440','last_argument':1,'sequences':{}}
-    failures=[];float32_step=float32_accumulation_step()
+    failures=[]
     for name,(translation_limits,frames) in SEQUENCES.items():
         model=base if translation_limits is None else replace(base,translation_limits=np.asarray(translation_limits,dtype=np.float32))
-        original=OriginalTemporalCaller(binary,model);native=TemporalPoseFitter(model);variant=TemporalPoseFitter(model);rows=[]
+        original=OriginalTemporalCaller(binary,model);native=TemporalPoseFitter(model);variant=TemporalPoseFitter(model,accumulation='float32');rows=[]
         for seed,(label,angles,translation,noise,*event) in enumerate(frames):
             points=landmarks(model,angles,translation,noise,seed)
             if event==['lose-pose']:
@@ -198,9 +188,7 @@ def main():
                 for fitter in (native,variant):
                     fitter.rigid_state=np.array([0,FLOAT_PI,0,0,0,0],dtype=np.float32);fitter.initialised=True
             actual=original.process(points,640,480);expected=native.process(points,640,480)
-            standard=pose_fit.mode_step;pose_fit.mode_step=float32_step
-            try:alternative=variant.process(points,640,480)
-            finally:pose_fit.mode_step=standard
+            alternative=variant.process(points,640,480)
             sensitivity={key:float(np.max(np.abs(expected[key]-alternative[key]))) for key in KEYS}
             decisions,fixed,numeric,errors=compare(actual,expected,sensitivity)
             row={'frame':label,'event':event[0] if event else None,'decisions_agree':decisions,
