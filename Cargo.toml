@@ -13,6 +13,7 @@ tobii-protocol = { path = "crates/tobii-protocol" }
 tobii-usb = { path = "crates/tobii-usb" }
 tobii-device = { path = "crates/tobii-device" }
 tobii-models = { path = "crates/tobii-models" }
+tobii-inference = { path = "crates/tobii-inference" }
 hmac = "0.13"
 md-5 = "0.11"
 nusb = "0.2.8"
@@ -25,6 +26,7 @@ memchr = "2"
 miniz_oxide = "0.8"
 roxmltree = "0.21"
 sha2 = "0.11"
+libloading = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
