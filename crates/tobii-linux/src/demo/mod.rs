@@ -178,7 +178,8 @@ pub async fn run(
         })
     };
     use tokio::signal::unix::{SignalKind, signal};
-    let (mut interrupt, mut terminate) = (signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?);
+    let mut signals =
+        if ready.is_some() { None } else { Some((signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?)) };
     match ready {
         Some(ready) => ready(url),
         None => println!("Demo running at {url} (Ctrl+C to stop)"),
@@ -207,8 +208,7 @@ pub async fn run(
     };
     tokio::select! {
         () = stopped => {}
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
+        () = signalled(signals.as_mut()) => {}
     }
     status.abort();
     thread.stop.set();
@@ -220,6 +220,19 @@ pub async fn run(
         eprintln!("The tracker thread did not stop in time; streams may still be subscribed");
     }
     Ok(())
+}
+
+/// Waits for SIGINT or SIGTERM; forever without handlers, as an embedded demo has none.
+async fn signalled(signals: Option<&mut (tokio::signal::unix::Signal, tokio::signal::unix::Signal)>) {
+    match signals {
+        Some((interrupt, terminate)) => {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// `tobii-linux demo [options]`.
