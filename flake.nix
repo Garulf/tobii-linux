@@ -32,14 +32,21 @@
         env.TOBII_OPENVINO_LIBRARY_DIR = "${lib.getLib pkgs.openvino}/lib";
         dependencies = with pkgs.python3Packages; [ numpy openvino ];
         makeWrapperArgs = [ "--set-default TOBII_LINUX_MODELS ${models}" ];
+        postBuild = ''
+          cargo build --release --offline --frozen -p tobii-linux --bin tobii-linux --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+        '';
+        postInstall = ''
+          install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/tobii-linux $out/bin/tobii-linux
+        '';
         checkPhase = ''
           runHook preCheck
           mkdir -p models && ln -s ${models} models/tobii-et5
           cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
+          $out/bin/tobii-linux serve --help | grep -q -- --tet-tcp
           runHook postCheck
         '';
-        pythonImportsCheck = [ "tobii_linux.usb" "tobii_linux._native" ];
+        pythonImportsCheck = [ "tobii_linux.usb" "tobii_linux._native" "tobii_linux.cli" ];
         meta = {
           description = "Experimental Eye Tracker 5 head-pose driver";
           platforms = pkgs.lib.platforms.linux;
