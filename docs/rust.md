@@ -115,11 +115,16 @@ rustc. A binary built there runs inside the same shell. The flake has a `tobii-s
 package (buildRustPackage with gtk4 and wrapGAppsHook4).
 
 `tobii-linux-setup --help` lists the options of `tobii-linux setup` without the browser
-ones (`--host`, `--port`, `--no-browser`), plus `--windowed` and `--simulate-monitors`.
+ones (`--host`, `--port`, `--no-browser`), plus `--windowed`, `--simulate-monitors` and
+`--simulate-compute-failure`.
 `--simulate mapped|unmapped` runs against `simulated::SimulatedTracker` (the port of
 `simulated_tracker.py`, same scripted device and user) with profiles and backups in a
 fresh temporary directory; `--simulate-monitors` adds a portrait monitor left of the
-27 inch primary one so the monitor switcher can be tried. On a real desktop the window
+27 inch primary one so the monitor switcher can be tried, and
+`--simulate-compute-failure N` refuses the Nth compute to show "Oops. No detection.".
+The simulated user looks at the targets as scaled into the calibration area of the
+display area the device holds (the Python simulation looks at the unscaled points, so a
+display set up with a diagonal over 700 mm stalls its calibration). On a real desktop the window
 moves with `fullscreen_on_monitor` to the monitor whose GDK connector matches the
 xrandr output.
 
