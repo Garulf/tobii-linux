@@ -28,6 +28,7 @@ pub fn error(error: Error) -> PyErr {
         Error::Value(message) => PyValueError::new_err(message),
         Error::Unsupported(message) => PyNotImplementedError::new_err(message),
         Error::Models(error) => crate::models::error(error),
+        Error::Inference(error) => crate::inference::error(error),
         Error::Io(error) => error.into(),
     }
 }
