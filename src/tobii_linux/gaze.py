@@ -14,18 +14,18 @@ The ET5 computes gaze on the device. The runtime only routes each 0x500 message:
 There is no filtering, eye combination or coordinate transform on the host: the
 device's combined point (column 28) is the gaze point the game receives.
 tools/gaze_oracle.py runs the original code for every step; docs/gaze-host.md
-has the evidence.
+has the evidence. Steps 1 and 2 and presence decoding are implemented in
+crates/tobii-protocol/src/gaze.rs; the dataclasses here carry their results.
 """
 from dataclasses import dataclass, fields as dataclass_fields, replace
 import json
 import struct
 
-from .frames import FRAME_STRUCT, COLUMN_STRUCT, stream_columns, struct_code
+from ._native import gaze as _gaze
+from .frames import stream_columns
 from .prp import GazePoint, ProtocolError as PrpError, encode_envelope, encode_gaze_body
-from .ttp import Field, Message, ProtocolError
-from .ttp_commands import (FIELD_FIXED16, FIELD_FIXED42, FIELD_INT32, FIELD_INT64, FIELD_STRUCT,
-                           FIELD_UINT32, STREAM_DATA_KIND, Stream, wire_stream_id)
-from .ttp_fields import FIXED16_SCALE, FIXED42_SCALE, float32
+from .ttp import Message
+from .ttp_commands import STREAM_DATA_KIND, Stream, wire_stream_id
 
 PARSED_UINT32 = 1
 PARSED_INT32 = 2
@@ -33,8 +33,8 @@ PARSED_INT64 = 4
 PARSED_FLOAT = 5
 PARSED_VEC2 = 9
 PARSED_VEC3 = 10
-VEC2_STRUCT = 0x1F40
-VEC3_STRUCT = 0x1F41
+VEC2_STRUCT = _gaze.VEC2_STRUCT
+VEC3_STRUCT = _gaze.VEC3_STRUCT
 
 OPERATION_STREAM = 1
 OPERATION_COMPOUND_STREAM = 0xB
@@ -89,78 +89,19 @@ class DeviceGaze:
 
 
 # Column id: (record field, parsed type, field set when the column is present).
-COLUMNS = {
-    1: ('timestamp', PARSED_INT64, None),
-    2: ('left_origin_tracker', PARSED_VEC3, None),
-    3: ('left_position_relative', PARSED_VEC3, None),
-    4: ('left_gaze_point_3d', PARSED_VEC3, None),
-    5: ('left_gaze_point_2d', PARSED_VEC2, None),
-    6: ('left_pupil_diameter', PARSED_FLOAT, None),
-    7: ('left_validity', PARSED_UINT32, None),
-    8: ('right_origin_tracker', PARSED_VEC3, None),
-    9: ('right_position_relative', PARSED_VEC3, None),
-    10: ('right_gaze_point_3d', PARSED_VEC3, None),
-    11: ('right_gaze_point_2d', PARSED_VEC2, None),
-    12: ('right_pupil_diameter', PARSED_FLOAT, None),
-    13: ('right_validity', PARSED_UINT32, None),
-    14: (None, PARSED_UINT32, None),
-    17: (None, PARSED_UINT32, None),
-    20: (None, PARSED_UINT32, None),
-    21: ('right_origin_tracker_validity', PARSED_UINT32, None),
-    22: ('left_origin_tracker_validity', PARSED_UINT32, None),
-    23: ('left_eyeball_centre', PARSED_VEC3, 'left_eyeball_present'),
-    24: ('right_eyeball_centre', PARSED_VEC3, 'right_eyeball_present'),
-    27: ('combined_validity', PARSED_UINT32, None),
-    28: ('combined_point', PARSED_VEC2, None),
-    29: ('left_position_relative_validity', PARSED_UINT32, None),
-    30: ('right_position_relative_validity', PARSED_UINT32, None),
-    31: ('responsive_validity', PARSED_UINT32, None),
-    32: ('responsive_point', PARSED_VEC2, None),
-    33: ('left_origin_display_validity', PARSED_UINT32, None),
-    34: ('left_origin_display', PARSED_VEC3, None),
-    35: ('right_origin_display_validity', PARSED_UINT32, None),
-    36: ('right_origin_display', PARSED_VEC3, None),
-    37: ('left_position_guide', PARSED_VEC3, None),
-    38: ('left_position_guide_validity', PARSED_UINT32, None),
-    39: ('right_position_guide', PARSED_VEC3, None),
-    40: ('right_position_guide_validity', PARSED_UINT32, None),
-    41: ('left_openness', PARSED_FLOAT, None),
-    42: ('left_openness_validity', PARSED_UINT32, None),
-    43: ('right_openness', PARSED_FLOAT, None),
-    44: ('right_openness_validity', PARSED_UINT32, None),
-}
+COLUMNS = dict(_gaze.COLUMNS)
 VALIDITY_FIELDS = tuple(f.name for f in dataclass_fields(DeviceGaze)
                         if f.name.endswith(('validity', '_present')))
+assert tuple(f.name for f in dataclass_fields(DeviceGaze)) == _gaze.DEVICE_GAZE_FIELDS
 
 
-def _fixed42_float(field: Field) -> float:
-    return float32(struct.unpack('>q', field.data)[0] * FIXED42_SCALE)
-
-
-def _fixed16_float(field: Field) -> float:
-    return float32(float32(struct.unpack('>i', field.data)[0]) * FIXED16_SCALE)
+def _device(values) -> DeviceGaze | None:
+    return None if values is None else DeviceGaze(*values)
 
 
 def parsed_value(items: tuple) -> tuple:
     """(parsed type, value) of one column value, as the runtime's column reader types it."""
-    first = items[0]
-    if len(items) == 1:
-        if first.tag == FIELD_INT64 and len(first.data) == 8:
-            return PARSED_INT64, struct.unpack('>q', first.data)[0]
-        if first.tag == FIELD_UINT32 and len(first.data) == 4:
-            return PARSED_UINT32, struct.unpack('>I', first.data)[0]
-        if first.tag == FIELD_INT32 and len(first.data) == 4:
-            return PARSED_INT32, struct.unpack('>i', first.data)[0]
-        if first.tag == FIELD_FIXED16 and len(first.data) == 4:
-            return PARSED_FLOAT, _fixed16_float(first)
-    if first.tag == FIELD_STRUCT and all(item.tag == FIELD_FIXED42 and len(item.data) == 8
-                                         for item in items[1:]):
-        shape = struct_code(first)
-        if shape == (2, VEC2_STRUCT) and len(items) == 3:
-            return PARSED_VEC2, tuple(_fixed42_float(item) for item in items[1:])
-        if shape == (3, VEC3_STRUCT) and len(items) == 4:
-            return PARSED_VEC3, tuple(_fixed42_float(item) for item in items[1:])
-    return None, None
+    return _gaze.parsed_value(items)
 
 
 def decode_gaze_message(payload: bytes) -> DeviceGaze | None:
@@ -169,25 +110,11 @@ def decode_gaze_message(payload: bytes) -> DeviceGaze | None:
     Unknown columns are skipped, a repeated column overwrites the earlier one and
     a known column with another type drops the message without any callback.
     """
-    values = {}
-    for column in stream_columns(payload):
-        if column.column_id not in COLUMNS:
-            continue
-        name, expected, present = COLUMNS[column.column_id]
-        parsed, value = parsed_value(column.value)
-        if parsed != expected:
-            return None
-        if name is not None:
-            values[name] = value
-        if present is not None:
-            values[present] = 1
-    return DeviceGaze(**values)
+    return _device(_gaze.decode_gaze_message(payload))
 
 
 def gaze_message(message: Message) -> DeviceGaze | None:
-    if message.kind != STREAM_DATA_KIND or message.command != wire_stream_id(Stream.GAZE):
-        raise ProtocolError('Not a gaze stream message')
-    return decode_gaze_message(message.payload)
+    return _device(_gaze.gaze_message(message))
 
 
 # Platmod records (receive_gaze_data 0x140265d70) -------------------------------------------
@@ -200,7 +127,7 @@ class PointRecord:
     point: tuple
 
     def pack(self) -> bytes:
-        return struct.pack('<qI2f', self.timestamp, self.valid, *self.point)
+        return _gaze.pack('point', self)
 
 
 @dataclass(frozen=True)
@@ -213,8 +140,7 @@ class PairRecord:
     right: tuple
 
     def pack(self) -> bytes:
-        return struct.pack('<qI3fI3f', self.timestamp, self.left_valid, *self.left,
-                           self.right_valid, *self.right)
+        return _gaze.pack('pair', self)
 
 
 @dataclass(frozen=True)
@@ -226,8 +152,7 @@ class OpennessRecord:
     right: float
 
     def pack(self) -> bytes:
-        return struct.pack('<qIfIf', self.timestamp, self.left_valid, self.left,
-                           self.right_valid, self.right)
+        return _gaze.pack('openness', self)
 
 
 @dataclass(frozen=True)
@@ -247,16 +172,11 @@ class EyeData:
     PACKED = struct.Struct('<I3fI3fI3f2fI3fIf')
 
     def pack(self) -> bytes:
-        return self.PACKED.pack(self.origin_valid, *self.origin, self.position_valid,
-                                *self.position, self.eye_valid, *self.gaze_point_3d,
-                                *self.gaze_point_2d, self.eyeball_valid, *self.eyeball_centre,
-                                self.pupil_valid, self.pupil_diameter)
+        return _gaze.pack('eye', self)
 
     @classmethod
     def unpack(cls, data: bytes) -> 'EyeData':
-        v = cls.PACKED.unpack(data)
-        return cls(v[0], v[1:4], v[4], v[5:8], v[8], v[9:12], v[12:14], v[14], v[15:18],
-                   v[18], v[19])
+        return cls(*_gaze.platmod_from_bytes('eye', data))
 
 
 @dataclass(frozen=True)
@@ -266,78 +186,42 @@ class GazeDataRecord:
     right: EyeData
 
     def pack(self) -> bytes:
-        return struct.pack('<q', self.timestamp) + self.left.pack() + self.right.pack()
+        return _gaze.pack('gaze_data', self)
 
 
-def _flag(condition: bool) -> int:
-    return 1 if condition else 0
+def _gaze_data(values) -> GazeDataRecord:
+    timestamp, left, right = values
+    return GazeDataRecord(timestamp, EyeData(*left), EyeData(*right))
 
 
-def _eye_valid(validity: int) -> int:
-    return _flag(validity < 2)
-
-
-def _unit_clamp(value: float) -> float:
-    if value < 0.0:
-        value = 0.0
-    if 1.0 < value:
-        value = 1.0
-    return value
-
-
-def _eye_data(origin_valid, origin, position_valid, position, validity, point_3d, point_2d,
-              eyeball_present, eyeball, pupil) -> EyeData:
-    valid = _eye_valid(validity)
-    return EyeData(_flag(origin_valid == 1), origin, _flag(position_valid == 1), position,
-                   valid, point_3d, point_2d, valid if eyeball_present == 1 else 0, eyeball,
-                   valid, pupil)
+def _records(g: DeviceGaze):
+    _, point, responsive, origin, data, openness, guide = _gaze.gaze_frame(g)
+    return (PointRecord(*point), PointRecord(*responsive), PairRecord(*origin), _gaze_data(data),
+            OpennessRecord(*openness), PairRecord(*guide))
 
 
 def gaze_point_record(g: DeviceGaze) -> PointRecord:
-    return PointRecord(g.timestamp, _flag(g.combined_validity != 0), g.combined_point)
+    return _records(g)[0]
 
 
 def responsive_gaze_point_record(g: DeviceGaze) -> PointRecord:
-    return PointRecord(g.timestamp, _flag(g.responsive_validity != 0), g.responsive_point)
-
-
-def eye_openness_record(g: DeviceGaze) -> OpennessRecord:
-    return OpennessRecord(g.timestamp, _flag(g.left_openness_validity != 0), g.left_openness,
-                          _flag(g.right_openness_validity != 0), g.right_openness)
+    return _records(g)[1]
 
 
 def gaze_origin_record(g: DeviceGaze) -> PairRecord:
-    return PairRecord(g.timestamp, _flag(g.left_origin_display_validity == 1),
-                      g.left_origin_display, _flag(g.right_origin_display_validity == 1),
-                      g.right_origin_display)
+    return _records(g)[2]
 
 
 def gaze_data_record(g: DeviceGaze) -> GazeDataRecord:
-    left = _eye_data(g.left_origin_tracker_validity, g.left_origin_tracker,
-                     g.left_position_relative_validity, g.left_position_relative,
-                     g.left_validity, g.left_gaze_point_3d, g.left_gaze_point_2d,
-                     g.left_eyeball_present, g.left_eyeball_centre, g.left_pupil_diameter)
-    right = _eye_data(g.right_origin_tracker_validity, g.right_origin_tracker,
-                      g.right_position_relative_validity, g.right_position_relative,
-                      g.right_validity, g.right_gaze_point_3d, g.right_gaze_point_2d,
-                      g.right_eyeball_present, g.right_eyeball_centre, g.right_pupil_diameter)
-    return GazeDataRecord(g.timestamp, left, right)
+    return _records(g)[3]
+
+
+def eye_openness_record(g: DeviceGaze) -> OpennessRecord:
+    return _records(g)[4]
 
 
 def user_position_guide_record(g: DeviceGaze) -> PairRecord:
-    return PairRecord(g.timestamp, _flag(g.left_position_guide_validity == 1),
-                      tuple(_unit_clamp(v) for v in g.left_position_guide),
-                      _flag(g.right_position_guide_validity == 1),
-                      tuple(_unit_clamp(v) for v in g.right_position_guide))
-
-
-DEVICE_GAZE_RECORDS = {
-    'gaze_point': gaze_point_record,
-    'responsive_gaze_point': responsive_gaze_point_record,
-    'eye_openness': eye_openness_record,
-    'gaze_origin': gaze_origin_record,
-    'gaze_data': gaze_data_record,
-}
+    return _records(g)[5]
 
 
 def platmod_records(g: DeviceGaze, host_gaze: bool = False) -> dict[str, bytes]:
@@ -347,26 +231,18 @@ def platmod_records(g: DeviceGaze, host_gaze: bool = False) -> dict[str, bytes]:
     ignored and only the user position guide is published; the ET5 runs gaze on
     the device, so the runtime takes the other branch.
     """
-    records = {} if host_gaze else {name: build(g).pack()
-                                     for name, build in DEVICE_GAZE_RECORDS.items()}
-    records['user_position_guide'] = user_position_guide_record(g).pack()
-    return records
+    return _gaze.platmod_records(g, host_gaze)
 
 
 def platmod_from_bytes(name: str, data: bytes):
+    values = _gaze.platmod_from_bytes(name, data)
     if name in ('gaze_point', 'responsive_gaze_point'):
-        t, valid, x, y = struct.unpack('<qI2f', data[:0x14])
-        return PointRecord(t, valid, (x, y))
+        return PointRecord(*values)
     if name == 'eye_openness':
-        return OpennessRecord(*struct.unpack('<qIfIf', data[:0x18]))
+        return OpennessRecord(*values)
     if name in ('gaze_origin', 'user_position_guide'):
-        v = struct.unpack('<qI3fI3f', data[:0x28])
-        return PairRecord(v[0], v[1], v[2:5], v[5], v[6:9])
-    if name == 'gaze_data':
-        size = EyeData.PACKED.size
-        return GazeDataRecord(struct.unpack_from('<q', data)[0], EyeData.unpack(data[8:8 + size]),
-                              EyeData.unpack(data[8 + size:8 + 2 * size]))
-    raise ValueError(f'Unknown platmod record {name!r}')
+        return PairRecord(*values)
+    return _gaze_data(values)
 
 
 # PRP stream records (service callbacks) -----------------------------------------------------
@@ -509,9 +385,14 @@ class GazeFrame:
 
 
 def gaze_frame(g: DeviceGaze) -> GazeFrame:
-    return GazeFrame(g, gaze_point_record(g), responsive_gaze_point_record(g),
-                     gaze_origin_record(g), gaze_data_record(g), eye_openness_record(g),
-                     user_position_guide_record(g))
+    return GazeFrame(g, *_records(g))
+
+
+def frame_from_native(values) -> GazeFrame:
+    """GazeFrame of the tuple the native stream reader produces for one gaze message."""
+    device, point, responsive, origin, data, openness, guide = values
+    return GazeFrame(DeviceGaze(*device), PointRecord(*point), PointRecord(*responsive), PairRecord(*origin),
+                     _gaze_data(data), OpennessRecord(*openness), PairRecord(*guide))
 
 
 PRP_STREAM_RECORDS = {PRP_GAZE_POINT: 'gaze_point', PRP_RESPONSIVE_GAZE_POINT: 'responsive_gaze_point',
@@ -532,12 +413,12 @@ PROPERTY_USER_PRESENCE = 0xB
 
 def platmod_presence(device_value: int) -> int:
     """receive_presence_data 0x140266b60: device values 0, 1, 2 pass, anything else becomes 0."""
-    return device_value if device_value in (0, 1, 2) else 0
+    return _gaze.platmod_presence(device_value)
 
 
 def prp_presence(platmod_value: int) -> int:
     """Service callback 0x1400fa2b0: the property 0xB value the client maps to away or present."""
-    return {1: PRESENCE_AWAY, 2: PRESENCE_PRESENT}.get(platmod_value, PRESENCE_UNKNOWN)
+    return _gaze.prp_presence(platmod_value)
 
 
 PRESENCE_COLUMN_TYPES = {1: PARSED_INT64, 2: PARSED_INT32}
@@ -550,16 +431,7 @@ def presence_message(payload: bytes) -> tuple[int, int] | None:
     tag 1, which the ET5 sends) and skips other columns; a wrong type fails the parse.
     The dispatcher 0x1402c2700 (index 5) leaves absent columns zero.
     """
-    values = {}
-    for column in stream_columns(payload):
-        expected = PRESENCE_COLUMN_TYPES.get(column.column_id)
-        if expected is None:
-            continue
-        parsed, value = parsed_value(column.value)
-        if parsed != expected:
-            return None
-        values[column.column_id] = value
-    return values.get(1, 0), values.get(2, 0)
+    return _gaze.presence_message(payload)
 
 
 # Building messages (tests and oracle edge cases) --------------------------------------------
@@ -569,46 +441,33 @@ def message_columns(payload: bytes) -> dict[int, tuple]:
     return {column.column_id: column.value for column in stream_columns(payload)}
 
 
-def _field(tag: int, form: str, value) -> Field:
-    return Field(tag, struct.pack(form, value))
-
-
 def uint32_column(value: int) -> tuple:
-    return (_field(FIELD_UINT32, '>I', value),)
+    return tuple(_gaze.uint32_column(value))
 
 
 def int32_column(value: int) -> tuple:
-    return (_field(FIELD_INT32, '>i', value),)
+    return tuple(_gaze.int32_column(value))
 
 
 def int64_column(value: int) -> tuple:
-    return (_field(FIELD_INT64, '>q', value),)
+    return tuple(_gaze.int64_column(value))
 
 
 def fixed16_column(value: float) -> tuple:
-    return (_field(FIELD_FIXED16, '>i', int(float32(value) * 65536.0)),)
-
-
-def _fixed42(value: float) -> Field:
-    return _field(FIELD_FIXED42, '>q', int(value * 2.0 ** 42))
+    return tuple(_gaze.fixed16_column(value))
 
 
 def vec2_column(values) -> tuple:
-    return (_field(FIELD_STRUCT, '>I', 2 << 16 | VEC2_STRUCT),) + tuple(_fixed42(v) for v in values)
+    return tuple(_gaze.vec2_column(values))
 
 
 def vec3_column(values) -> tuple:
-    return (_field(FIELD_STRUCT, '>I', 3 << 16 | VEC3_STRUCT),) + tuple(_fixed42(v) for v in values)
+    return tuple(_gaze.vec3_column(values))
 
 
 def columns_payload(columns: dict) -> bytes:
     """Column set payload; columns mapped to None are left out."""
-    present = [(column_id, value) for column_id, value in columns.items() if value is not None]
-    items = [_field(FIELD_STRUCT, '>I', len(present) << 16 | FRAME_STRUCT)]
-    for column_id, value in present:
-        items += [_field(FIELD_STRUCT, '>I', 2 << 16 | COLUMN_STRUCT),
-                  _field(FIELD_UINT32, '>I', column_id), *value]
-    return b'\0\0' + b''.join(item.encode() for item in items)
+    return _gaze.columns_payload([(column_id, value) for column_id, value in columns.items() if value is not None])
 
 
 def gaze_stream_message(columns: dict) -> Message:

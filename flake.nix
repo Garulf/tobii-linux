@@ -19,18 +19,21 @@
         pyproject = true;
         src = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [ ./pyproject.toml ./src ./tests ];
+          fileset = pkgs.lib.fileset.unions [
+            ./pyproject.toml ./Cargo.toml ./Cargo.lock ./clippy.toml ./rustfmt.toml ./crates ./src ./tests
+          ];
         };
-        build-system = [ pkgs.python3Packages.setuptools ];
+        cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+        nativeBuildInputs = with pkgs.rustPlatform; [ cargoSetupHook maturinBuildHook ];
         dependencies = with pkgs.python3Packages; [ numpy openvino ];
-        makeWrapperArgs = [
-          "--set-default TOBII_LIBUSB_PATH ${pkgs.libusb1}/lib/libusb-1.0.so"
-          "--set-default TOBII_LINUX_MODELS ${models}"
-        ];
+        makeWrapperArgs = [ "--set-default TOBII_LINUX_MODELS ${models}" ];
         checkPhase = ''
-          PYTHONPATH=src python -m unittest discover -s tests
+          runHook preCheck
+          cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+          PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
+          runHook postCheck
         '';
-        pythonImportsCheck = [ "tobii_linux.usb" ];
+        pythonImportsCheck = [ "tobii_linux.usb" "tobii_linux._native" ];
         meta = {
           description = "Experimental Eye Tracker 5 head-pose driver";
           platforms = pkgs.lib.platforms.linux;

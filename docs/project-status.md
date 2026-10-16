@@ -309,7 +309,7 @@ unfinished.
 
 | Files | Purpose |
 | --- | --- |
-| `src/tobii_linux/usb.py` | libusb descriptor probe, bounded bulk/control transfers and resource cleanup |
+| `crates/tobii-usb`, `src/tobii_linux/usb.py` | nusb descriptor probe, bounded bulk/control transfers, continuous channel reader (docs/rust.md) |
 | `src/tobii_linux/usb_framing.py`, `usb_channel.py` | Direction-specific framing, incremental receive parsing, explicit channel open/close |
 | `src/tobii_linux/ttp.py` | Inner TTP framing, typed uint32 arrays and protocol-upgrade request |
 | `src/tobii_linux/prp.py` | Game-facing envelope, gaze/head records and non-compound stream packets |

@@ -1,11 +1,12 @@
 """Several subscribed TTP streams read from one TrackerSession and split by stream.
 
 TrackerSession.frames() keeps only image frames. StreamReader subscribes any
-set of streams and decodes images (frames.image_frame), gaze (gaze.gaze_frame
-of gaze.gaze_message, which drops a message exactly where the runtime does) and
-presence (gaze.presence_message); other stream messages pass through undecoded.
-GazeAndImageStreams adds the threading and clock mapping a live service needs,
-and serve_tracker runs one whole service session on it.
+set of streams and decodes images, gaze (dropping a message exactly where the
+runtime does) and presence; other stream messages pass through undecoded. The
+reader, its silence and suspend checks and the device clock watch are
+crates/tobii-device/src/streams.rs. GazeAndImageStreams adds the threading and
+clock mapping a live service needs, and serve_tracker runs one whole service
+session on it.
 
 The tracker stops sending for good (stream data and replies) when its endpoint
 is not read for about a second while streams are subscribed, so every reader
@@ -16,53 +17,29 @@ from collections import Counter, deque
 from dataclasses import dataclass, replace
 import logging
 import threading
-import time
 
 from . import gaze
+from ._native import device as _device
 from .driver import ClockMapper, DeviceError, head_pose_processor, newest_frames
-from .frames import image_frame
-from .ttp import ProtocolError
-from .ttp_commands import STREAM_DATA_KIND, Stream, subscribe_stream, unsubscribe_stream, wire_stream_id
+from .frames import ImageFrame, image_frame
+from .ttp_commands import Stream, wire_stream_id
 
 log = logging.getLogger('tobii_linux.streams')
 READ_SLICE_MS = 100
 READER_EXIT_TIMEOUT_S = 2.0
 SILENCE_TIMEOUT_S = 3.0
-# A suspended host keeps CLOCK_BOOTTIME running while CLOCK_MONOTONIC stops.
 SUSPEND_GAP_S = 2.0
-# The device clock running backwards by more than this means the tracker restarted.
 DEVICE_CLOCK_REWIND_US = 1_000_000
 DRAIN_DEPTH = 256
 
-
-def suspended_time_s():
-    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
-
-
-class SuspendWatch:
-    """Notices that the host was suspended since the last check (the tracker loses power then)."""
-    def __init__(self, suspended_time=suspended_time_s, threshold_s=SUSPEND_GAP_S):
-        self.suspended_time = suspended_time
-        self.threshold_s = threshold_s
-        self.last = suspended_time()
-
-    def resumed(self):
-        now = self.suspended_time()
-        jumped = now - self.last > self.threshold_s
-        self.last = now
-        return jumped
-
-
-class DeviceClockWatch:
-    """Raises when device timestamps jump back, which happens when the tracker restarts."""
-    def __init__(self, rewind_us=DEVICE_CLOCK_REWIND_US):
-        self.rewind_us = rewind_us
-        self.latest = None
-
-    def observe(self, device_us):
-        if self.latest is not None and device_us < self.latest - self.rewind_us:
-            raise DeviceError('The tracker clock went back; the tracker restarted')
-        self.latest = device_us if self.latest is None else max(self.latest, device_us)
+suspended_time_s = _device.suspended_time_s
+# SuspendWatch(suspended_time=suspended_time_s, threshold_s=SUSPEND_GAP_S).resumed() is true
+# when the host was suspended since the last check (the tracker loses power then).
+SuspendWatch = _device.SuspendWatch
+# DeviceClockWatch(rewind_us).observe(device_us) raises DeviceError when the tracker restarted.
+DeviceClockWatch = _device.DeviceClockWatch
+# A threading.Event the native reading loops check without calling into Python.
+StopEvent = _device.StopEvent
 
 
 @dataclass(frozen=True)
@@ -92,6 +69,20 @@ class StreamItem:
     message: object = None
 
 
+def _value(kind, value, message):
+    if kind == 'image':
+        return ImageFrame(*value)
+    if kind == 'gaze':
+        return gaze.frame_from_native(value)
+    if kind == 'presence':
+        return Presence(*value)
+    return message
+
+
+def _counter(counts):
+    return Counter({Stream(stream): count for stream, count in counts})
+
+
 class StreamReader:
     """Reads stream data from a started session; stop() may be called from another thread.
 
@@ -107,49 +98,57 @@ the tracker has to be started again afterwards. Setting `stop_event`
         self.streams = tuple(Stream(s) for s in streams)
         self.optional = frozenset(Stream(s) for s in optional)
         self.by_wire_id = {wire_stream_id(s): s for s in self.streams}
-        self.subscribed = []
-        self.refused = {}
-        self.received = Counter()
-        self.dropped = Counter()
-        self.decode_errors = Counter()
-        self.unexpected = 0
-        self.last_error = None
-        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.native = _device.StreamReader([int(s) for s in self.streams], [int(s) for s in self.optional])
+        self.stop_event = stop_event if stop_event is not None else StopEvent()
         self.suspend_watch = suspend_watch
 
+    @property
+    def subscribed(self):
+        return [Stream(stream) for stream in self.native.subscribed]
+
+    @property
+    def refused(self):
+        return {Stream(stream): error for stream, error in self.native.refused}
+
+    @property
+    def received(self):
+        return _counter(self.native.received)
+
+    @property
+    def dropped(self):
+        return _counter(self.native.dropped)
+
+    @property
+    def decode_errors(self):
+        return _counter(self.native.decode_errors)
+
+    @property
+    def unexpected(self):
+        return self.native.unexpected
+
+    @property
+    def last_error(self):
+        return self.native.last_error
+
     def subscribe(self):
-        for stream in self.streams:
-            try:
-                self.session.call(lambda rid, s=stream: subscribe_stream(rid, s))
-            except DeviceError as error:
-                if stream not in self.optional:
-                    raise
-                self.refused[stream] = str(error)
-                continue
-            self.subscribed.append(stream)
+        try:
+            self.native.subscribe(self.session.native)
+        finally:
+            self.session._collect()
 
     def unsubscribe(self):
         """Unsubscribe every subscribed stream; errors are collected so each stream gets its request.
 
 A dead session is not asked: its device no longer answers.
 """
-        if self.session.dead:
-            log.info('not unsubscribing %d stream(s) of a dead session', len(self.subscribed))
-            self.subscribed.clear()
+        try:
+            self.native.unsubscribe(self.session.native)
+        except (DeviceError, OSError, RuntimeError):
             self.session.pending_streams = []
-            return
-        errors, unsubscribed = [], []
-        while self.subscribed:
-            stream = self.subscribed.pop()
-            try:
-                self.session.call(lambda rid, s=stream: unsubscribe_stream(rid, s))
-                unsubscribed.append(stream.name.lower())
-            except (DeviceError, OSError, RuntimeError) as error:
-                errors.append(error)
+            raise
+        finally:
+            self.session.native.take_pending()
         self.session.pending_streams = []
-        log.info('unsubscribed %s', ', '.join(unsubscribed) or 'nothing')
-        if errors:
-            raise errors[0]
 
     @property
     def stopping(self):
@@ -173,28 +172,14 @@ A dead session is not asked: its device no longer answers.
             if exc_type is None:
                 raise
 
+    def _item(self, item):
+        stream, kind, value, message = item
+        return StreamItem(Stream(stream), _value(kind, value, message), message)
+
     def decode(self, message):
         """The StreamItem for one stream message, or None when it is not ours, dropped or malformed."""
-        if message.kind != STREAM_DATA_KIND:
-            return None
-        stream = self.by_wire_id.get(message.command)
-        if stream is None:
-            self.unexpected += 1
-            return None
-        self.received[stream] += 1
-        decoder = DECODERS.get(stream)
-        if decoder is None:
-            return StreamItem(stream, message, message)
-        try:
-            value = decoder(message)
-        except ProtocolError as error:
-            self.decode_errors[stream] += 1
-            self.last_error = f'{stream.name.lower()} message: {error}'
-            return None
-        if value is None:
-            self.dropped[stream] += 1
-            return None
-        return StreamItem(stream, value, message)
+        item = self.native.decode(message)
+        return self._item(item) if item is not None else None
 
     def items(self, silence_timeout_s=SILENCE_TIMEOUT_S):
         """Decoded items as they arrive until stop() is called.
@@ -204,24 +189,21 @@ Raises DeviceError, marking the session dead, when no stream data arrives for
 """
         session = self.session
         pending, session.pending_streams = session.pending_streams, []
-        last_data = time.monotonic()
+        pump = _device.ItemPump(pending, silence_timeout_s)
+        if session.native_loops:
+            while (item := pump.next(self.native, session.native, self.stop_event, self.suspend_watch)) is not None:
+                yield self._item(item)
+            return
         while not self.stopping:
-            for message in pending:
-                if self.stopping:
-                    return
-                item = self.decode(message)
-                if item is not None:
-                    yield item
+            item = pump.pending_item(self.native, self.stop_event)
+            if item == 'stopped':
+                return
+            if item is not None:
+                yield self._item(item)
+                continue
             data = session.read(READ_SLICE_MS)
-            pending = session.decoder.feed(data) if data else []
-            if self.suspend_watch is not None and self.suspend_watch.resumed():
-                session.dead = True
-                raise DeviceError('The host was suspended; the tracker must be started again')
-            if pending:
-                last_data = time.monotonic()
-            elif time.monotonic() - last_data > silence_timeout_s:
-                session.dead = True
-                raise DeviceError(f'The tracker sent no stream data for {silence_timeout_s:g} s')
+            resumed = self.suspend_watch is not None and self.suspend_watch.resumed()
+            pump.received(session.native, data, resumed)
 
 
 def drained(items, depth=DRAIN_DEPTH):
@@ -390,7 +372,7 @@ raises DeviceError and the like when the tracker fails or goes silent.
         replies = DeviceReplies.capture(session)
     gaze_callback = feed.gaze if feed.gaze is not None else (lambda frame: None)
     with GazeAndImageStreams(session, host_clock, gaze_callback, feed.presence,
-                             suspend_watch=suspend_watch, stop_event=threading.Event(),
+                             suspend_watch=suspend_watch, stop_event=StopEvent(),
                              on_device_stream=feed.device_stream) as streams:
         stopper = StopRelay(stop, streams.reader.stop)
         if replies is not None:

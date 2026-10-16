@@ -19,16 +19,16 @@ synthetic inputs; those checks are listed in the linked documents.
 
 | Stage | Module | Status |
 | --- | --- | --- |
-| USB transport, channel framing | `usb.py`, `usb_framing.py`, `usb_channel.py` | Works on a real tracker; TTP runs on channel 0 |
-| TTP requests and replies | `ttp.py`, `ttp_commands.py`, `ttp_fields.py` | Startup, unlock, realm, hardware info and stream commands match the original encoders and parsers |
-| Camera calibration reply | `camera_info.py` | Parser matches the original and reads the live reply |
-| Image frames | `frames.py` | 280x280 frames at about 33 Hz from a real tracker |
+| USB transport, channel framing | `crates/tobii-usb` (`usb.py`, `usb_framing.py`, `usb_channel.py`) | Works on a real tracker; TTP runs on channel 0 |
+| TTP requests and replies | `crates/tobii-protocol` (`ttp.py`, `ttp_commands.py`, `ttp_fields.py`) | Startup, unlock, realm, hardware info and stream commands match the original encoders and parsers |
+| Camera calibration reply | `crates/tobii-protocol` (`camera_info.py`) | Parser matches the original and reads the live reply |
+| Image frames | `crates/tobii-protocol` (`frames.py`) | 280x280 frames at about 33 Hz from a real tracker |
 | Face finder | `face_detect.py` | Matches the original detector end to end, network input included |
 | Tracking loop and working view | `face_tracking.py` | Working view matches the original; LBF eye refinement not yet run |
 | D1 landmarks, confidence gate | `d1.py`, `d1_quality.py` | Crop and gate match the original |
 | Face-model fit | `pose_*.py` | Updates, bounds, staged and temporal callers match the original |
 | Output conversion, geometry, smoothing | `pose_output.py`, `pose_geometry.py`, `head_pose_pipeline.py` | Euler conversion, geometry stage and One Euro filters match the original |
-| Device session and CLI | `driver.py`, `cli.py` | Runs against a real tracker; head pose within about 1% of the Windows depth |
+| Device session and CLI | `crates/tobii-device` (`driver.py`, `streams.py`, `supervisor.py`), `cli.py` | Runs against a real tracker; head pose within about 1% of the Windows depth |
 | Game client protocol (PRP) | `prp.py`, `prp_session.py`, `prp_service.py` | Codecs and handshake match the game DLL; service replies match the real service byte for byte |
 | Wine pipe bridge | `tools/prp_bridge/` | The game DLL and `tobii_stream_engine.dll` receive tracker samples under Wine |
 | Wine pipe listing | `patches/wine/` | Needed for service discovery; tested on Wine 11.0 and master |
@@ -39,6 +39,14 @@ the game DLL's head-tracking API under Wine
 ([tracking loop](docs/face-tracking.md#fitting-coordinates-live-comparison)).
 
 ## Use
+
+The protocol, USB and device layers are Rust crates under `crates/`, loaded by
+the Python package as `tobii_linux._native`. Build the extension once after a
+checkout and after Rust changes (Rust 1.90 or later and Cargo):
+
+```sh
+make native
+```
 
 Probe for the tracker (no interface is claimed):
 
@@ -130,9 +138,14 @@ receives every sample from the service; Star Citizen itself has not been run.
 ## Tests
 
 ```sh
+make native
 PYTHONPATH=.local/inference:src python3 -m unittest discover -s tests
 PYTHONPATH=.local/python:.local/inference:src python3 tools/<oracle>.py
+cargo test --workspace
 ```
+
+`make test`, `make oracles` and `make rust-lint` run the same with the
+extension rebuilt first ([Rust core](docs/rust.md)).
 
 The oracles need the private Windows binaries under `evidence/private/` and
 the Unicorn emulator; unit tests skip what they cannot run.
@@ -163,7 +176,7 @@ evaluation), but no NixOS machine has run them yet.
 
 ## Documents
 
-- [Project status](docs/project-status.md), [browser demo](docs/demo.md), [setup flow](docs/setup-flow.md), [display setup](docs/display-setup.md), [gaze calibration](docs/gaze-calibration.md)
+- [Project status](docs/project-status.md), [Rust core](docs/rust.md), [browser demo](docs/demo.md), [setup flow](docs/setup-flow.md), [display setup](docs/display-setup.md), [gaze calibration](docs/gaze-calibration.md)
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)

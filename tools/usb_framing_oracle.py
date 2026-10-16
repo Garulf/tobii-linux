@@ -15,6 +15,7 @@ from unicorn.x86_const import (UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX,
                               UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RSP,
                               UC_X86_REG_RIP)
 from ttp_encoder_oracle import machine, DATA, STACK, STOP, SHA256
+from tobii_linux.usb_framing import IncomingFrames, outgoing_frames
 
 CALLBACK = STOP + 0x10
 SOURCE = DATA + 0x20000
@@ -106,21 +107,16 @@ def main():
     for channel, size in ((0, 1), (7, 512), (11, 4087), (2, 4088), (3, 8192), (0, 0)):
         payload = bytes(i % 251 for i in range(size))
         writes = transmit(binary, channel, payload)
-        remaining = payload
-        expected = []
-        while remaining:
-            count = min(len(remaining), 4087)
-            if count % 512 == 0:
-                count -= 1
-            expected.append((5, struct.pack('<II', channel, count) + remaining[:count]))
-            remaining = remaining[count:]
+        expected = [(5, frame) for frame in outgoing_frames(channel, payload)]
         assert writes == expected
         results.append({'direction': 'out', 'channel': channel, 'payload_bytes': size,
                         'transfer_lengths': [len(w) for _, w in writes],
                         'headers': [w[:8].hex() for _, w in writes], 'matches': True})
     for mask, payload in ((1, b'abc'), (0x805, b'hello'), (0, b'discard'), (0xfff, b'x')):
-        actual = receive(binary, struct.pack('<II', mask, len(payload) + 8) + payload)
-        expected = [(channel, payload) for channel in range(12) if mask & (1 << channel)]
+        wire = struct.pack('<II', mask, len(payload) + 8) + payload
+        actual = receive(binary, wire)
+        frames = IncomingFrames().feed(wire)
+        expected = [(channel, frame.payload) for frame in frames for channel in range(12) if frame.for_channel(channel)]
         assert actual == expected, (actual, expected)
         results.append({'direction': 'in', 'mask': mask, 'payload_hex': payload.hex(),
                         'channels': [channel for channel, _ in actual], 'matches': True})

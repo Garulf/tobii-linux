@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "f32::mul_add", reason = "fused multiply-add rounds differently from the recovered machine code" },
+    { path = "f64::mul_add", reason = "fused multiply-add rounds differently from the recovered machine code" },
+]

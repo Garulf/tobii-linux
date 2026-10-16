@@ -5,34 +5,19 @@ shuts its client server down and starts the device again from scratch once it
 is back (docs/service-behaviour.md). TrackerLink does the same for one Linux
 process: it opens a session, runs it until it fails, reports the loss, waits
 with a growing delay and opens a new one. A session that ran long enough
-resets the delay.
+resets the delay. The loop and the backoff are crates/tobii-device/src/supervisor.rs.
 """
-from dataclasses import dataclass
 import logging
 import threading
 import time
 
-from .driver import NoTrackerError
+from ._native import device as _device
 
 log = logging.getLogger('tobii_linux.supervisor')
 
-
-@dataclass
-class Backoff:
-    """Delays between session attempts: doubling from `first_s` up to `max_s`."""
-    first_s: float = 0.5
-    max_s: float = 2.0
-    healthy_s: float = 10.0
-
-    def __post_init__(self):
-        self.next_s = self.first_s
-
-    def delay(self, session_s):
-        """Delay before the next attempt after a session that lasted `session_s` seconds."""
-        if session_s >= self.healthy_s:
-            self.next_s = self.first_s
-        delay, self.next_s = self.next_s, min(self.next_s * 2, self.max_s)
-        return delay
+# Backoff(first_s=0.5, max_s=2.0, healthy_s=10.0).delay(session_s): the delay before the
+# next attempt after a session that lasted `session_s` seconds, doubling up to max_s.
+Backoff = _device.Backoff
 
 
 class TrackerLink:
@@ -51,28 +36,18 @@ starts). Any exception from a session counts as a lost session.
         self.backoff = backoff or Backoff()
         self.clock = clock
         self.stopping = threading.Event()
-        self.sessions = self.failures = 0
+        self.native = _device.TrackerLink()
+
+    @property
+    def sessions(self):
+        return self.native.sessions
+
+    @property
+    def failures(self):
+        return self.native.failures
 
     def stop(self):
         self.stopping.set()
 
     def run(self):
-        while not self.stopping.is_set():
-            started = self.clock()
-            try:
-                self.on_state('starting', 'Starting the tracker')
-                with self.open_session() as session:
-                    self.sessions += 1
-                    self.run_session(session, self.stopping)
-                if not self.stopping.is_set():
-                    self.on_state('lost', 'The tracker session ended')
-            except NoTrackerError as error:
-                self.on_state('searching', str(error))
-            except Exception as error:
-                self.failures += 1
-                log.warning('tracker session ended: %s: %s', type(error).__name__, error)
-                self.on_state('lost', f'{type(error).__name__}: {error}')
-            if self.stopping.is_set():
-                break
-            self.stopping.wait(self.backoff.delay(self.clock() - started))
-        self.on_state('stopped', 'Stopped')
+        self.native.run(self)

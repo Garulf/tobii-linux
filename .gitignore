@@ -6,3 +6,5 @@ build/
 result
 result-*
 tools/prp_bridge/*.exe
+target/
+src/tobii_linux/_native*.so

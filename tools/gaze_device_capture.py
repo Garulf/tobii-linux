@@ -46,21 +46,11 @@ def emit(kind, **values):
     print(json.dumps({'kind': kind, 'time': time.time(), **values}, default=repr), flush=True)
 
 
-class NotificationLog:
-    """Wraps the session decoder so notifications are logged wherever they arrive."""
-    def __init__(self, decoder):
-        self.decoder = decoder
-
-    def feed(self, data):
-        messages = self.decoder.feed(data)
-        for message in messages:
-            if message.kind == tc.NOTIFICATION_KIND:
-                emit('notification', word1=message.request_id, word2=message.word2,
-                     command=message.command, word4=message.word4, payload=message.payload.hex())
-        return messages
-
-    def __getattr__(self, name):
-        return getattr(self.decoder, name)
+def log_notification(message):
+    """Session observer: logs notifications wherever they arrive, during calls or reads."""
+    if message.kind == tc.NOTIFICATION_KIND:
+        emit('notification', word1=message.request_id, word2=message.word2,
+             command=message.command, word4=message.word4, payload=message.payload.hex())
 
 
 def gaze_summary(record):
@@ -152,7 +142,7 @@ def run(args):
         with context.open_transport(bus=device['bus'], address=device['address']) as transport:
             with USBChannel(transport, args.channel) as channel:
                 session = driver.TrackerSession(channel)
-                session.decoder = NotificationLog(session.decoder)
+                session.observe(log_notification)
                 session.initialize()
                 session.camera_calibration()
                 emit('step', name='started')
