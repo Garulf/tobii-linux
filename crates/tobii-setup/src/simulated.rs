@@ -8,7 +8,9 @@
 //!
 //! The user sits too far back for the first seconds of eye positioning, then leans in to
 //! the middle of the track box, and looks at whichever calibration target is the first one
-//! of the current stage not collected yet, so the gaze-driven target choice finds it.
+//! of the current stage not collected yet, so the gaze-driven target choice finds it. Unlike
+//! the Python simulation, the user looks at the targets as scaled into the calibration area
+//! of the display area the device holds, so a large display does not stall the calibration.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -214,8 +216,10 @@ impl Default for Simulation {
     }
 }
 
-fn targets() -> Vec<[f64; 2]> {
-    INTERACTIVE_POINTS.iter().map(|p| p.map(float32)).collect()
+/// The calibration targets the setup shows for the display area the device holds.
+fn targets(area: &DisplayArea) -> Vec<[f64; 2]> {
+    let size = tobii_gaze::display::is_mapped(Some(area)).then(|| [area.width_mm(), area.height_mm()]);
+    tobii_gaze::calibration::calibration_targets(size, &INTERACTIVE_POINTS)
 }
 
 /// The target being collected, else the first of the current stage not collected yet, else the centre.
@@ -225,7 +229,7 @@ fn default_looking_at(state: &TrackerState, now: f64) -> [f64; 2] {
     {
         return point;
     }
-    let targets = targets();
+    let targets = targets(&state.area);
     for stage in STAGES {
         if let Some(&index) = stage.iter().find(|&&i| !state.collected.contains(&targets[i])) {
             return targets[index];
@@ -536,6 +540,20 @@ mod tests {
         assert_eq!((g.left_position_guide_validity, g.right_position_guide_validity), (1, 1));
         assert!(g.left_position_guide[0] > g.right_position_guide[0]);
         assert!((g.left_gaze_point_2d[0] - 0.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn the_user_looks_at_targets_scaled_into_a_large_display() {
+        let mut tracker = SimulatedTracker::new(Simulation::default());
+        let large = tobii_gaze::display::compose_display_area([800.0, 450.0], &ET5_MOUNTING, 0.0);
+        let mut state = tracker.state.lock().unwrap();
+        assert_eq!(default_looking_at(&state, 0.0), [0.5, 0.5]);
+        state.area = large;
+        state.collected.push([0.5, 0.5]);
+        let target = default_looking_at(&state, 0.0);
+        drop(state);
+        assert!((target[0] - (0.125 + 0.1 * 0.75)).abs() < 1e-6, "{target:?}");
+        assert!(tracker.gaze_columns(1.0).is_ok());
     }
 
     #[test]

@@ -565,8 +565,8 @@ impl SetupFlow {
         let key = self.desktop.monitors[target].key.clone();
         let previous = self.channel.monitor();
         self.report("move_monitor", json!({ "direction": direction.name(), "to": key }));
-        self.channel.show(ScreenKind::Moving { to: key.clone() });
         self.channel.follow_monitor(Some(key.clone()));
+        self.channel.show(ScreenKind::Moving { to: key.clone() });
         let channel = self.channel.clone();
         let mut arrived = || (channel.window_monitor().as_deref() == Some(key.as_str())).then_some(());
         match self.channel.wait_action::<(), FlowError>(|_| false, Some(self.move_timeout), None, Some(&mut arrived)) {
