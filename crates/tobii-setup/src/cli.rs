@@ -34,6 +34,8 @@ options:
   --simulate mapped|unmapped   Use a scripted tracker and user instead of the device
   --simulate-monitors          With --simulate, pretend to run on a desktop with a portrait
                                monitor left of a 27 inch primary one
+  --simulate-compute-failure N With --simulate, refuse the Nth compute (1070) as all points
+                               failed, to show the failure screen
   --windowed                   Do not ask for fullscreen (the window must still fill the screen)
   --log FILE                   Write the steps as JSON lines to this file
   -h, --help                   Show this help";
@@ -54,6 +56,7 @@ pub struct Args {
     pub channel: u32,
     pub simulate: Option<bool>,
     pub simulate_monitors: bool,
+    pub simulate_compute_failure: Option<usize>,
     pub windowed: bool,
     pub log: Option<PathBuf>,
 }
@@ -108,6 +111,7 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
                 }
             }
             "--simulate-monitors" => args.simulate_monitors = true,
+            "--simulate-compute-failure" => args.simulate_compute_failure = Some(number(&option, &value()?)?),
             "--windowed" => args.windowed = true,
             "--log" => args.log = Some(value()?.into()),
             other => return Err(format!("unrecognized argument: {other}")),
@@ -116,8 +120,8 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
     if args.edid.is_some() && args.connector.is_some() {
         return Err("--edid and --connector cannot be combined".into());
     }
-    if args.simulate_monitors && args.simulate.is_none() {
-        return Err("--simulate-monitors needs --simulate".into());
+    if (args.simulate_monitors || args.simulate_compute_failure.is_some()) && args.simulate.is_none() {
+        return Err("--simulate-monitors and --simulate-compute-failure need --simulate".into());
     }
     Ok(Command::Run(Box::new(args)))
 }
@@ -222,6 +226,7 @@ mod tests {
         let args = run(&[]);
         assert_eq!((args.display, args.calibrate, args.simulate), (DisplayMode::Auto, true, None));
         let args = run(&["--simulate", "unmapped", "--display=always", "--no-calibration", "--profile", "Anna"]);
+        assert_eq!(run(&["--simulate=mapped", "--simulate-compute-failure", "2"]).simulate_compute_failure, Some(2));
         assert_eq!(args.simulate, Some(false));
         assert_eq!((args.display, args.calibrate, args.profile.as_deref()), (DisplayMode::Always, false, Some("Anna")));
         assert_eq!(parse(["--help".to_string()]).unwrap(), Command::Help);
