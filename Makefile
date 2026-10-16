@@ -9,8 +9,10 @@ NATIVE := src/tobii_linux/_native.abi3.so
 PYTEST_PATH := .local/inference:src
 ORACLE_PATH := .local/python:.local/inference:src
 RUNTIME := evidence/private/binaries/platform_runtime_IS5LEYETRACKER5_service.exe
-ORACLES := ttp_commands ttp_hwinfo ttp_reply gaze presence gaze_calibration gaze_device display_setup
+GAME_DLL := evidence/private/binaries/tobii_gameintegration_x64.dll
+ORACLES := ttp_commands ttp_hwinfo ttp_reply gaze presence gaze_calibration gaze_device display_setup sesp
 BINARY_ORACLES := usb_framing ttp_encoder
+GAME_ORACLES := prp_encoder prp_session
 
 .PHONY: native native-debug rust-test rust-lint test oracles check clean-native
 
@@ -38,6 +40,9 @@ oracles: native
 	done
 	@for oracle in $(BINARY_ORACLES); do \
 		echo "== $$oracle"; PYTHONPATH=$(ORACLE_PATH) $(PYTHON) tools/$${oracle}_oracle.py $(RUNTIME) > /dev/null || exit 1; \
+	done
+	@for oracle in $(GAME_ORACLES); do \
+		echo "== $$oracle"; PYTHONPATH=$(ORACLE_PATH) $(PYTHON) tools/$${oracle}_oracle.py $(GAME_DLL) > /dev/null || exit 1; \
 	done
 
 check: rust-lint rust-test test
