@@ -64,7 +64,18 @@ fn fit_landmarks<'py>(
     ))
 }
 
-type Staged<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, bool, Vec<(u8, u32, u32, bool)>);
+pub type Staged<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, bool, Vec<(u8, u32, u32, bool)>);
+
+pub fn staged<'py>(py: Python<'py>, fit: &policy::StagedFit) -> Staged<'py> {
+    let stages = fit.stages.iter().map(|s| (s.mode.flag(), s.updates, s.attempts, s.valid)).collect();
+    (
+        bytes(py, &fit.rigid_state),
+        bytes(py, &fit.shape_coefficients),
+        bytes(py, &fit.animation_coefficients),
+        fit.valid,
+        stages,
+    )
+}
 
 /// `(rigid_state, shape, animation, valid, [(mode, updates, attempts, valid)])`.
 #[pyfunction]
@@ -78,14 +89,7 @@ fn fit_staged_landmarks<'py>(
     let model = pose_model(model)?;
     let points = rows::<2>(points)?;
     let fit = crate::exit::detached(py, || policy::fit_staged_landmarks(&model, &points, width, height)).py()?;
-    let stages = fit.stages.iter().map(|s| (s.mode.flag(), s.updates, s.attempts, s.valid)).collect();
-    Ok((
-        bytes(py, &fit.rigid_state),
-        bytes(py, &fit.shape_coefficients),
-        bytes(py, &fit.animation_coefficients),
-        fit.valid,
-        stages,
-    ))
+    Ok(staged(py, &fit))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
