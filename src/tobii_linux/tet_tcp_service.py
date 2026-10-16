@@ -17,38 +17,32 @@ sends reaches the tracker here:
 Stream messages keep their bytes except column 1, the device timestamp, which
 becomes the game's QueryPerformanceCounter microseconds: the module passes it
 through unchanged because timesync (UDP 4457) never connects under Wine.
-The port listens only while a tracker session runs.
+The port listens only while a tracker session runs. Answers and restamping are
+implemented in crates/tobii-service/src/tet_tcp.rs; the asyncio endpoint stays here.
 """
 import asyncio
 from dataclasses import dataclass, field
 import itertools
 import logging
-import struct
 
-from tobii_linux.frames import COLUMN_MEMBERS, COLUMN_STRUCT, FRAME_STRUCT, struct_code, take_value
-from tobii_linux.ttp import Decoder, Field, Message, ProtocolError, fields
-from tobii_linux.ttp_commands import (Command, FIELD_INT64, REQUEST_KIND, RESPONSE_KIND,
-                                      STREAM_DATA_KIND, request)
+from tobii_linux._native import tet_tcp_service as _service
+from tobii_linux.ttp import Decoder, Message, ProtocolError, fields
+from tobii_linux.ttp_commands import Command, STREAM_DATA_KIND, request
 from tobii_linux.ttp_fields import value
-from tobii_linux.tet_tcp import (COMMAND_PORT, DISPLAY_AREA_WRITABLE, PERSISTENT_FILE_ENUMERATE,
-                                 UNSUPPORTED_OPERATION, subscribed_stream)
+from tobii_linux.tet_tcp import COMMAND_PORT
 
 log = logging.getLogger("tobii_linux.tet_tcp_service")
 
-GAZE_STREAM = 0x500
-PRESENCE_STREAM = 0x504
+GAZE_STREAM = _service.GAZE_STREAM
+PRESENCE_STREAM = _service.PRESENCE_STREAM
 STREAMS = (GAZE_STREAM, PRESENCE_STREAM)
 # Getters the legacy module and the game layer sent during device start (docs/tet-tcp.md).
-CAPTURED_GETTERS = (
-    Command.ENUMERATE_STREAM_TYPES, Command.GET_DEVICE_PROPERTIES, Command.GET_CAPABILITIES,
-    Command.GET_TRACK_BOX, Command.GET_DEVICE_INFO, Command.GET_DISPLAY_AREA,
-    DISPLAY_AREA_WRITABLE, Command.GET_DEVICE_STATUS, Command.GET_FREQUENCIES,
-    Command.GET_DEVICE_NAME, Command.GET_GEOMETRY_MOUNTING, PERSISTENT_FILE_ENUMERATE)
+CAPTURED_GETTERS = tuple(_service.CAPTURED_GETTERS)
 CAPTURE_TIMEOUT_S = 1.0
 # Device replies to subscribe and unsubscribe carry this second header word and no payload.
-REPLY_WORD2 = 1
-MAX_PENDING_BYTES = 64 * 1024
-TIMESTAMP_COLUMN = 1
+REPLY_WORD2 = _service.REPLY_WORD2
+MAX_PENDING_BYTES = _service.MAX_PENDING_BYTES
+TIMESTAMP_COLUMN = _service.TIMESTAMP_COLUMN
 
 
 @dataclass
@@ -82,29 +76,15 @@ class DeviceReplies:
 
 def restamp(payload: bytes, timestamp_us: int) -> bytes:
     """Stream payload with the int64 of column 1 replaced; every other byte unchanged."""
-    items = fields(payload)
-    count, kind = struct_code(items[0])
-    if kind != FRAME_STRUCT:
-        raise ProtocolError("stream payload does not start with a column set")
-    index = 1
-    for _ in range(count):
-        if index + 2 >= len(items) or struct_code(items[index]) != (COLUMN_MEMBERS, COLUMN_STRUCT):
-            raise ProtocolError("malformed column set")
-        column, data = items[index + 1], items[index + 2]
-        if column.data == struct.pack(">I", TIMESTAMP_COLUMN) and data.tag == FIELD_INT64:
-            items[index + 2] = Field(FIELD_INT64, struct.pack(">q", timestamp_us))
-            return b"\0\0" + b"".join(item.encode() for item in items)
-        index = take_value(items, index + 2)
-    raise ProtocolError("stream message without a timestamp column")
+    return _service.restamp(payload, timestamp_us)
 
 
 def reply_to(message: Message, cached: Message) -> Message:
-    return Message(RESPONSE_KIND, message.request_id, cached.word2, message.command,
-                   cached.word4, cached.payload)
+    return _service.reply_to(message, cached)
 
 
 def refusal(message: Message) -> Message:
-    return Message(RESPONSE_KIND, message.request_id, 0, message.command, UNSUPPORTED_OPERATION)
+    return _service.refusal(message)
 
 
 class TetTcpConnection:
@@ -133,30 +113,20 @@ class TetTcpConnection:
             await self.writer.drain()
 
     def handle(self, message: Message) -> None:
-        if message.kind != REQUEST_KIND:
-            return
-        replies = self.service.device.replies
-        if message.command in (Command.SUBSCRIBE_STREAM, Command.UNSUBSCRIBE_STREAM):
-            self.send(self.subscription(message))
-        elif message.command in replies:
-            self.send(reply_to(message, replies[message.command]))
-        else:
-            log.info("tet-tcp connection %d: command %d refused", self.number, message.command)
-            self.send(refusal(message))
-
-    def subscription(self, message: Message) -> Message:
-        stream = subscribed_stream(message)
-        if stream not in STREAMS or stream not in self.service.device.streams:
-            log.info("tet-tcp connection %d: stream %s not served", self.number, stream)
-            return refusal(message)
-        if message.command == Command.SUBSCRIBE_STREAM:
+        action, reply, stream = _service.answer(message, self.service.device.replies,
+                                                self.service.device.streams)
+        if action == "subscribe":
             self.streams.add(stream)
-        else:
+        elif action == "unsubscribe":
             self.streams.discard(stream)
-        log.info("tet-tcp connection %d: %s %#x", self.number,
-                 "subscribe" if message.command == Command.SUBSCRIBE_STREAM else "unsubscribe",
-                 stream)
-        return Message(RESPONSE_KIND, message.request_id, REPLY_WORD2, message.command, 0)
+        if action in ("subscribe", "unsubscribe"):
+            log.info("tet-tcp connection %d: %s %#x", self.number, action, stream)
+        elif action == "refuse-stream":
+            log.info("tet-tcp connection %d: stream %s not served", self.number, stream)
+        elif action == "refuse":
+            log.info("tet-tcp connection %d: command %d refused", self.number, message.command)
+        if reply is not None:
+            self.send(reply)
 
 
 class TetTcpService:
