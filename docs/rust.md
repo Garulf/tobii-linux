@@ -42,6 +42,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-protocol` | USB channel framing, TTP messages and items, typed values and the reply reader, request builders, stream ids, column sets, image frames, camera hardware info, gaze and presence stream decoding with the platmod records. Pure: no I/O, clocks or threads. | `hmac`, `md-5` |
 | `crates/tobii-usb` | nusb backend: sysfs descriptor probe, `BulkTransport` on interface 0, `UsbChannel` (vendor open/close, framed writes, demultiplexed reads) with its continuous reader thread, the raw traffic log and its replay. | `tobii-protocol`, `nusb` |
 | `crates/tobii-device` | `TrackerSession` (startup, realms, calls, hardware info, image frames), `StreamReader` and `ItemPump` (subscriptions, demultiplexing, silence and suspend checks), `DeviceClockWatch`, `ClockMapper`, `TrackerLink` with `Backoff`, reader threads (`newest`, `drained`), `usb_session`. Generic over the `Channel` trait. | `tobii-protocol`, `tobii-usb`, `rustix` |
+| `crates/tobii-service` | Game service: PRP envelopes, stream bodies and session codecs, the gaze PRP stream records, SESP framing and flatcc-shaped messages, the Wine counter clock (classifier, follower, `ServiceClock`, counter mapping), relay framing, property answers and presence cache of the PRP service, the SESP legacy position transform, the tet-tcp policy, answers and restamping. Pure apart from `ServiceClock` reading the host clocks; the asyncio servers stay in Python. | `tobii-protocol`, `tobii-device`, `rustix` |
 | `crates/tobii-py` | PyO3 bindings, one submodule per Python module (`_native.ttp`, `fields`, `commands`, `frames`, `camera_info`, `gaze`, `usb`, `device`). Nothing else depends on it. | all of the above, `pyo3` |
 
 Dependencies point down the table only. A later crate never reaches into the
@@ -57,10 +58,15 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `ttp_fields.py` | `tobii_protocol::fields`, `numeric` | `Wire` enum and constants in Python |
 | `ttp_commands.py` | `tobii_protocol::commands` | `Command` and `Stream` enums in Python |
 | `frames.py`, `camera_info.py` | `tobii_protocol::frames`, `camera_info` | frozen dataclasses built from native tuples |
-| `gaze.py` (columns, records, presence) | `tobii_protocol::gaze` | dataclasses built from native tuples; PRP serialization stays Python until the game service moves |
+| `gaze.py` (columns, records, presence) | `tobii_protocol::gaze` | dataclasses built from native tuples |
 | `usb.py`, `usb_channel.py` | `tobii_usb` | `USBError`, `ShortWriteError` and the descriptor dataclasses in Python |
 | `traffic_log.py` | `tobii_usb::traffic` | re-exports |
 | `driver.py` (session, clock mapper) | `tobii_device::session`, `clock` | `TrackerSession` keeps `pending_streams`, `usb_device`; head-pose glue stays |
+| `prp.py`, `prp_session.py`, `sesp.py` | `tobii_service::prp`, `prp_session`, `sesp` | dataclasses built from native tuples; `sesp.Table`, `FrameDecoder`, `FlatccBuilder` are native classes |
+| `gaze.py` (PRP stream records and bodies) | `tobii_service::prp_streams` | `PrpRecord` dataclass; records cross as their packed platmod bytes |
+| `qpc_clock.py` | `tobii_service::qpc_clock` | `ServiceClock`, `QpcClockClassifier` subclass native classes; `QpcClockFollower` maps bridges to native keys |
+| `prp_service.py`, `sesp_service.py` (messages, property answers, presence, position transform) | `tobii_service::prp_service`, `sesp_service` | asyncio servers, hubs, subscriptions and synthetic producers stay |
+| `tet_tcp.py`, `tet_tcp_service.py` (policy, answers, restamp) | `tobii_service::tet_tcp` | recording proxy (threads, router, raw log) and asyncio endpoint stay |
 | `streams.py` (reader, watches) | `tobii_device::streams` | `GazeAndImageStreams`, `serve_tracker` stay |
 | `supervisor.py` | `tobii_device::supervisor` | `TrackerLink` holds the Python callables |
 
@@ -144,6 +150,10 @@ machine code computes them. The rules:
 
 Phase 1 (done): workspace, protocol, USB and device layers, bindings, Python
 wrappers, Nix build, Rust hooks in pre-commit.
+
+Game service (done, `tobii-service`): codecs and service decisions in Rust; the
+asyncio servers and the tet-tcp recording proxy stay in Python until the binary
+phase settles how the service runs its I/O.
 
 The next phases can run in parallel. Each owns new crates and the Python modules
 listed; shared files (`Cargo.toml` members, `crates/tobii-py/src/lib.rs`, the
