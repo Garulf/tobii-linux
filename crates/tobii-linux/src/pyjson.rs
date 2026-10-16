@@ -93,6 +93,15 @@ pub fn object<const N: usize>(entries: [(&str, Json); N]) -> Json {
 }
 
 /// Python's `repr(float)`.
+/// The shortest digits that read back as `value`, nearest to it, ties to even as Python's
+/// repr: Rust's shortest form can round a tie up.
+fn nearest_shortest(value: f64) -> String {
+    let shortest = format!("{value:e}");
+    let digits = shortest.split('e').next().unwrap_or_default().bytes().filter(u8::is_ascii_digit).count();
+    let nearest = format!("{value:.precision$e}", precision = digits.saturating_sub(1));
+    if nearest.parse::<f64>() == Ok(value) { nearest } else { shortest }
+}
+
 pub fn float_repr(value: f64) -> String {
     if value.is_nan() {
         return "nan".into();
@@ -100,7 +109,7 @@ pub fn float_repr(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "inf".into() } else { "-inf".into() };
     }
-    let scientific = format!("{value:e}");
+    let scientific = nearest_shortest(value);
     let (mantissa, exponent) = scientific.split_once('e').expect("Rust's {:e} always has an exponent");
     let exponent: i32 = exponent.parse().expect("integer exponent");
     let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |rest| ("-", rest));
@@ -263,6 +272,7 @@ mod tests {
             (f64::from(0.35f32), "0.3499999940395355"),
             (1e300, "1e+300"),
             (5e-324, "5e-324"),
+            (f64::from(-26.342_422_f32), "-26.342422485351562"),
         ];
         for (value, text) in cases {
             assert_eq!(float_repr(value), text, "{value:e}");
