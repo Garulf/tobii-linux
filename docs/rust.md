@@ -42,6 +42,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-protocol` | USB channel framing, TTP messages and items, typed values and the reply reader, request builders, stream ids, column sets, image frames, camera hardware info, gaze and presence stream decoding with the platmod records. Pure: no I/O, clocks or threads. | `hmac`, `md-5` |
 | `crates/tobii-usb` | nusb backend: sysfs descriptor probe, `BulkTransport` on interface 0, `UsbChannel` (vendor open/close, framed writes, demultiplexed reads) with its continuous reader thread, the raw traffic log and its replay. | `tobii-protocol`, `nusb` |
 | `crates/tobii-device` | `TrackerSession` (startup, realms, calls, hardware info, image frames), `StreamReader` and `ItemPump` (subscriptions, demultiplexing, silence and suspend checks), `DeviceClockWatch`, `ClockMapper`, `TrackerLink` with `Backoff`, reader threads (`newest`, `drained`), `usb_session`. Generic over the `Channel` trait. | `tobii-protocol`, `tobii-usb`, `rustix` |
+| `crates/tobii-gaze` | Gaze configuration: calibration, persistent-file and display-area requests, setting files, stimulus and blob point records, the display-area model and moving-lines wizard, EDID hints, eye positioning, calibration profiles, monitor rules and parsers. Device procedures (backup, restore, display setup, profile switching, the calibration sequence) are `Operation`s, state machines whose caller sends each request and runs each UI event; `operation::run` drives them on a `TrackerSession`. | `tobii-protocol`, `tobii-device`, `serde_json` |
 | `crates/tobii-py` | PyO3 bindings, one submodule per Python module (`_native.ttp`, `fields`, `commands`, `frames`, `camera_info`, `gaze`, `usb`, `device`). Nothing else depends on it. | all of the above, `pyo3` |
 
 Dependencies point down the table only. A later crate never reaches into the
@@ -63,6 +64,12 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `driver.py` (session, clock mapper) | `tobii_device::session`, `clock` | `TrackerSession` keeps `pending_streams`, `usb_device`; head-pose glue stays |
 | `streams.py` (reader, watches) | `tobii_device::streams` | `GazeAndImageStreams`, `serve_tracker` stay |
 | `supervisor.py` | `tobii_device::supervisor` | `TrackerLink` holds the Python callables |
+| `gaze_device.py` | `tobii_gaze::device` | dataclasses and enums in Python; `drive` sends the requests of native operations |
+| `calibration.py` | `tobii_gaze::calibration`, `operation` | `Calibrator.run` drives the native sequence on Python sessions and UIs; `DryRunSession` and the reports stay |
+| `calibration_profiles.py` | `tobii_gaze::profiles` | `ProfileStore` keeps the directory |
+| `display_setup.py` | `tobii_gaze::display` | dataclasses built from native tuples |
+| `eye_positioning.py` | `tobii_gaze::positioning` | classes around native objects, `Status` enum in Python |
+| `monitors.py` | `tobii_gaze::monitors` | the xrandr and PowerShell queries stay |
 
 ## Conventions
 
@@ -153,7 +160,7 @@ Makefile `ORACLES` list, this document) take one line per phase.
 | --- | --- | --- | --- | --- |
 | Game service: PRP, SESP, tet-tcp | `tobii-service` | `prp.py`, `prp_session.py`, `prp_service.py`, `sesp.py`, `sesp_service.py`, `tet_tcp.py`, `tet_tcp_service.py`, `qpc_clock.py`, PRP part of `gaze.py` | `tobii-protocol::gaze`, `tobii-device` | all |
 | Head-pose pipeline incl. OpenVINO | `tobii-headpose` | `face_detect.py`, `face_tracking.py`, `d1*.py`, `lbf*.py`, `eye_refine.py`, `landmark_smoothing.py`, `pose_*.py`, `head_pose_pipeline.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-device::session` (camera calibration, frames) | all |
-| Gaze device and calibration, display setup | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
+| Gaze device and calibration, display setup (done) | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
 | Setup app (gtk4-rs) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
 | Binary | `tobii-linux` (bin) | `cli.py`, `streams.GazeAndImageStreams`, `serve_tracker`, `demo/` | everything | last |
 
