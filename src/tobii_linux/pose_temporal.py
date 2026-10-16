@@ -77,6 +77,16 @@ order. Groups 13 and 15 are skipped; summation follows numeric FDP order.
                                                    raw(flipped_points), width, height, float(rectangle_width)))
 
 
+def fit_arrays(result, model):
+    """A native frame result with its float32 arrays rebuilt for `model`."""
+    ns, na = len(model.shape_ranges), len(model.animation_ranges)
+    return {'valid': result['valid'], 'rotation': array(result['rotation'], 3),
+            'translation': array(result['translation'], 3), 'rigid_state': array(result['rigid_state'], 6),
+            'shape_coefficients': array(result['shape_coefficients'], ns),
+            'animation_coefficients': array(result['animation_coefficients'], na),
+            'initialised': result['initialised'], 'frontal': result['frontal'], 'trace': result['trace']}
+
+
 class TemporalPoseFitter:
     """Stateful 0x14007e440 caller (last argument 1) for complete D1 landmarks.
 
@@ -107,13 +117,7 @@ The parent pose is left as it was."""
         points = floats(normalized_points)
         if points.shape != (len(self.model.landmark_ids), 2) or not np.isfinite(points).all():
             raise ValueError('Expected complete finite normalized landmarks')
-        result = self._native.process(points.tobytes(), width, height)
-        ns, na = len(self.model.shape_ranges), len(self.model.animation_ranges)
-        return {'valid': result['valid'], 'rotation': array(result['rotation'], 3),
-                'translation': array(result['translation'], 3), 'rigid_state': array(result['rigid_state'], 6),
-                'shape_coefficients': array(result['shape_coefficients'], ns),
-                'animation_coefficients': array(result['animation_coefficients'], na),
-                'initialised': result['initialised'], 'frontal': result['frontal'], 'trace': result['trace']}
+        return fit_arrays(self._native.process(points.tobytes(), width, height), self.model)
 
     @property
     def rigid_state(self):

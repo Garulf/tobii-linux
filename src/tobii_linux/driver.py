@@ -5,7 +5,8 @@ run against a real tracker: TTP on channel 0, startup, calibration and image
 frames as documented in its "Live observations" section. The session itself is
 crates/tobii-device (TrackerSession, ClockMapper); this module keeps the
 Python-facing state (pending stream messages, the USB device description) and
-the head-pose pipeline glue.
+the head-pose stream loop; each frame's head pose is computed by
+crates/tobii-headpose (HeadPoseProcessor).
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -267,25 +268,24 @@ class HeadPoseProcessor:
 
 Each session restarts the tracking state and the output filters with that
 session's camera calibration, as the runtime builds a new algorithm instance
-when a device is added.
+when a device is added. Tracking, fitting and the output stages all run in
+the Rust core (crates/tobii-headpose/src/processor.rs).
 """
     def __init__(self, model_directory, display_area):
-        from .face_tracking import FaceTracker
-        self.tracker = FaceTracker(model_directory)
+        from ._native import head_pose_processor
+        area = display_area
         self.display_area = display_area
-        self.output = None
+        self.native = head_pose_processor.HeadPoseProcessor(model_directory, tuple(area.top_left),
+                                                            tuple(area.top_right), tuple(area.bottom_left))
 
     def start(self, calibration):
-        from .head_pose_pipeline import HeadPoseOutput
-        self.tracker.reset()
-        self.output = HeadPoseOutput(calibration.translation, calibration.angles, self.display_area)
+        self.native.start(tuple(calibration.translation), tuple(calibration.angles))
 
     def __call__(self, frame):
-        import numpy as np
-        pixels = np.frombuffer(frame.pixels, np.uint8).reshape(frame.height, frame.width)
-        result = self.tracker.process(pixels, frame.timestamp // 1000)
-        fit = result.fit['rigid_state'] if result.fit is not None else None
-        return self.output(fit, frame.timestamp)
+        from .head_pose_pipeline import HeadPoseSample
+        timestamp, valid, position, rotation = self.native.process(frame.pixels, frame.width, frame.height,
+                                                                   frame.timestamp)
+        return HeadPoseSample(timestamp, valid, tuple(position), tuple(rotation))
 
 
 def head_pose_processor(session, model_directory, display_area, camera=0):
