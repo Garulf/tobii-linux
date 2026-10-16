@@ -55,3 +55,35 @@ check: rust-lint rust-test test
 
 clean-native:
 	rm -f $(NATIVE)
+
+# The GTK 4 setup app (crates/tobii-setup, feature gtk). The default targets above never
+# build it, so they work without GTK. Without a host GTK these run in nix/setup-shell.nix,
+# through nix-shell or nix-portable, with nixpkgs' Rust toolchain in target/gtk.
+NIX_PORTABLE ?= $(HOME)/.local/bin/nix-portable
+NIXPKGS ?= $(HOME)/np-src/nixpkgs
+SETUP_ARGS ?= --simulate unmapped
+ifeq ($(shell pkg-config --exists gtk4 2>/dev/null && echo yes),yes)
+GTK_TARGET_DIR ?= $(CARGO_TARGET_DIR)
+GTK_RUN ?= sh -c
+else ifneq ($(shell command -v nix-shell 2>/dev/null),)
+GTK_TARGET_DIR ?= $(CARGO_TARGET_DIR)/gtk
+GTK_RUN ?= nix-shell $(CURDIR)/nix/setup-shell.nix --run
+else
+GTK_TARGET_DIR ?= $(CARGO_TARGET_DIR)/gtk
+GTK_RUN ?= mkdir -p $(CURDIR)/build/nix-tmp && TMPDIR=$(CURDIR)/build/nix-tmp $(NIX_PORTABLE) nix-shell \
+	-I nixpkgs=$(NIXPKGS) $(CURDIR)/nix/setup-shell.nix --run
+endif
+GTK_CARGO := CARGO_TARGET_DIR=$(GTK_TARGET_DIR) cargo
+
+.PHONY: setup-app setup-test setup-run
+
+setup-app:
+	$(GTK_RUN) '$(GTK_CARGO) build --release -p tobii-setup --features gtk'
+	@echo $(GTK_TARGET_DIR)/release/tobii-linux-setup
+
+setup-test:
+	$(GTK_RUN) '$(GTK_CARGO) test -p tobii-setup --features gtk && \
+		$(GTK_CARGO) clippy -p tobii-setup --features gtk --all-targets -- -D warnings'
+
+setup-run: setup-app
+	$(GTK_RUN) '$(GTK_TARGET_DIR)/release/tobii-linux-setup $(SETUP_ARGS)'

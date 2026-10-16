@@ -13,6 +13,24 @@
     in rec {
       prp-bridge = bridge.prpBridge;
       wine-run = bridge.wineRun;
+      tobii-setup = pkgs.rustPlatform.buildRustPackage {
+        pname = "tobii-setup";
+        version = "0.1.0";
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./clippy.toml ./rustfmt.toml ./crates ];
+        };
+        cargoLock.lockFile = ./Cargo.lock;
+        cargoBuildFlags = [ "-p" "tobii-setup" "--features" "gtk" ];
+        cargoTestFlags = [ "-p" "tobii-setup" "--features" "gtk" ];
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.wrapGAppsHook4 ];
+        buildInputs = [ pkgs.gtk4 ];
+        meta = {
+          description = "Guided display setup and calibration of the Eye Tracker 5 (GTK 4)";
+          platforms = lib.platforms.linux;
+          mainProgram = "tobii-linux-setup";
+        };
+      };
       default = pkgs.python3Packages.buildPythonApplication {
         pname = "tobii-linux";
         version = "0.1.0";

@@ -1,0 +1,28 @@
+[package]
+name = "tobii-setup"
+description = "Guided display setup, eye positioning, calibration and profiles of the Eye Tracker 5 as a GTK 4 app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+gtk = ["dep:gtk4"]
+
+[dependencies]
+gtk4 = { version = "0.11", features = ["v4_14"], optional = true }
+log.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tobii-device.workspace = true
+tobii-gaze.workspace = true
+tobii-protocol.workspace = true
+tobii-usb.workspace = true
+
+[[bin]]
+name = "tobii-linux-setup"
+path = "src/main.rs"
+required-features = ["gtk"]
+
+[lints]
+workspace = true
