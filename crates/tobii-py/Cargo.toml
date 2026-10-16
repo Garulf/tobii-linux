@@ -24,6 +24,7 @@ tobii-device.workspace = true
 tobii-models.workspace = true
 tobii-gaze.workspace = true
 tobii-protocol.workspace = true
+tobii-service.workspace = true
 tobii-usb.workspace = true
 
 [lints]

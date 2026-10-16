@@ -537,7 +537,18 @@ dependencies = [
  "tobii-gaze",
  "tobii-models",
  "tobii-protocol",
+ "tobii-service",
  "tobii-usb",
+]
+
+[[package]]
+name = "tobii-service"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror",
+ "tobii-device",
+ "tobii-protocol",
 ]
 
 [[package]]

@@ -10,7 +10,9 @@ layer (display area, display id, user presence, with presence change notificatio
 Like the Windows runtime, it serves clients only while a tracker session runs: when
 the tracker goes away every client connection is closed and new ones are refused
 until it is back. Relay framing and real-service comparison: docs/prp-bridge.md,
-docs/gaze-host.md and docs/service-behaviour.md.
+docs/gaze-host.md and docs/service-behaviour.md. The messages, property answers and
+presence cache are implemented in crates/tobii-service/src/prp_service.rs; the asyncio
+service stays here.
 """
 
 import argparse
@@ -24,9 +26,9 @@ import struct
 import uuid
 
 from tobii_linux import gaze, sesp
+from tobii_linux._native import prp_service as _service
 from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
-from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, decode_envelope, encode_envelope
-from tobii_linux.prp import encode_stream_packet
+from tobii_linux.prp import HEAD_POSE, HeadPose, ProtocolError, encode_stream_packet
 from tobii_linux.qpc_clock import (
     AUTO, DEFAULT_SOURCE, WINE_CLOCKS, ClockSwitch, CounterMapping, QpcClockFollower, QpcSample,
     ServiceClock, decode_qpc_report)
@@ -35,15 +37,13 @@ from tobii_linux.tet_tcp_service import DeviceReplies, TetTcpService
 from tobii_linux.ttp_fields import float32
 from tobii_linux.prp_session import (
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE,
-    COMMAND_STREAM_START, COMMAND_STREAM_STOP, COMMAND_TIMESYNC, OPERATION_COMMAND_REQUEST,
-    OPERATION_COMMAND_RESPONSE, OPERATION_PROPERTY_GET, PROPERTY_DISPLAY_AREA,
-    PROPERTY_DISPLAY_ID, SERVER_PIPE_PREFIX,
+    COMMAND_STREAM_START, COMMAND_TIMESYNC, OPERATION_PROPERTY_GET, SERVER_PIPE_PREFIX,
     STATUS_NOT_SUPPORTED, STATUS_OK, SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL, CommandResponse,
     ConnectResponse, HandshakeInfo, PropertyResponse, decode_client_hello, decode_client_pid,
     decode_command_request, decode_property_request, decode_property_subscribe_request,
-    display_area_value, encode_command_response, encode_handshake_ack, encode_handshake_info,
-    encode_property_notification, encode_property_response, encode_property_subscribe_response,
-    split_packets, string_value)
+    encode_command_response, encode_handshake_ack, encode_handshake_info,
+    encode_property_response, encode_property_subscribe_response, split_packets)
+from tobii_linux._native import prp_session as _session
 
 log = logging.getLogger("tobii_linux.prp_service")
 
@@ -65,12 +65,11 @@ STATUS_CONNECTION_FAILED = 3
 STATUS_NOT_SUBSCRIBED = 5
 STATUS_INVALID_PARAMETER = 8
 STATUS_INSUFFICIENT_LICENSE = 17
-GAZE_STREAMS = (gaze.PRP_GAZE_POINT, gaze.PRP_RESPONSIVE_GAZE_POINT, gaze.PRP_GAZE_ORIGIN)
+GAZE_STREAMS = _service.GAZE_STREAMS
 # The real service refused these with INSUFFICIENT_LICENSE to a client without license keys.
-LICENSED_STREAMS = (gaze.PRP_GAZE_DATA, gaze.PRP_EYE_OPENNESS)
+LICENSED_STREAMS = _service.LICENSED_STREAMS
 # Stream list of the real service's connect response, without the streams this service lacks.
-GAZE_SERVICE_STREAMS = (gaze.PRP_GAZE_DATA, gaze.PRP_GAZE_POINT, gaze.PRP_RESPONSIVE_GAZE_POINT,
-                        gaze.PRP_GAZE_ORIGIN, HEAD_POSE)
+GAZE_SERVICE_STREAMS = _service.GAZE_SERVICE_STREAMS
 # Generic error body: four zero words satisfy every fixed-size response branch of the
 # client decoder except connect (0x180055780, operation 10).
 ERROR_BODY_WORDS = 4
@@ -85,7 +84,7 @@ PROPERTY_MODEL = 8
 # 0x10: the real service answered subscribe with 0 (and get, where tried: 2, 4, 5). The game
 # layer drops its notification subscriptions when one of them is refused, and its reconnect
 # then stalls re-subscribing the refused one.
-PROPERTY_ZERO_WORDS = (2, 4, 5, 7, 0x10)
+PROPERTY_ZERO_WORDS = _service.PROPERTY_ZERO_WORDS
 PROPERTY_CALIBRATION_ID = 6
 PROPERTY_USER_PRESENCE = gaze.PROPERTY_USER_PRESENCE
 PROPERTY_TRACK_BOX = 0xF
@@ -95,14 +94,11 @@ PROPERTY_LENS_CONFIGURATION = 0xC
 # Subscribe and unsubscribe answers of the real service (live, Windows,
 # evidence/private/robust-live/subscribe-all.jsonl): these are refused with INSUFFICIENT_LICENSE,
 # 3, 8 and 9 with NOT_SUPPORTED, and unsubscribing anything not subscribed gives NOT_SUBSCRIBED.
-LICENSED_SUBSCRIPTIONS = (0xA, 0xC, 0xD, 0xE, 0x13, 0x14, 0x17, 0x18)
-SUBSCRIBE_ONLY_PROPERTIES = (PROPERTY_USER_PRESENCE, PROPERTY_CALIBRATION_ID, PROPERTY_TRACK_BOX,
-                             PROPERTY_FIELD_OF_USE, PROPERTY_FAULTS, PROPERTY_WARNINGS)
+LICENSED_SUBSCRIPTIONS = _service.LICENSED_SUBSCRIPTIONS
+SUBSCRIBE_ONLY_PROPERTIES = _service.SUBSCRIBE_ONLY_PROPERTIES
 # Track box corners in mm as the reference tracker reported them: front plane at 450 mm,
 # back plane at 900 mm (property 0xF, live). The device getter 1400 is not queried.
-TRACK_BOX_MM = (125.0, 100.0, 450.0, -125.0, 100.0, 450.0, -125.0, -100.0, 450.0,
-                125.0, -100.0, 450.0, 250.0, 200.0, 900.0, -250.0, 200.0, 900.0,
-                -250.0, -200.0, 900.0, 250.0, -200.0, 900.0)
+TRACK_BOX_MM = _service.TRACK_BOX_MM
 TRACKER_STATUS_TEXT = "ok"
 MODEL_NAME = "IS5_Large_Eyetracker_5"
 # Subscribing presence on the device emits an unknown record this much before the tracker's
@@ -113,8 +109,7 @@ NOTIFICATION_TAG = 0
 # Smallest value block the client decoder accepts per property id (0x180055780, operation 6);
 # ids not listed need 8 bytes. Error replies carry a zero block of this size, as the real
 # service did for the properties it refused.
-PROPERTY_BLOCK_SIZES = {0: 4, 1: 0x28, 0xA: 0x1C, 0xB: 0x10, 0xC: 0x18, 0xD: 0xC, 0xF: 0x64,
-                        0x13: 0x488, 0x14: 0x10, 0x17: 0x34, 0x18: 0x10}
+PROPERTY_BLOCK_SIZES = _service.PROPERTY_BLOCK_SIZES
 DEFAULT_PROPERTY_BLOCK_SIZE = 8
 
 
@@ -146,26 +141,7 @@ def device_connect_response(serial: str, license_count: int,
     checked by device_create. The other values are copied from the real reply so
     later queries see a plausible device; their meaning is not established.
     """
-    return ConnectResponse(
-        build_version="1.37.4.0_tobii_linux",
-        list_a=(8, 12, 22, 21, 1, 15, 18, 2, 5, 4, 9, 16, 7, 6, 19, 17),
-        list_b=(1, 18, 2, 4, 16),
-        list_c=(0, 1, 2, 0, 4, 5, 6, 7, 0, 0, 0, 11, 0, 0, 0, 15, 16, 17, 18, 0, 0, 21, 22, 0, 0),
-        list_d=(9,),
-        streams=streams,
-        supported_commands=(COMMAND_CONNECT, COMMAND_STREAM_START, COMMAND_STREAM_STOP,
-                            COMMAND_TIMESYNC),
-        groups=((2, (17, 18)),),
-        strings=(serial, "IS5_Large_Eyetracker_5", "IS5", "tobii-linux", "Peripheral",
-                 "IS5LEYETRACKER5", ""),
-        words=(2, _float_word(184.0), _float_word(20.0), 0, _float_word(-0.16),
-               _float_word(13.85), 0, _float_word(5.38), _float_word(9.86)),
-        license_results=(0,) * license_count,
-        mode=2)
-
-
-def _float_word(value: float) -> int:
-    return struct.unpack("<i", struct.pack("<f", value))[0]
+    return ConnectResponse(*_service.device_connect_response(serial, license_count, list(streams)))
 
 
 def parse_display_area(text: str) -> DisplayArea:
@@ -177,7 +153,7 @@ def parse_display_area(text: str) -> DisplayArea:
 
 
 def word_value(value: int) -> tuple[bytes, bytes]:
-    return struct.pack("<II", 8, value), struct.pack("<I", 4)
+    return _service.word_value(value)
 
 
 def presence_value(value: int, since_us: int) -> tuple[bytes, bytes]:
@@ -186,70 +162,49 @@ def presence_value(value: int, since_us: int) -> tuple[bytes, bytes]:
     The real service answered two subscribes minutes apart with the same timestamp, so
     the time is that of the last change, not of the request.
     """
-    block = struct.pack("<IIII", 0x10, since_us >> 32 & 0xFFFFFFFF, since_us & 0xFFFFFFFF,
-                        value)
-    return block, struct.pack("<I", 4)
+    return _service.presence_value(value, since_us)
 
 
 def floats_value(values) -> tuple[bytes, bytes]:
-    return struct.pack(f"<I{len(values)}f", 4 + 4 * len(values), *values), struct.pack("<I", 4)
+    return _session.floats_value(list(values))
 
 
 def property_error(tag: int, property_id: int, status: int = STATUS_NOT_SUPPORTED):
     """Refusal with a zero value block, so the client decoder still accepts the packet."""
-    size = PROPERTY_BLOCK_SIZES.get(property_id, DEFAULT_PROPERTY_BLOCK_SIZE)
-    block = struct.pack("<I", size) + bytes(size - 4)
-    return PropertyResponse(tag, status, property_id, block, struct.pack("<I", 4))
+    return PropertyResponse(*_service.property_error(tag, property_id, status))
 
 
 def subscribe_error(tag: int, property_id: int, status: int = STATUS_NOT_SUPPORTED):
     """Refused command 5, carrying the empty value the real service sent for that property."""
-    if property_id == PROPERTY_MODEL:
-        return PropertyResponse(tag, status, property_id, *string_value(""))
-    if property_id == PROPERTY_LENS_CONFIGURATION:
-        block = struct.pack("<6I", 0x18, 0, 4, 0, 4, 0)
-        return PropertyResponse(tag, status, property_id, block, struct.pack("<I", 4))
-    return property_error(tag, property_id, status)
+    return PropertyResponse(*_service.subscribe_error(tag, property_id, status))
 
 
 # Relay framing ------------------------------------------------------------------------
 
 
 def encode_frame(kind: int, payload: bytes = b"") -> bytes:
-    if len(payload) > MAX_FRAME:
-        raise ProtocolError("relay frame exceeds the limit")
-    return RELAY_HEADER.pack(kind, len(payload)) + payload
+    return _service.encode_frame(kind, payload)
 
 
 async def read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
-    kind, size = RELAY_HEADER.unpack(await reader.readexactly(RELAY_HEADER.size))
-    if size > MAX_FRAME:
-        raise ProtocolError("relay frame exceeds the limit")
+    kind, size = _service.decode_frame_header(await reader.readexactly(RELAY_HEADER.size))
     return kind, await reader.readexactly(size)
 
 
 def encode_names(names) -> bytes:
-    return b"".join(name.encode("ascii") + b"\0" for name in names)
+    return _service.encode_names(list(names))
 
 
 def decode_names(payload: bytes) -> list[str]:
-    if payload and not payload.endswith(b"\0"):
-        raise ProtocolError("unterminated relay name")
-    return [name.decode("ascii") for name in payload.split(b"\0")[:-1]]
+    return _service.decode_names(payload)
 
 
 def encode_pipe_open(client_pid: int, pipe: str) -> bytes:
-    return struct.pack("<II", RELAY_VERSION, client_pid) + encode_names([pipe])
+    return _service.encode_pipe_open(client_pid, pipe)
 
 
 def decode_pipe_open(payload: bytes) -> tuple[int, str]:
-    if len(payload) < 9:
-        raise ProtocolError("truncated pipe open frame")
-    version, client_pid = struct.unpack_from("<II", payload)
-    names = decode_names(payload[8:])
-    if version != RELAY_VERSION or len(names) != 1:
-        raise ProtocolError("unsupported pipe open frame")
-    return client_pid, names[0]
+    return _service.decode_pipe_open(payload)
 
 
 class RelayPipe:
@@ -322,44 +277,12 @@ class HeadPoseHub(SampleHub):
 
 def presence_subscribe_time(tracker_time_us: int) -> int:
     """Time of the unknown record a presence subscription emits (0x140276dd0)."""
-    if tracker_time_us >= PRESENCE_SUBSCRIBE_LEAD_US:
-        return tracker_time_us - PRESENCE_SUBSCRIBE_LEAD_US
-    return tracker_time_us
+    return _service.presence_subscribe_time(tracker_time_us)
 
 
-class UserPresence:
-    """Property 0xB as the service caches it (0x1400fd220, cache 0x14010e930).
-
-    Every platmod presence record replaces the cached property record; it is
-    pushed to subscribed clients unless it is the first record since the cache
-    was cleared. There is no comparison with the previous value: the device
-    only sends changes (and its current value when subscribed).
-    """
-
-    def __init__(self):
-        self.clear()
-
-    def clear(self) -> None:
-        """Forget the record, as the service does when a device is added again (0x14010e8d0)."""
-        self.value: int | None = None
-        self.since_us = 0
-
-    def record(self, timestamp_us: int, platmod_value: int) -> bool:
-        """Cache one platmod record; True when the service would push it as a notification."""
-        notify = self.value is not None
-        self.value, self.since_us = gaze.prp_presence(platmod_value), timestamp_us
-        return notify
-
-    @property
-    def present(self) -> bool:
-        return self.value == gaze.PRESENCE_PRESENT
-
-    def value_block(self) -> tuple[bytes, bytes]:
-        return presence_value(self.value, self.since_us)
-
-    def notification(self) -> bytes:
-        return encode_property_notification(NOTIFICATION_TAG, PROPERTY_USER_PRESENCE,
-                                            *self.value_block())
+# Property 0xB as the service caches it (0x1400fd220, cache 0x14010e930): every platmod
+# record replaces it and is pushed to subscribers unless it is the first since a clear.
+UserPresence = _service.UserPresence
 
 
 class GazeHub(SampleHub):
@@ -425,10 +348,7 @@ def gaze_package(frame: gaze.GazeFrame, stream: int) -> bytes:
 
 
 def packet_operation(packet: bytes) -> int:
-    payload = decode_envelope(packet)
-    if len(payload) < 12:
-        raise ProtocolError("truncated PRP header")
-    return struct.unpack_from("<I", payload, 8)[0]
+    return _service.packet_operation(packet)
 
 
 @dataclass(frozen=True)
@@ -439,26 +359,12 @@ class RequestHeader:
 
 def request_header(packet: bytes) -> RequestHeader:
     """Tag and command id of any operation 9 request, including commands without a codec."""
-    payload = decode_envelope(packet)
-    if len(payload) < 16:
-        raise ProtocolError("truncated PRP request")
-    size, tag, operation = struct.unpack_from("<III", payload)
-    command_block = size + struct.unpack_from("<I", payload, size)[0] if size == 12 else 0
-    if (operation != OPERATION_COMMAND_REQUEST or command_block == 0
-            or command_block + 8 > len(payload)):
-        raise ProtocolError("not a PRP command request")
-    block_size, command = struct.unpack_from("<II", payload, command_block)
-    if block_size < 8:
-        raise ProtocolError("PRP command block is too short")
-    return RequestHeader(tag, command)
+    return RequestHeader(*_service.request_header(packet))
 
 
 def error_response(tag: int, command: int, status: int) -> bytes:
     """Nonzero-status reply for commands this service does not implement."""
-    header = struct.pack("<IIII", 12, tag, OPERATION_COMMAND_RESPONSE, 4)
-    status_block = struct.pack("<IiII", 12, status, command, 4)
-    body = struct.pack("<I", 4 * ERROR_BODY_WORDS) + bytes(4 * ERROR_BODY_WORDS - 4)
-    return encode_envelope(header + status_block + body + struct.pack("<II", 4, 0))
+    return _service.error_response(tag, command, status)
 
 
 class Subscription:
@@ -793,40 +699,12 @@ class PrpService:
         service sent them, and user presence for subscribes only (the real service refused
         the plain get).
         """
-        if subscribe and property_id in LICENSED_SUBSCRIPTIONS:
-            return subscribe_error(tag, property_id, STATUS_INSUFFICIENT_LICENSE)
-        value = self.property_value(property_id, subscribe, subscription)
-        if value is None:
-            return (subscribe_error if subscribe else property_error)(tag, property_id)
-        return PropertyResponse(tag, STATUS_OK, property_id, *value)
-
-    def property_value(self, property_id: int, subscribe: bool,
-                       subscription: Subscription | None = None):
-        if property_id in SUBSCRIBE_ONLY_PROPERTIES and not subscribe:
-            return self.get_value(property_id)
-        if property_id == PROPERTY_CALIBRATION_ID:
-            return word_value(self.calibration_id)
-        if property_id == PROPERTY_TRACK_BOX:
-            return floats_value(TRACK_BOX_MM)
-        if property_id == PROPERTY_FIELD_OF_USE:
-            return word_value(subscription.field_of_use if subscription is not None else 0)
-        if property_id in (PROPERTY_FAULTS, PROPERTY_WARNINGS):
-            return string_value(TRACKER_STATUS_TEXT)
-        return self.get_value(property_id, subscribe)
-
-    def get_value(self, property_id: int, subscribe: bool = False):
-        if property_id == PROPERTY_DISPLAY_AREA and self.display_area:
-            area = self.display_area
-            return display_area_value(area.top_left, area.top_right, area.bottom_left)
-        if property_id == PROPERTY_DISPLAY_ID and (self.display_id or self.reported_display_id):
-            return string_value(self.display_id or self.reported_display_id)
-        if property_id == PROPERTY_MODEL and not subscribe:
-            return string_value(MODEL_NAME)
-        if property_id in PROPERTY_ZERO_WORDS:
-            return word_value(0)
-        if property_id == PROPERTY_USER_PRESENCE and subscribe and self.presence.value is not None:
-            return self.presence.value_block()
-        return None
+        area = self.display_area
+        corners = (*area.top_left, *area.top_right, *area.bottom_left) if area else None
+        field_of_use = subscription.field_of_use if subscription is not None else None
+        return PropertyResponse(*_service.answer_property(
+            tag, property_id, subscribe, corners, self.display_id or self.reported_display_id,
+            self.calibration_id, self.presence, field_of_use))
 
     def connect(self, connection: PipeConnection, request) -> CommandResponse:
         subscription = self.subscriptions.get(request.connect.subscription_client_id)

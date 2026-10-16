@@ -12,7 +12,9 @@ that relays TTP requests to a tracker backend, remapping request ids, and sends
 responses and subscribed stream data back. Every byte in either direction is
 written to a RawLog. Requests outside READ_COMMANDS are never forwarded: the
 router answers them with an error and logs them as blocked, so the DLL cannot
-write calibration, display area, settings or files to the device.
+write calibration, display area, settings or files to the device. The policy is
+implemented in crates/tobii-service/src/tet_tcp.rs; the sockets, threads and router stay
+here, since the router calls Python backends and connections.
 """
 from dataclasses import dataclass, field
 import itertools
@@ -21,38 +23,24 @@ import socket
 import threading
 import time
 
+from ._native import tet_tcp as _tet_tcp
 from .ttp import Decoder, Message, ProtocolError, fields, protocol_upgrade
 from .ttp_commands import (Command, NOTIFICATION_KIND, REQUEST_KIND, RESPONSE_KIND,
                            STREAM_DATA_KIND, header_only_request, open_realm_response,
                            open_realm_salt, realm_digest, request, uint32_field)
 from .ttp_fields import value
 
-COMMAND_PORT = 4455
-CHANNEL_PORTS = {4455: 1, 4457: 3, 4459: 4}
-TIMESYNC_UDP_PORT = 4457
-SERVICE_UNLOCK_KEY = b'aaaaaaaabbbbbbbbccccccccdddddddd'
-UNSUPPORTED_OPERATION = 0x20000501
+COMMAND_PORT = _tet_tcp.COMMAND_PORT
+CHANNEL_PORTS = dict(_tet_tcp.CHANNEL_PORTS)
+TIMESYNC_UDP_PORT = _tet_tcp.TIMESYNC_UDP_PORT
+SERVICE_UNLOCK_KEY = _tet_tcp.SERVICE_UNLOCK_KEY
+UNSUPPORTED_OPERATION = _tet_tcp.UNSUPPORTED_OPERATION
 INTERNAL_TIMEOUT_S = 3.0
-DISPLAY_AREA_WRITABLE = 1460
-PERSISTENT_FILE_ENUMERATE = 3060
-PERSISTENT_FILE_READ = 3080
+DISPLAY_AREA_WRITABLE = _tet_tcp.DISPLAY_AREA_WRITABLE
+PERSISTENT_FILE_ENUMERATE = _tet_tcp.PERSISTENT_FILE_ENUMERATE
+PERSISTENT_FILE_READ = _tet_tcp.PERSISTENT_FILE_READ
 
-READ_COMMANDS = frozenset({
-    Command.PROTOCOL_UPGRADE, Command.ENUMERATE_STREAM_TYPES,
-    Command.ENUMERATE_STREAM_TYPE_COLUMNS, Command.SUBSCRIBE_STREAM,
-    Command.UNSUBSCRIBE_STREAM, Command.GET_DEVICE_PROPERTIES, Command.GET_CAPABILITIES,
-    Command.GET_CAPABILITIES_ALL, Command.GET_TRACK_BOX, Command.GET_DEVICE_INFO,
-    Command.GET_DISPLAY_AREA, Command.GET_DEVICE_STATUS, Command.UNLOCK_PPU,
-    Command.GET_OUTPUT_FREQUENCY, Command.ENUMERATE_OUTPUT_FREQUENCIES,
-    Command.GET_FREQUENCIES, Command.ENUMERATE_FREQUENCIES, Command.GET_DEVICE_NAME,
-    Command.ENUMERATE_EXTENSIONS, Command.ENUMERATE_ENABLED_EXTENSIONS,
-    Command.OPEN_REALM_SALT, Command.OPEN_REALM_RESPONSE,
-    Command.OPEN_REALM_RESPONSE_WITH_DATA, Command.CLOSE_REALM, Command.GET_LOW_BLINK_MODE,
-    Command.GET_ILLUMINATION_MODE, Command.ENUMERATE_ILLUMINATION_MODES,
-    Command.GET_GEOMETRY_MOUNTING, Command.HARDWARE_CONFIGURATION_GET,
-    Command.GET_ENABLED_EYE, DISPLAY_AREA_WRITABLE, PERSISTENT_FILE_ENUMERATE,
-    PERSISTENT_FILE_READ,
-})
+READ_COMMANDS = frozenset(_tet_tcp.READ_COMMANDS)
 
 
 def describe(message):
@@ -91,11 +79,7 @@ class RawLog:
 
 def subscribed_stream(message):
     """Wire stream id of a SUBSCRIBE_STREAM or UNSUBSCRIBE_STREAM request, if readable."""
-    try:
-        first = fields(message.payload)[0]
-        return value(first) if first.tag == 0x02 else None
-    except (ProtocolError, IndexError, ValueError):
-        return None
+    return _tet_tcp.subscribed_stream(message)
 
 
 @dataclass

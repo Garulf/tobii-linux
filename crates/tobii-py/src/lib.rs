@@ -26,6 +26,14 @@ mod gaze_operation;
 mod logging;
 mod models;
 mod monitors;
+mod prp;
+mod prp_service;
+mod prp_session;
+mod qpc_clock;
+mod sesp;
+mod sesp_service;
+mod tet_tcp;
+mod tet_tcp_service;
 mod ttp;
 mod usb;
 
@@ -59,5 +67,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "display_setup", display_setup::register)?;
     submodule(m, "eye_positioning", eye_positioning::register)?;
     submodule(m, "monitors", monitors::register)?;
+    submodule(m, "prp", prp::register)?;
+    submodule(m, "prp_session", prp_session::register)?;
+    submodule(m, "prp_service", prp_service::register)?;
+    submodule(m, "qpc_clock", qpc_clock::register)?;
+    submodule(m, "sesp", sesp::register)?;
+    submodule(m, "sesp_service", sesp_service::register)?;
+    submodule(m, "tet_tcp", tet_tcp::register)?;
+    submodule(m, "tet_tcp_service", tet_tcp_service::register)?;
     Ok(())
 }
