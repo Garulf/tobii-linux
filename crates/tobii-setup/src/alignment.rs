@@ -564,6 +564,59 @@ mod tests {
         assert_eq!(alignment.key(LineKey::Enter, false, true, 11.0), KeyOutcome::Done(alignment.left, alignment.right));
     }
 
+    /// The browser page's numbers at 1280 x 720 after "This display" (alignment.trackerBox(),
+    /// left and right, and display-setup.json's display_args after Done and Save), for the
+    /// default 376.3 mm width estimate and for a 597 x 336 mm EDID hint, from
+    /// `tobii-linux setup --simulate unmapped [--edid]`.
+    #[test]
+    fn pixels_and_millimetres_match_the_browser_page() {
+        use tobii_gaze::display::{
+            ET5_MOUNTING, area_from_lines, initial_lines, line_instructions, picture_proportion,
+        };
+        let cases = [
+            (
+                None,
+                (0.2555142173797502, 0.7444857826202498),
+                [153.57959075205952, 483.6326480171275, 972.840818495881, 86.36735198287245],
+                [-188.14999389648438, 209.1708984375, 69.29495239257812, 188.14999389648438, 209.1708984375],
+            ),
+            (
+                Some([597.0, 336.0]),
+                (0.34589614740368513, 0.6541038525963149),
+                [333.4003350083753, 515.5610811538444, 613.1993299832494, 54.4389188461556],
+                [-298.5, 325.8278503417969, 111.7546157836914, 298.5, 325.8278503417969],
+            ),
+        ];
+        for (hint, (left, right), [x, y, width, height], area_start) in cases {
+            let setup = initial_lines(&ET5_MOUNTING, None, hint, Some([1280.0, 720.0]));
+            assert_eq!((setup.left, setup.right), (left, right));
+            let mut alignment = Alignment::default();
+            alignment.resize(1280.0, 720.0, 1.0);
+            let config = DisplayLines {
+                intro: true,
+                left: setup.left,
+                right: setup.right,
+                aspect: setup.aspect,
+                tracker_width_mm: ET5_MOUNTING.width_mm,
+                picture_proportion: picture_proportion(&ET5_MOUNTING),
+                instructions: line_instructions(&ET5_MOUNTING),
+                previous: false,
+                next: false,
+            };
+            alignment.show(config, 0.0);
+            alignment.choose_this_display(0.0);
+            alignment.tick(1.6);
+            alignment.tick(10.0);
+            let tracker = alignment.tracker_box();
+            for (found, expected) in [(tracker.x, x), (tracker.y, y), (tracker.width, width), (tracker.height, height)]
+            {
+                assert!((found - expected).abs() < 1e-9, "{tracker:?}");
+            }
+            let (_, _, area) = area_from_lines(alignment.left, alignment.right, setup.aspect, &ET5_MOUNTING).unwrap();
+            assert_eq!(area.floats()[..5], area_start);
+        }
+    }
+
     #[test]
     fn lines_keep_their_limits() {
         let mut alignment = ready(false);
