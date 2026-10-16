@@ -61,15 +61,7 @@ pub fn translate(xml: &str, weights: &[u8]) -> Result<IrModel> {
     }
     let mut builder = Builder { weights, graph: Graph::default() };
     builder.run(root)?;
-    let name = root.attribute("name").map(str::to_owned);
-    Ok(builder.graph.serialize(name.as_deref().unwrap_or("")).with_name(name))
-}
-
-impl IrModel {
-    fn with_name(mut self, name: Option<String>) -> Self {
-        self.name = name;
-        self
-    }
+    Ok(builder.graph.serialize(root.attribute("name").map(str::to_owned)))
 }
 
 fn children<'a, 'input>(
@@ -210,8 +202,11 @@ impl Graph {
         Ok(self.add(name, Op::Add, vec![left, right], shape, Element::F32))
     }
 
-    fn serialize(&self, name: &str) -> IrModel {
-        let mut xml = format!("<?xml version=\"1.0\"?>\n<net name=\"{}\" version=\"11\">\n\t<layers>\n", escape(name));
+    fn serialize(&self, name: Option<String>) -> IrModel {
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<net name=\"{}\" version=\"11\">\n\t<layers>\n",
+            escape(name.as_deref().unwrap_or(""))
+        );
         let mut weights = Vec::new();
         let mut edges = String::new();
         for (id, node) in self.nodes.iter().enumerate() {
@@ -249,7 +244,7 @@ impl Graph {
         }
         let _ = write!(xml, "\t</layers>\n\t<edges>\n{edges}\t</edges>\n\t<rt_info />\n</net>\n");
         let inputs = self.nodes.iter().filter(|n| matches!(n.op, Op::Parameter)).map(|n| n.shape.clone()).collect();
-        IrModel { name: None, xml, weights, inputs }
+        IrModel { name, xml, weights, inputs }
     }
 }
 
