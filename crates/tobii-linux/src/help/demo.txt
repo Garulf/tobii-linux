@@ -1,0 +1,35 @@
+usage: tobii-linux demo [-h] [--host HOST] [--port PORT]
+                        [--display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ]
+                        [--models MODELS] [--channel CHANNEL] [--index INDEX]
+                        [--image-rate IMAGE_RATE] [--gaze-source {device}]
+                        [--no-headpose] [--replay-frames LOG]
+                        [--replay-frames-dir DIR] [--replay-gaze LOG]
+
+Live browser view of the tracker: camera, head pose, gaze and status.
+
+options:
+  -h, --help            show this help message and exit
+  --host HOST           Address to listen on (default 127.0.0.1)
+  --port PORT           HTTP port (default 8765)
+  --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+                        Display area corners in millimetres: top-left, top-
+                        right, bottom-left
+  --models MODELS
+  --channel CHANNEL     USB channel carrying TTP
+  --index INDEX         Device index from probe
+  --image-rate IMAGE_RATE
+                        Camera images sent to the browser per second (default
+                        15)
+  --gaze-source {device}
+  --no-headpose         Skip face tracking and head pose
+
+replay:
+  Play recorded data instead of opening the tracker
+
+  --replay-frames LOG   JSON-lines log of tools/linux_session_probe.py --until
+                        frames
+  --replay-frames-dir DIR
+                        Directory holding that log's frames (default: frames/
+                        next to the log)
+  --replay-gaze LOG     JSON-lines log of tools/linux_stream_capture.py with
+                        gaze messages

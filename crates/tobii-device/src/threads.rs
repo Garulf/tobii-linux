@@ -148,16 +148,16 @@ mod tests {
 
     #[test]
     fn drained_keeps_the_newest_depth_items() {
-        let (go_tx, go_rx) = mpsc::channel::<()>();
-        let source = (0..10).map(move |n| {
-            if n == 0 {
-                go_rx.recv().unwrap();
+        let (exhausted_tx, exhausted_rx) = mpsc::channel::<()>();
+        let source = (0..=10).map_while(move |n| {
+            if n == 10 {
+                exhausted_tx.send(()).unwrap();
+                return None;
             }
-            Ok::<_, ()>(n)
+            Some(Ok::<_, ()>(n))
         });
         let relay = drained(source, 3);
-        go_tx.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        exhausted_rx.recv().unwrap();
         assert_eq!(relay.map(Result::unwrap).collect::<Vec<_>>(), [7, 8, 9]);
     }
 }
