@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tobii_device::streams::HostSuspendWatch;
 use tobii_device::supervisor::{Backoff, LinkHost, LinkState, TrackerLink};
-use tobii_device::{StopFlag, StopSignal};
+use tobii_device::{Channel, StopFlag, StopSignal, TrackerSession};
 use tobii_headpose::pipeline::DisplayArea;
 use tobii_service::prp_service::{DEFAULT_NAME, DEFAULT_PORT};
 use tokio::sync::mpsc;
@@ -199,16 +199,25 @@ impl Serve {
     }
 }
 
-/// TrackerLink host feeding the service's events from USB sessions.
-struct ServiceLink<'a> {
-    session: &'a Session,
-    processor: &'a mut dyn FrameProcessor,
-    clock: HostTime,
-    feed: &'a ServiceFeed,
-    events: mpsc::UnboundedSender<Event>,
+/// Opens a started tracker session: the USB tracker, or a scripted one in tests.
+pub type OpenTracker<'a, C> = &'a mut dyn FnMut() -> Result<TrackerSession<C>>;
+
+/// TrackerLink host feeding the service's events from the sessions `open` starts.
+pub struct ServiceLink<'a, C> {
+    pub open: OpenTracker<'a, C>,
+    pub processor: &'a mut dyn FrameProcessor,
+    pub clock: HostTime,
+    pub feed: &'a ServiceFeed,
+    pub events: mpsc::UnboundedSender<Event>,
 }
 
-impl LinkHost for ServiceLink<'_> {
+impl<C> std::fmt::Debug for ServiceLink<'_, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceLink").field("clock", &self.clock).field("feed", self.feed).finish_non_exhaustive()
+    }
+}
+
+impl<C: Channel> LinkHost for ServiceLink<'_, C> {
     type Error = Error;
 
     fn on_state(&mut self, state: LinkState, detail: &str) -> Result<()> {
@@ -218,7 +227,7 @@ impl LinkHost for ServiceLink<'_> {
     }
 
     fn attempt(&mut self, stop: &dyn StopSignal, opened: &mut dyn FnMut()) -> Result<()> {
-        let (_, mut session) = self.session.open()?;
+        let mut session = (self.open)()?;
         opened();
         let suspend = Box::new(HostSuspendWatch::default());
         serve_tracker(&mut session, self.processor, self.clock.clone(), self.feed, stop, Some(suspend))
@@ -307,7 +316,8 @@ async fn run_service(
         std::thread::Builder::new().name("tracker-link".into()).spawn(move || {
             let mut link = TrackerLink::new(Backoff::default());
             let processor = processor.as_mut();
-            let mut host = ServiceLink { session: &session, processor, clock: host_clock, feed: &feed, events };
+            let mut open = || session.open().map(|(_, tracker)| tracker);
+            let mut host = ServiceLink { open: &mut open, processor, clock: host_clock, feed: &feed, events };
             link.run(&mut host, &stop);
             let _ = finished.send((link.sessions(), link.failures()));
         })?

@@ -239,9 +239,9 @@ type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
 /// emits one until the device reports (0x140276dd0). Image frames reach the consumer
 /// newest first, dropping frames that arrive while it is busy, with a function mapping
 /// their device timestamps onto `clock`. Gaze and images use separate clock mappers, so
-/// head pose timing is the same as without gaze. A device clock that jumps back ends the
-/// session. `device_stream`, when given, also receives each gaze and presence message as
-/// the device sent it, with its time on `clock`.
+/// head pose timing is the same as without gaze. A device clock that jumps back, as
+/// `device_clock` judges it, ends the session. `device_stream`, when given, also receives
+/// each gaze and presence message as the device sent it, with its time on `clock`.
 pub struct LiveStreams<'a> {
     pub clock: HostTime,
     pub gaze: GazeCallback<'a>,
@@ -249,6 +249,7 @@ pub struct LiveStreams<'a> {
     pub device_stream: Option<DeviceStreamCallback<'a>>,
     pub silence: Duration,
     pub suspend: Option<Box<dyn SuspendWatch>>,
+    pub device_clock: DeviceClockWatch,
 }
 
 impl std::fmt::Debug for LiveStreams<'_> {
@@ -262,7 +263,15 @@ impl std::fmt::Debug for LiveStreams<'_> {
 
 impl<'a> LiveStreams<'a> {
     pub fn new(clock: HostTime, gaze: GazeCallback<'a>) -> Self {
-        Self { clock, gaze, presence: None, device_stream: None, silence: SILENCE_TIMEOUT, suspend: None }
+        Self {
+            clock,
+            gaze,
+            presence: None,
+            device_stream: None,
+            silence: SILENCE_TIMEOUT,
+            suspend: None,
+            device_clock: DeviceClockWatch::default(),
+        }
     }
 
     /// Subscribes, runs `started` with the reader, then hands frames to `consume` until
@@ -297,7 +306,7 @@ impl<'a> LiveStreams<'a> {
                 presence: self.presence,
                 device_stream: self.device_stream,
                 gaze_time: ClockMapper::new(self.clock.clone()),
-                device_clock: DeviceClockWatch::default(),
+                device_clock: self.device_clock,
                 image_time,
                 frames,
             };
