@@ -23,6 +23,10 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "-p" "tobii-setup" "--features" "gtk" ];
         cargoTestFlags = [ "-p" "tobii-setup" "--features" "gtk" ];
+        preConfigure = ''
+          export HOME="$NIX_BUILD_TOP/home"
+          mkdir -p "$HOME"
+        '';
         nativeBuildInputs = [ pkgs.pkg-config pkgs.wrapGAppsHook4 ];
         buildInputs = [ pkgs.gtk4 ];
         meta = {
