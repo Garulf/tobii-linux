@@ -4,8 +4,10 @@ VNNTrackerCore keeps one parent face model across frames. The first frame (or
 the first after tracking is lost) runs the flag-3 initial fit 0x14007ec70 and
 then the flag-5 temporal fit 0x14007ee60; later frames run only the temporal
 fit, starting from the previous frame's pose and coefficients.
+The caller is crates/tobii-headpose/src/temporal.rs.
 """
-import math
+from ._arrays import array, floats, raw
+from ._native import pose_temporal as _temporal
 
 FLOAT_PI = 3.1415927410125732
 INITIAL_YAW = 3
@@ -22,36 +24,22 @@ RESET_POINTS = ((3, 7), (3, 11), (3, 8), (3, 12))
 MINIMUM_FIT_POINTS = 4
 
 
-def _f32(value):
-    import numpy as np
-    return np.float32(value)
-
-
-def _round(value):
-    """cvtps2pd + cvtsd2si under the default round-to-nearest-even mode."""
-    return int(round(float(_f32(value))))
-
-
 def facing_degrees(rigid_state):
     """0x14007ee60 facing angle from the model pose, before that attempt's fit."""
     import numpy as np
-    pose = np.asarray(rigid_state, dtype=np.float32)
-    bearing = _f32(math.atan2(float(pose[3]), float(pose[5])))
-    return _f32(_f32(_f32(pose[1] - bearing) - _f32(FACING_PI)) * _f32(RADIANS_TO_DEGREES))
+    return np.float32(_temporal.facing_degrees(raw(rigid_state)))
 
 
 def pose_output(rigid_state):
     """0x140055470 output: (rx, ry - float32(pi), rz) and the translation."""
     import numpy as np
-    pose = np.asarray(rigid_state, dtype=np.float32)
-    rotation = np.array([pose[0], pose[1] - _f32(FLOAT_PI), pose[2]], dtype=np.float32)
-    return rotation, pose[3:].copy()
+    rotation, translation = _temporal.pose_output(raw(rigid_state))
+    return np.array(rotation, dtype=np.float32), np.array(translation, dtype=np.float32)
 
 
 def is_near_frontal(output_rotation):
     """COMISS + JAE: a NaN angle counts as below the limit."""
-    limit = _f32(FRONTAL_LIMIT)
-    return not (abs(_f32(output_rotation[0])) >= limit or abs(_f32(output_rotation[1])) >= limit)
+    return _temporal.is_near_frontal((output_rotation[0], output_rotation[1]))
 
 
 def eye_face_rectangle(normalized_points, landmark_ids, width, height):
@@ -60,35 +48,11 @@ def eye_face_rectangle(normalized_points, landmark_ids, width, height):
 Returns (x, y, size, size) in pixels, or None when a required record is absent;
 the original then leaves its output uninitialised.
 """
-    lookup = {tuple(identifier): point for identifier, point in zip(landmark_ids, normalized_points)}
-    required = ((3, 11), (3, 7), (3, 12), (3, 8), (9, 5), (9, 4), (8, 1))
-    if any(identifier not in lookup for identifier in required):
-        return None
-    w, h = _f32(width), _f32(height)
-    def pixel(identifier):
-        x, y = lookup[identifier]
-        return _round(w * _f32(x)), _round(_f32(y) * h)
-    def middle(a, b):
-        return (_round(_f32(a[0] + b[0]) * _f32(.5)), _round(_f32(a[1] + b[1]) * _f32(.5)))
-    left = middle(pixel((3, 11)), pixel((3, 7)))
-    right = middle(pixel((3, 12)), pixel((3, 8)))
-    nose = middle(pixel((9, 5)), pixel((9, 4)))
-    eyes = middle(right, left)
-    mouth = pixel((8, 1))
-    def squared(a, b):
-        dx, dy = _f32(a[0] - b[0]), _f32(a[1] - b[1])
-        return _f32(dy * dy + dx * dx)
-    def root(value):
-        return _f32(math.sqrt(float(value)))
-    right_mouth, left_right, left_mouth = squared(right, mouth), squared(left, right), squared(left, mouth)
-    largest = right_mouth if root(right_mouth) >= root(left_right) else left_right
-    if not root(left_mouth) >= root(largest):
-        left_mouth = left_right if root(right_mouth) < root(left_right) else right_mouth
-    size = _round(root(left_mouth) * _f32(RECTANGLE_SCALE))
-    half = _f32(_f32(size) * _f32(.5))
-    x = _round(_f32(_f32(_f32(eyes[0]) * _f32(RECTANGLE_EYE_WEIGHT)) + _f32(_f32(nose[0]) * _f32(RECTANGLE_NOSE_WEIGHT))) - half)
-    y = _round(_f32(_f32(_f32(eyes[1]) * _f32(RECTANGLE_EYE_WEIGHT)) + _f32(_f32(nose[1]) * _f32(RECTANGLE_NOSE_WEIGHT))) - half)
-    return x, y, size, size
+    ids = [tuple(identifier) for identifier in landmark_ids]
+    points = floats(normalized_points).reshape(-1, 2)
+    count = min(len(ids), len(points))
+    rectangle = _temporal.eye_face_rectangle(points[:count].tobytes(), ids[:count], width, height)
+    return None if rectangle is None else tuple(rectangle)
 
 
 def finalized_projection(model, rigid_state, shape_coefficients, animation_coefficients):
@@ -96,14 +60,10 @@ def finalized_projection(model, rigid_state, shape_coefficients, animation_coeff
 
 The divide is focal/Z followed by X*(focal/Z), unlike the fitting prediction.
 """
-    import numpy as np
-    from .pose_projection import deform_vertices, project_points
-    pose = np.asarray(rigid_state, dtype=np.float32)
-    deformed = deform_vertices(model.vertices, model.shape_basis, shape_coefficients,
-                               model.animation_basis, animation_coefficients)
-    _, camera = project_points(deformed, pose[:3], pose[3:], model.focal_factor, 1)
-    factor = np.float32(model.focal_factor) / camera[:, 2]
-    return np.column_stack((camera[:, 0] * factor, camera[:, 1] * factor))
+    from .pose_model import _native_model
+    projected = _temporal.finalized_projection(_native_model(model), raw(rigid_state), raw(shape_coefficients),
+                                               raw(animation_coefficients))
+    return array(projected, len(model.vertices), 2)
 
 
 def reprojection_error(model, projected, flipped_points, width, height, rectangle_width):
@@ -113,24 +73,8 @@ flipped_points are the Y-flipped caller copy (0x14007ac80) in model.landmark_ids
 order. Groups 13 and 15 are skipped; summation follows numeric FDP order.
 """
     import numpy as np
-    w, h = _f32(width), _f32(height)
-    aspect_x = w / h if height < width else _f32(1)
-    aspect_y = h / w if width < height else _f32(1)
-    half = _f32(.5)
-    inverse = _f32(1) / _f32(rectangle_width)
-    total, count = _f32(0), 0
-    for index in sorted(range(len(model.landmark_ids)), key=lambda i: tuple(model.landmark_ids[i])):
-        if model.landmark_ids[index][0] in ERROR_EXCLUDED_GROUPS:
-            continue
-        model_x = half - (projected[index, 0] * half) / aspect_x
-        model_y = (projected[index, 1] * half) / aspect_y + half
-        record_x, record_y = (_f32(v) for v in flipped_points[index])
-        dy = _f32(h * record_y) - _f32(h * model_y)
-        dx = _f32(w * record_x) - _f32(w * model_x)
-        total = _f32(total + _f32(np.sqrt(_f32(_f32(dx * dx) + _f32(dy * dy)))) * inverse)
-        count += 1
-    with np.errstate(invalid='ignore', divide='ignore'):
-        return _f32(total / _f32(count))
+    return np.float32(_temporal.reprojection_error([tuple(i) for i in model.landmark_ids], raw(projected),
+                                                   raw(flipped_points), width, height, float(rectangle_width)))
 
 
 class TemporalPoseFitter:
@@ -142,151 +86,84 @@ object built by 0x1400dbba0. That object keeps its own latent state and is
 re-encoded from the parent only when the requested flag changes, so parent
 pose resets made between two same-flag fits do not move the next fit's start.
 Extra parent models and the caller +0x58 external pose hint are not supported.
+`accumulation='float32'` sums the updates in float32 instead of float64, only
+to measure how sensitive a frame is to arithmetic order.
 """
-    def __init__(self, model):
-        import numpy as np
-        from .pose_model import select_pose_landmarks
+    def __init__(self, model, accumulation='float64'):
+        from .pose_model import _native_model, select_pose_landmarks
         self.model = model
         self.selected, self.order = select_pose_landmarks(model, model.landmark_ids)
         self.reset_indices = [self.selected.landmark_ids.index(i) for i in RESET_POINTS]
-        self.rigid_state = np.zeros(6, dtype=np.float32)
-        self.projected = np.zeros((len(self.selected.landmark_ids), 2), dtype=np.float32)
-        self.reset()
+        self._native = _temporal.TemporalPoseFitter(_native_model(model), accumulation)
 
     def reset(self):
         """Caller reset 0x14007e270 plus the fitting-object rebuild it triggers in 0x14007e330.
 
 The parent pose is left as it was."""
-        import numpy as np
-        self.initialised = False
-        self.frontal = False
-        self.shape = np.zeros(len(self.model.shape_ranges), dtype=np.float32)
-        self.animation = np.zeros(len(self.model.animation_ranges), dtype=np.float32)
-        self.fit_mode = None
-        self.fit_state = None
-        self.fixed_shape = self.fixed_animation = None
+        self._native.reset()
 
     def process(self, normalized_points, width, height):
         import numpy as np
-        from .pose_fit import prepare_observations
-        points = np.asarray(normalized_points, dtype=np.float32)
+        points = floats(normalized_points)
         if points.shape != (len(self.model.landmark_ids), 2) or not np.isfinite(points).all():
             raise ValueError('Expected complete finite normalized landmarks')
-        frame = _Frame(self, points[self.order], width, height)
-        frame.observations, frame.weights = prepare_observations(
-            frame.points, self.selected.landmark_ids, width, height)
-        if not self.initialised:
-            self.initialised = frame.initial_fit()
-            self.frontal = is_near_frontal(pose_output(self.rigid_state)[0])
-        valid = frame.temporal_fit()
-        if not valid:
-            self.rigid_state = np.array([0, FLOAT_PI, 0, 0, 0, 0], dtype=np.float32)
-        elif is_near_frontal(pose_output(self.rigid_state)[0]) and not self.frontal:
-            self.initialised = frame.initial_fit()
-            frame.temporal_fit()
-            self.frontal = True
-        rotation, translation = pose_output(self.rigid_state)
-        return {'valid': valid, 'rotation': rotation, 'translation': translation,
-                'rigid_state': self.rigid_state.copy(), 'shape_coefficients': self.shape.copy(),
-                'animation_coefficients': self.animation.copy(), 'initialised': self.initialised,
-                'frontal': self.frontal, 'trace': frame.trace}
+        result = self._native.process(points.tobytes(), width, height)
+        ns, na = len(self.model.shape_ranges), len(self.model.animation_ranges)
+        return {'valid': result['valid'], 'rotation': array(result['rotation'], 3),
+                'translation': array(result['translation'], 3), 'rigid_state': array(result['rigid_state'], 6),
+                'shape_coefficients': array(result['shape_coefficients'], ns),
+                'animation_coefficients': array(result['animation_coefficients'], na),
+                'initialised': result['initialised'], 'frontal': result['frontal'], 'trace': result['trace']}
 
+    @property
+    def rigid_state(self):
+        return array(self._native.rigid_state, 6)
 
-class _Frame:
-    def __init__(self, fitter, points, width, height):
-        import numpy as np
-        self.fitter = fitter
-        self.points = points
-        self.width, self.height = width, height
-        self.flipped = np.column_stack((points[:, 0], np.float32(1) - points[:, 1]))
-        self.trace = []
+    @rigid_state.setter
+    def rigid_state(self, state):
+        self._native.rigid_state = raw(state)
 
-    def reset_pose(self, yaw):
-        """0x140052d70 rigid reset; deformation coefficients are left unchanged."""
-        from .pose_fit import initial_rigid_state
-        selected = self.fitter.selected
-        index = self.fitter.reset_indices
-        return initial_rigid_state(selected.vertices[index], self.points[index],
-                                   self.width, self.height, selected.focal_factor, float(yaw))
+    @property
+    def initialised(self):
+        return self._native.initialised
 
-    def build(self, mode):
-        """0x1400dbba0: a new fitting object only when the flag differs from the last one."""
-        fitter = self.fitter
-        if fitter.fit_mode == mode:
-            return fitter.fit_state
-        fitter.fit_mode = mode
-        fitter.fixed_shape, fitter.fixed_animation = fitter.shape.copy(), fitter.animation.copy()
-        return None
+    @initialised.setter
+    def initialised(self, value):
+        self._native.initialised = bool(value)
 
-    def fit(self, mode, iterations):
-        """0x1400dbba0 + 0x1400dc3b0 without a pose hint; True when bounds hold.
+    @property
+    def frontal(self):
+        return self._native.frontal
 
-Decoding writes only the active coefficient block back to the parent; the
-fitting object keeps the inactive block copied when it was built.
-"""
-        from .pose_fit import mode_step
-        from .pose_policy import check_pose_bounds
-        fitter, selected = self.fitter, self.fitter.selected
-        active = self.build(mode)
-        if len(selected.landmark_ids) < MINIMUM_FIT_POINTS:
-            return False
-        valid = False
-        for attempt in range(2):
-            if attempt:
-                fitter.rigid_state = self.reset_pose(FLOAT_PI)
-                active = None
-                iterations = 3
-            for _ in range(iterations):
-                shape = fitter.shape if mode == 3 else fitter.fixed_shape
-                animation = fitter.animation if mode == 5 else fitter.fixed_animation
-                result = mode_step(selected, self.observations, fitter.rigid_state, shape,
-                                   animation, mode, self.weights, active)
-                fitter.rigid_state, active = result['rigid_state'], result['active_state']
-                if mode == 3:
-                    fitter.shape = result['shape_coefficients']
-                else:
-                    fitter.animation = result['animation_coefficients']
-            fitter.fit_state = active
-            invalid, fitter.shape, fitter.animation = check_pose_bounds(
-                fitter.rigid_state, fitter.shape, fitter.animation,
-                selected.rotation_limits, selected.translation_limits)
-            if not invalid:
-                fitter.projected = finalized_projection(selected, fitter.rigid_state,
-                                                        fitter.shape, fitter.animation)
-                valid = True
-                break
-        self.trace.append({'mode': mode, 'valid': valid, 'attempts': attempt + 1})
-        return valid
+    @frontal.setter
+    def frontal(self, value):
+        self._native.frontal = bool(value)
 
-    def initial_fit(self):
-        """0x14007ec70: zero coefficients, reset with yaw float(3), flag 3 for two updates."""
-        import numpy as np
-        fitter = self.fitter
-        fitter.shape = np.zeros_like(fitter.shape)
-        fitter.animation = np.zeros_like(fitter.animation)
-        fitter.rigid_state = self.reset_pose(INITIAL_YAW)
-        return self.fit(3, 2)
+    @property
+    def shape(self):
+        return array(self._native.shape, len(self.model.shape_ranges))
 
-    def temporal_fit(self):
-        """0x14007ee60: up to two flag-5 single-update attempts from the current pose."""
-        fitter = self.fitter
-        valid, attempt = False, 0
-        while fitter.initialised:
-            if valid or attempt >= 2:
-                break
-            facing = facing_degrees(fitter.rigid_state)
-            valid = self.fit(5, 1)
-            rectangle = eye_face_rectangle(self.points, fitter.selected.landmark_ids, self.width, self.height)
-            if rectangle is None:
-                raise NotImplementedError('Original rectangle output is uninitialised without eye/nose/mouth records')
-            error = reprojection_error(fitter.selected, fitter.projected, self.flipped,
-                                       self.width, self.height, float(rectangle[2]))
-            self.trace[-1].update({'facing': float(facing), 'error': float(error), 'rectangle': rectangle})
-            if not valid or (error > _f32(REPROJECTION_ERROR_LIMIT) and attempt == 0):
-                if -FACING_REINITIALISE_DEGREES < facing < FACING_REINITIALISE_DEGREES:
-                    fitter.initialised = self.initial_fit()
-                else:
-                    fitter.rigid_state = self.reset_pose(FLOAT_PI)
-                valid = False
-            attempt += 1
-        return valid
+    @shape.setter
+    def shape(self, values):
+        self._native.shape = raw(values)
+
+    @property
+    def animation(self):
+        return array(self._native.animation, len(self.model.animation_ranges))
+
+    @animation.setter
+    def animation(self, values):
+        self._native.animation = raw(values)
+
+    @property
+    def projected(self):
+        return array(self._native.projected, len(self.selected.landmark_ids), 2)
+
+    @property
+    def fit_mode(self):
+        return self._native.fit_mode
+
+    @property
+    def fit_state(self):
+        state = self._native.fit_state
+        return None if state is None else array(state, len(state) // 4)

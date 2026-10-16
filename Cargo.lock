@@ -517,6 +517,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-headpose"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tobii-models",
+]
+
+[[package]]
 name = "tobii-inference"
 version = "0.1.0"
 dependencies = [
@@ -557,6 +565,7 @@ dependencies = [
  "serde_json",
  "tobii-device",
  "tobii-gaze",
+ "tobii-headpose",
  "tobii-inference",
  "tobii-models",
  "tobii-protocol",

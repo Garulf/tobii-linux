@@ -1,8 +1,11 @@
-"""Fitted face pose to the public 48-byte head-pose sample (producer 0x140293ca0 onwards)."""
+"""Fitted face pose to the public 48-byte head-pose sample (producer 0x140293ca0 onwards).
+
+The stages are crates/tobii-headpose/src/pipeline.rs.
+"""
 from dataclasses import dataclass
 import struct
-from .pose_output import PI, HeadPoseFilter, adapter_head_pose, matrix_euler
-from .pose_geometry import camera_extrinsic, display_matrix, geometry_stage
+
+from ._native import head_pose_pipeline as _pipeline
 
 SAMPLE = struct.Struct('<qi3fiii3f')
 
@@ -16,10 +19,8 @@ class HeadPoseSample:
     rotation_rad: tuple
 
     def encode(self):
-        flag = 1 if self.valid else 0
-        position = self.position_mm if self.valid else (0.0, 0.0, 0.0)
-        rotation = self.rotation_rad if self.valid else (0.0, 0.0, 0.0)
-        return SAMPLE.pack(self.timestamp_us, flag, *position, flag, flag, flag, *rotation)
+        return _pipeline.encode_sample(self.timestamp_us, bool(self.valid), tuple(self.position_mm),
+                                       tuple(self.rotation_rad))
 
 
 @dataclass(frozen=True)
@@ -37,21 +38,16 @@ class HeadPoseOutput:
 its hardware info. Without a display area the original produces no head pose.
 """
     def __init__(self, camera_translation, camera_angles, display_area):
-        self.camera = camera_extrinsic(camera_translation, camera_angles)
+        import numpy as np
         area = display_area
-        self.display = display_matrix(area.top_left, area.bottom_left, area.top_right)
-        self.filter = HeadPoseFilter()
+        self._native = _pipeline.HeadPoseOutput(tuple(camera_translation), tuple(camera_angles),
+                                                tuple(area.top_left), tuple(area.top_right), tuple(area.bottom_left))
+        self.camera = np.array(self._native.camera, dtype=np.float32).reshape(4, 4)
+        self.display = np.array(self._native.display, dtype=np.float32).reshape(4, 4)
 
     def __call__(self, fitted_rigid_state, timestamp_us):
         """`fitted_rigid_state` is (rx, ry, rz, tx, ty, tz) from the face-model fit, or None."""
-        import numpy as np
-        if fitted_rigid_state is None:
-            return HeadPoseSample(timestamp_us, False, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
-        state = np.asarray(fitted_rigid_state, dtype=np.float32)
-        rotation = (state[0], np.float32(state[1] - np.float32(PI)), state[2])
-        matrix, position = adapter_head_pose(rotation, state[3:])
-        angles = matrix_euler(matrix)
-        rotated, moved = geometry_stage(angles[:3], position, self.camera, self.display)
-        smoothed_rotation, smoothed_position = self.filter(np.asarray(rotated, np.float32)[:3], moved, timestamp_us)
-        return HeadPoseSample(timestamp_us, True, tuple(float(v) for v in smoothed_position),
-                              tuple(float(v) for v in smoothed_rotation))
+        from ._arrays import raw
+        state = None if fitted_rigid_state is None else raw(fitted_rigid_state)
+        _, valid, position, rotation = self._native.process(state, timestamp_us)
+        return HeadPoseSample(timestamp_us, valid, tuple(position), tuple(rotation))

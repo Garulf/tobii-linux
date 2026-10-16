@@ -23,6 +23,7 @@ mod frames;
 mod gaze;
 mod gaze_device;
 mod gaze_operation;
+mod headpose;
 mod inference;
 mod logging;
 mod models;
@@ -77,5 +78,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "tet_tcp", tet_tcp::register)?;
     submodule(m, "tet_tcp_service", tet_tcp_service::register)?;
     inference::register(m)?;
+    headpose::register(m)?;
     Ok(())
 }

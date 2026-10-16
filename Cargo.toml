@@ -16,6 +16,7 @@ tobii-models = { path = "crates/tobii-models" }
 tobii-gaze = { path = "crates/tobii-gaze" }
 tobii-service = { path = "crates/tobii-service" }
 tobii-inference = { path = "crates/tobii-inference" }
+tobii-headpose = { path = "crates/tobii-headpose" }
 hmac = "0.13"
 md-5 = "0.11"
 nusb = "0.2.8"
