@@ -13,6 +13,7 @@ tobii-protocol = { path = "crates/tobii-protocol" }
 tobii-usb = { path = "crates/tobii-usb" }
 tobii-device = { path = "crates/tobii-device" }
 tobii-models = { path = "crates/tobii-models" }
+tobii-gaze = { path = "crates/tobii-gaze" }
 hmac = "0.13"
 md-5 = "0.11"
 nusb = "0.2.8"

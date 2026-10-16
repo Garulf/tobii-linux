@@ -8,15 +8,17 @@ in emulation by tools/gaze_device_oracle.py.
 The runtime keeps the user calibration on the device. At start it reads the
 device calibration id (status key 7) and compares it with the copy in
 calibration.setpm; it applies the local copy (1110) only when they differ.
+
+The encoders, decoders and device procedures are crates/tobii-gaze/src/device.rs;
+the dataclasses and enums here carry their results.
 """
 from dataclasses import dataclass
 from enum import IntEnum
 import struct
+import time
 
-from .ttp import ProtocolError
-from .ttp_commands import blob_field, request, string_field, uint32_field
-from .ttp_fields import (StructHeader, array_fields, fixed16_field, fixed42_field, int32_field,
-                         struct_field, triple_fixed42_fields)
+from ._native import gaze_device as _gd
+from .ttp import ProtocolError  # noqa: F401  (raised by this module's functions)
 
 
 class Eye(IntEnum):
@@ -26,66 +28,48 @@ class Eye(IntEnum):
     BOTH = 3
 
 
-class GazeCommand(IntEnum):
-    CALIBRATION_START = 1010
-    CALIBRATION_START_EYE = 1011
-    CALIBRATION_STOP = 1020
-    CALIBRATION_COLLECT_2D = 1030
-    CALIBRATION_COLLECT_3D = 1031
-    CALIBRATION_COLLECT_PER_EYE_2D = 1032
-    CALIBRATION_CLEAR = 1060
-    CALIBRATION_COMPUTE_AND_APPLY = 1070
-    CALIBRATION_COMPUTE_AND_APPLY_PER_EYE = 1071
-    CALIBRATION_DISCARD_2D = 1080
-    CALIBRATION_DISCARD_3D = 1081
-    CALIBRATION_RETRIEVE = 1100
-    CALIBRATION_APPLY = 1110
-    GET_CALIBRATION_STIMULUS_POINTS = 1120
-    GET_CONFIGURATION_KEY = 1310
-    SET_DISPLAY_AREA = 1440
-    ENABLE_EXTENSION = 1800
-    PERSISTENT_FILE_ENUMERATE = 3060
-    PERSISTENT_FILE_WRITE = 3070
-    PERSISTENT_FILE_READ = 3080
-    PERSISTENT_FILE_ERASE = 3090
-    SET_ENABLED_EYE = 3160
+GazeCommand = IntEnum('GazeCommand', _gd.GAZE_COMMANDS, module=__name__)
 
+HEADER_ONLY = frozenset(GazeCommand(c) for c in _gd.HEADER_ONLY)
+READ_ONLY = frozenset(GazeCommand(c) for c in _gd.READ_ONLY)
 
-HEADER_ONLY = frozenset({
-    GazeCommand.CALIBRATION_START, GazeCommand.CALIBRATION_STOP, GazeCommand.CALIBRATION_CLEAR,
-    GazeCommand.CALIBRATION_COMPUTE_AND_APPLY, GazeCommand.CALIBRATION_COMPUTE_AND_APPLY_PER_EYE,
-    GazeCommand.CALIBRATION_RETRIEVE, GazeCommand.GET_CALIBRATION_STIMULUS_POINTS,
-    GazeCommand.PERSISTENT_FILE_ENUMERATE,
-})
-
-READ_ONLY = frozenset({
-    GazeCommand.CALIBRATION_RETRIEVE, GazeCommand.GET_CALIBRATION_STIMULUS_POINTS,
-    GazeCommand.GET_CONFIGURATION_KEY, GazeCommand.PERSISTENT_FILE_ENUMERATE,
-    GazeCommand.PERSISTENT_FILE_READ,
-})
-
-DISPLAY_AREA_TRAILER = 0x3039
-STATUS_STRUCT = 10000
-STATUS_CALIBRATION_ID = 7
-SETTING_FILE_VERSION = 4
+DISPLAY_AREA_TRAILER = _gd.DISPLAY_AREA_TRAILER
+STATUS_STRUCT = _gd.STATUS_STRUCT
+STATUS_CALIBRATION_ID = _gd.STATUS_CALIBRATION_ID
+SETTING_FILE_VERSION = _gd.SETTING_FILE_VERSION
 SETTING_FILE_HEADER = struct.Struct('<3I')
 CALIBRATION_ID = struct.Struct('<I')
 
 
+def drive(operation, session):
+    """Run a native device operation that only sends requests on `session`.
+
+The operation decides every request; this loop sends them with
+session.call, so sessions written in Python (dry runs, fakes) work and no
+Rust code waits on Python. A failed call raises from here unchanged.
+"""
+    step = operation.start(time.monotonic())
+    while step[0] == 'call':
+        timeout_s = step[1]
+        if timeout_s is None:
+            reply = session.call(operation.request)
+        else:
+            reply = session.call(operation.request, timeout_s=timeout_s)
+        step = operation.replied(session.reply_values(reply), time.monotonic())
+    return step[1]
+
+
 def header_only(request_id: int, command: GazeCommand):
-    if command not in HEADER_ONLY:
-        raise ProtocolError('Command has fields; use its encoder')
-    return request(request_id, command)
+    return _gd.header_only(request_id, command)
 
 
 def calibration_start_eye(request_id: int, eye: Eye):
     """Command 1011 from vtable slot 0x1c0; no log name, so the name is inferred."""
-    return request(request_id, GazeCommand.CALIBRATION_START_EYE, (uint32_field(int(Eye(eye))),))
+    return _gd.calibration_start_eye(request_id, int(Eye(eye)))
 
 
 def _point_request(request_id, command, coordinates, eye):
-    fields = [fixed42_field(struct.unpack('<f', struct.pack('<f', c))[0]) for c in coordinates]
-    return request(request_id, command, fields + [uint32_field(int(Eye(eye)))])
+    return _gd.point_request(request_id, command, list(coordinates), int(Eye(eye)))
 
 
 def calibration_collect_2d(request_id: int, x: float, y: float, eye: Eye = Eye.BOTH):
@@ -111,59 +95,47 @@ def calibration_discard_3d(request_id: int, x: float, y: float, z: float, eye: E
 
 def calibration_apply(request_id: int, calibration: bytes):
     """1110 with the opaque blob that 1100 returned (0x1402c5050)."""
-    return request(request_id, GazeCommand.CALIBRATION_APPLY, (blob_field(calibration),))
+    return _gd.calibration_apply(request_id, calibration)
 
 
 def set_display_area(request_id: int, top_left, top_right, bottom_left):
     """1440 (0x1402c6f40): three float32 points as fixed42 triples, then an empty array of type 0x3039."""
-    points = [[struct.unpack('<f', struct.pack('<f', c))[0] for c in p] for p in (top_left, top_right, bottom_left)]
-    fields = [f for p in points for f in triple_fixed42_fields(p)] + array_fields(0, DISPLAY_AREA_TRAILER)
-    return request(request_id, GazeCommand.SET_DISPLAY_AREA, fields)
+    return _gd.set_display_area(request_id, top_left, top_right, bottom_left)
 
 
 def set_enabled_eye(request_id: int, eye: Eye):
-    return request(request_id, GazeCommand.SET_ENABLED_EYE, (uint32_field(int(Eye(eye))),))
+    return _gd.set_enabled_eye(request_id, int(Eye(eye)))
 
 
 def enable_extension(request_id: int, extension: int):
     """1800 from vtable slot 0x2e0; no log name, the name is inferred from 1810/1820."""
-    return request(request_id, GazeCommand.ENABLE_EXTENSION, (uint32_field(extension),))
+    return _gd.enable_extension(request_id, extension)
 
 
 def get_configuration_key(request_id: int, name: str):
-    return request(request_id, GazeCommand.GET_CONFIGURATION_KEY, (string_field(name),))
+    return _gd.get_configuration_key(request_id, name)
 
 
 def persistent_file_read(request_id: int, name: str):
-    return request(request_id, GazeCommand.PERSISTENT_FILE_READ, (string_field(name),))
+    return _gd.persistent_file_read(request_id, name)
 
 
 def persistent_file_write(request_id: int, name: str, data: bytes):
-    return request(request_id, GazeCommand.PERSISTENT_FILE_WRITE, (string_field(name), blob_field(data)))
+    return _gd.persistent_file_write(request_id, name, data)
 
 
 def persistent_file_erase(request_id: int, name: str):
-    return request(request_id, GazeCommand.PERSISTENT_FILE_ERASE, (string_field(name),))
+    return _gd.persistent_file_erase(request_id, name)
 
 
 def status_entries(values) -> dict:
     """Key/value pairs of a 1490 (or 1330) reply decoded by session.reply_values."""
-    entries, index = {}, 0
-    while index < len(values):
-        item = values[index]
-        if not isinstance(item, StructHeader) or item != StructHeader(2, STATUS_STRUCT):
-            raise ProtocolError('Expected a status entry header')
-        if index + 2 >= len(values):
-            raise ProtocolError('Truncated status entry')
-        entries[values[index + 1]] = bytes(values[index + 2])
-        index += 3
-    return entries
+    return dict(_gd.status_entries(values))
 
 
 def device_calibration_id(values) -> int | None:
     """Calibration id from status key 7, parsed with strtoul as 0x1402b9360 does; None when absent."""
-    text = status_entries(values).get(STATUS_CALIBRATION_ID)
-    return int(text.decode(), 10) & 0xFFFFFFFF if text else None
+    return _gd.device_calibration_id(values)
 
 
 @dataclass(frozen=True)
@@ -179,39 +151,25 @@ The payload is the calibration id followed by the 1100 reply blob verbatim;
 
 def setting_file_payload(data: bytes) -> bytes:
     """Strip the 12-byte setting-file header: version 4, kind 1, payload size."""
-    if len(data) < SETTING_FILE_HEADER.size:
-        raise ProtocolError('Setting file is shorter than its header')
-    version, _, size = SETTING_FILE_HEADER.unpack_from(data)
-    if version != SETTING_FILE_VERSION or size != len(data) - SETTING_FILE_HEADER.size:
-        raise ProtocolError('Unexpected setting file version or size')
-    return data[SETTING_FILE_HEADER.size:]
+    return _gd.setting_file_payload(data)
 
 
 def setting_file(payload: bytes, kind: int = 1) -> bytes:
-    return SETTING_FILE_HEADER.pack(SETTING_FILE_VERSION, kind, len(payload)) + payload
+    return _gd.setting_file(payload, kind)
 
 
 def calibration_setting(calibration: LocalCalibration) -> bytes:
     """calibration.setpm bytes for a calibration, the inverse of parse_calibration_setting."""
-    if not calibration.blob:
-        raise ProtocolError('Calibration holds no blob')
-    return setting_file(CALIBRATION_ID.pack(calibration.calibration_id) + calibration.blob)
+    return _gd.calibration_setting(calibration)
 
 
 def parse_calibration_setting(data: bytes) -> LocalCalibration:
-    payload = setting_file_payload(data)
-    if len(payload) <= CALIBRATION_ID.size:
-        raise ProtocolError('Calibration setting holds no blob')
-    return LocalCalibration(CALIBRATION_ID.unpack_from(payload)[0], payload[CALIBRATION_ID.size:])
+    return LocalCalibration(*_gd.parse_calibration_setting(data))
 
 
 def screen_plane_setting(data: bytes):
     """screenplane.setpm: bottom-left, top-left, top-right corners in millimetres."""
-    payload = setting_file_payload(data)
-    if len(payload) != 36:
-        raise ProtocolError('Screen plane setting must hold three points')
-    values = struct.unpack('<9f', payload)
-    return tuple(tuple(values[i:i + 3]) for i in (0, 3, 6))
+    return _gd.screen_plane_setting(data)
 
 
 class CalibrationState(IntEnum):
@@ -228,31 +186,17 @@ The runtime applies the local calibration when the ids differ, and clears the
 device (1010 then 1020) when there is no local calibration; here the clear is
 never sent and DEVICE_ONLY is returned instead. Applying needs allow_apply.
 """
-    from .ttp_commands import Command, header_only_request
-    status = session.reply_values(session.call(lambda rid: header_only_request(rid, Command.GET_DEVICE_STATUS)))
-    device_id = device_calibration_id(status) or 0
-    if local is None or local.calibration_id == 0:
-        return CalibrationState.DEVICE_ONLY if device_id else CalibrationState.IN_SYNC
-    if device_id == local.calibration_id:
-        return CalibrationState.IN_SYNC
-    if not allow_apply:
-        return CalibrationState.APPLY_NEEDED
-    session.call(lambda rid: calibration_apply(rid, local.blob))
-    return CalibrationState.APPLIED
+    return CalibrationState(drive(_gd.synchronize_calibration(local, allow_apply), session))
 
 
 def retrieve_calibration(session) -> bytes:
     """Read-only 1100: the device's current calibration blob."""
-    reply = session.reply_values(session.call(lambda rid: header_only(rid, GazeCommand.CALIBRATION_RETRIEVE)))
-    blobs = [v for v in reply if isinstance(v, (bytes, bytearray))]
-    if len(blobs) != 1:
-        raise ProtocolError('Calibration reply must hold one blob')
-    return bytes(blobs[0])
+    return drive(_gd.retrieve_calibration(), session)
 
 
-STIMULUS_POINT_STRUCT = 13200
-STIMULUS_POSITION_STRUCT = 8002
-STIMULUS_POINT_ITEMS = 7
+STIMULUS_POINT_STRUCT = _gd.STIMULUS_POINT_STRUCT
+STIMULUS_POSITION_STRUCT = _gd.STIMULUS_POSITION_STRUCT
+STIMULUS_POINT_ITEMS = _gd.STIMULUS_POINT_ITEMS
 
 
 class PointStatus(IntEnum):
@@ -260,6 +204,9 @@ class PointStatus(IntEnum):
     FAILED_OR_INVALID = 0
     VALID_BUT_NOT_USED = 1
     VALID_AND_USED = 2
+
+
+assert [(s.name, s.value) for s in PointStatus] == _gd.POINT_STATUSES
 
 
 @dataclass(frozen=True)
@@ -283,23 +230,16 @@ spread, both in normalized display units.
     right: EyeQuality
 
 
+def stimulus_point(record) -> StimulusPoint:
+    """A StimulusPoint from its native (point, left, right) tuple."""
+    point, left, right = record
+    return StimulusPoint(point, *(EyeQuality(PointStatus(status), bias, precision)
+                                  for status, bias, precision in (left, right)))
+
+
 def stimulus_points(values) -> tuple[StimulusPoint, ...]:
     """Decode the reply values of 1120 (get_calibration_stimulus_pts)."""
-    if len(values) < 2 or not isinstance(values[0], StructHeader) or values[0].struct_id != 0x100:
-        raise ProtocolError('Stimulus points reply must start with an array header')
-    count = values[0].item_count - 1
-    if values[1] != STIMULUS_POINT_STRUCT or len(values) != 2 + count * 11:
-        raise ProtocolError('Unexpected stimulus points array')
-    points = []
-    for index in range(count):
-        record = values[2 + index * 11:2 + (index + 1) * 11]
-        if record[0] != StructHeader(STIMULUS_POINT_ITEMS, STIMULUS_POINT_STRUCT) \
-                or record[1] != StructHeader(3, STIMULUS_POSITION_STRUCT):
-            raise ProtocolError('Unexpected stimulus point record')
-        left, right = (EyeQuality(tracker_point_status(status), bias, precision)
-                       for status, bias, precision in (record[5:8], record[8:11]))
-        points.append(StimulusPoint(tuple(record[2:5]), left, right))
-    return tuple(points)
+    return tuple(stimulus_point(record) for record in _gd.stimulus_points(values))
 
 
 def tracker_point_status(raw: int) -> PointStatus:
@@ -309,13 +249,7 @@ def tracker_point_status(raw: int) -> PointStatus:
 
 def stimulus_points_payload(points) -> list:
     """Reply fields of 1120 for the given records, in the layout stimulus_points reads."""
-    fields = array_fields(len(points), STIMULUS_POINT_STRUCT)
-    for p in points:
-        fields += [struct_field(STIMULUS_POINT_ITEMS, STIMULUS_POINT_STRUCT),
-                   struct_field(3, STIMULUS_POSITION_STRUCT)] + [fixed16_field(c) for c in p.point]
-        for eye in (p.left, p.right):
-            fields += [int32_field(eye.status), fixed16_field(eye.bias), fixed16_field(eye.precision)]
-    return fields
+    return _gd.stimulus_points_payload(points)
 
 
 @dataclass(frozen=True)
@@ -334,6 +268,11 @@ BLOB_STATUS = {-1: PointStatus.FAILED_OR_INVALID, 0: PointStatus.VALID_BUT_NOT_U
                1: PointStatus.VALID_AND_USED}
 
 
+def calibration_point(record) -> CalibrationPointData:
+    point, left_status, left_mapping, right_status, right_mapping = record
+    return CalibrationPointData(point, PointStatus(left_status), left_mapping, PointStatus(right_status), right_mapping)
+
+
 def calibration_points(blob: bytes) -> tuple[CalibrationPointData, ...]:
     """The per-sample point table of a 1100 blob, read as Stream Engine's tobii_calibration_parse does.
 
@@ -341,26 +280,9 @@ Word 0 of the blob is the offset of a trailer whose second word is the record
 count; each 40-byte record holds the target, then per eye the mapped gaze point
 and a status (-1 failed, 0 valid but unused, 1 valid and used).
 """
-    if len(blob) < 8:
-        raise ProtocolError('Calibration blob is too short')
-    trailer = struct.unpack_from('<i', blob)[0]
-    if not 0 <= trailer <= len(blob) - CALIBRATION_TRAILER.size:
-        raise ProtocolError('Calibration trailer offset is outside the blob')
-    count = CALIBRATION_TRAILER.unpack_from(blob, trailer)[0]
-    first = trailer + CALIBRATION_TRAILER.size
-    if count < 0 or first + count * CALIBRATION_RECORD.size > len(blob):
-        raise ProtocolError('Calibration point table does not fit the blob')
-    records = []
-    for index in range(count):
-        x, y, lx, ly, ls, rx, ry, rs = CALIBRATION_RECORD.unpack_from(blob, first + index * CALIBRATION_RECORD.size)
-        records.append(CalibrationPointData(
-            (x, y), BLOB_STATUS.get(ls, PointStatus.FAILED_OR_INVALID), (lx, ly),
-            BLOB_STATUS.get(rs, PointStatus.FAILED_OR_INVALID), (rx, ry)))
-    return tuple(records)
+    return tuple(calibration_point(record) for record in _gd.calibration_points(blob))
 
 
 def blob_calibration_id(blob: bytes) -> int:
     """Word 5 of a 1100 blob; on albedo it equals status key 7 and the calibration.setpm id."""
-    if len(blob) < 24:
-        raise ProtocolError('Calibration blob is too short')
-    return struct.unpack_from('<I', blob, 20)[0]
+    return _gd.blob_calibration_id(blob)

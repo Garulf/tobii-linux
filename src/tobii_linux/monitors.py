@@ -16,16 +16,17 @@ Sources, all read only:
   physical pixels, the monitor's device instance id (what Tobii stores as the
   monitor id and the game's window tracking matches) and its EDID from the
   registry.
+
+The choice rules and the parsers are crates/tobii-gaze/src/monitors.rs; the
+queries themselves (subprocess, PowerShell) stay here.
 """
 from dataclasses import dataclass, field
 import base64
 import gzip
-import json
-import re
 import shutil
 import subprocess
 
-from . import display_setup as ds
+from ._native import monitors as _mon
 
 EDID_ID = slice(8, 18)
 ROTATIONS = {'normal': 0, 'left': 90, 'inverted': 180, 'right': 270}
@@ -55,33 +56,21 @@ class Monitor:
     @property
     def size_mm(self):
         """The EDID size hint in the orientation the monitor is used in, or None."""
-        try:
-            width, height = ds.edid_size_mm(self.edid) if self.edid else (0, 0)
-        except ValueError:
-            return None
-        if not (width and height):
-            return None
-        return (height, width) if self.rotation in (90, 270) else (width, height)
+        return _mon.size_mm(self)
 
     @property
     def native_resolution(self):
-        try:
-            return ds.edid_native_resolution(self.edid) if self.edid else None
-        except ValueError:
-            return None
+        return _mon.native_resolution(self)
 
     @property
     def edid_id(self):
         """EDID bytes 8 to 17 (manufacturer, product, serial, week, year) in hex, as Tobii's display id keeps them."""
-        return self.edid[EDID_ID].hex().upper() if self.edid and len(self.edid) >= EDID_ID.stop else None
+        return _mon.edid_id(self)
 
     @property
     def display_id(self):
         """Tobii's display id string (displayinfo.setpm) when the Windows instance id is known."""
-        if not self.instance_id:
-            return None
-        rotation = {0: 1, 90: 2, 180: 3, 270: 4}[self.rotation]
-        return f'{self.instance_id}##eId:{self.edid_id or ""}#or:{rotation}#v:1.0'
+        return _mon.display_id(self)
 
     def record(self):
         return {'key': self.key, 'name': self.name, 'bounds': list(self.bounds) if self.bounds else None,
@@ -92,97 +81,47 @@ class Monitor:
 
 def same_aspect_ignoring_orientation(a, b, tolerance=0.001):
     """AspectRatio.IsSameIgnoreOrientation."""
-    if not a or not b or not all(a) or not all(b):
-        return True
-    ratio, other = a[0] / a[1], b[0] / b[1]
-    return abs(ratio - other) <= tolerance or abs(ratio - 1 / other) <= tolerance
+    return _mon.same_aspect_ignoring_orientation(tuple(a) if a else None, tuple(b) if b else None, tolerance)
 
 
 def has_recommended_aspect(monitor, resolution_px=None):
     """VirtualScreen.MonitorHasRecommendedAspectRatio: the mode's aspect equals the panel's native one."""
-    return same_aspect_ignoring_orientation(resolution_px or monitor.resolution_px, monitor.native_resolution)
+    return _mon.has_recommended_aspect(monitor, tuple(resolution_px) if resolution_px else None)
+
+
+def _pick(monitors, index):
+    return None if index is None else monitors[index]
 
 
 def primary(monitors):
-    placed = [m for m in monitors if m.bounds and m.bounds[:2] == (0, 0)]
-    return next((m for m in monitors if m.primary), placed[0] if placed else (monitors[0] if monitors else None))
+    return _pick(monitors, _mon.primary(monitors))
 
 
 def initial_monitor(monitors, persisted_key=None):
     """InitSelectedMonitor: the only monitor, else the persisted one, else the primary one."""
-    if len(monitors) == 1:
-        return monitors[0]
-    persisted = next((m for m in monitors if persisted_key and m.key == persisted_key), None)
-    return persisted or primary(monitors)
+    return _pick(monitors, _mon.initial_monitor(monitors, persisted_key))
 
 
 def previous_monitor(monitors, current):
     """GetPreviousDisplayDevice: the largest left edge below the current one's."""
-    if current is None or current.left is None or len(monitors) < 2:
-        return None
-    candidates = [m for m in monitors if m.left is not None and m.left < current.left]
-    return max(candidates, key=lambda m: m.left, default=None)
+    return _pick(monitors, _mon.previous_monitor(monitors, current))
 
 
 def next_monitor(monitors, current):
     """GetNextDisplayDevice: the smallest left edge above the current one's."""
-    if current is None or current.left is None or len(monitors) < 2:
-        return None
-    candidates = [m for m in monitors if m.left is not None and m.left > current.left]
-    return min(candidates, key=lambda m: m.left, default=None)
+    return _pick(monitors, _mon.next_monitor(monitors, current))
 
 
 # xrandr ------------------------------------------------------------------------------------------
 
-OUTPUT_LINE = re.compile(r'^(?P<name>\S+) connected(?P<primary> primary)?'
-                         r'(?: (?P<w>\d+)x(?P<h>\d+)\+(?P<x>-?\d+)\+(?P<y>-?\d+))?'
-                         r'(?: (?P<rotation>normal|left|inverted|right))?')
-
-
 def parse_xrandr(text):
     """Connected outputs of `xrandr --prop`, with their EDID when listed."""
-    monitors, current, edid_lines, in_edid = [], None, [], False
-
-    def finish():
-        if current is not None:
-            edid = bytes.fromhex(''.join(edid_lines)) if edid_lines else None
-            monitors.append(Monitor(**{**current, 'edid': edid}))
-
-    for line in text.splitlines():
-        if line and not line[0].isspace():
-            finish()
-            current, edid_lines, in_edid = None, [], False
-            match = OUTPUT_LINE.match(line)
-            if match:
-                bounds = (tuple(int(match[k]) for k in ('x', 'y', 'w', 'h')) if match['w'] else None)
-                current = {'key': match['name'], 'name': match['name'], 'bounds': bounds,
-                           'primary': bool(match['primary']), 'rotation': ROTATIONS.get(match['rotation'] or 'normal', 0)}
-            continue
-        stripped = line.strip()
-        if stripped.startswith('EDID:'):
-            in_edid = True
-            continue
-        if in_edid and re.fullmatch(r'[0-9a-fA-F]+', stripped):
-            edid_lines.append(stripped)
-        else:
-            in_edid = False
-    finish()
-    return [m for m in monitors if m.bounds is not None]
+    return [Monitor(*monitor) for monitor in _mon.parse_xrandr(text)]
 
 
 def drm_fallback(root='/sys/class/drm'):
     """Connected DRM connectors with their EDID but no geometry (Wayland without xrandr)."""
-    from pathlib import Path
-    monitors = []
-    for edid_path in sorted(Path(root).glob('*/edid')):
-        status = edid_path.parent/'status'
-        if status.exists() and status.read_text().strip() != 'connected':
-            continue
-        edid = edid_path.read_bytes()
-        if edid:
-            name = edid_path.parent.name.split('-', 1)[-1]
-            monitors.append(Monitor(name, name, edid=edid))
-    return monitors
+    return [Monitor(*monitor) for monitor in _mon.drm_fallback(root)]
 
 
 def linux_monitors(run=subprocess.run):
@@ -259,26 +198,12 @@ ConvertTo-Json -Compress -Depth 3 @($screens)
 
 def instance_id_from_interface(interface):
     """\\\\?\\DISPLAY#GSM5B7F#5&5028a6b&0&UID41221#{guid} -> DISPLAY\\GSM5B7F\\5&5028A6B&0&UID41221."""
-    if not interface:
-        return None
-    path = re.sub(r'^\\\\\?\\', '', interface)
-    path = re.sub(r'#\{[^}]*\}$', '', path)
-    return path.replace('#', '\\').upper()
+    return _mon.instance_id_from_interface(interface)
 
 
 def parse_windows_monitors(text):
     """Monitors from the JSON WINDOWS_QUERY prints."""
-    items = json.loads(text)
-    if isinstance(items, dict):
-        items = [items]
-    monitors = []
-    for item in items:
-        instance_id = instance_id_from_interface(item.get('interface'))
-        edid = base64.b64decode(item['edid']) if item.get('edid') else None
-        monitors.append(Monitor(instance_id or item['name'], item['name'], tuple(int(v) for v in item['bounds']),
-                                bool(item.get('primary')), WINDOWS_ROTATIONS.get(item.get('orientation', 0), 0),
-                                edid, instance_id))
-    return monitors
+    return [Monitor(*monitor) for monitor in _mon.parse_windows_monitors(text)]
 
 
 def encoded_command(script):
