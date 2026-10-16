@@ -21,6 +21,7 @@ log.workspace = true
 pyo3.workspace = true
 serde_json.workspace = true
 tobii-device.workspace = true
+tobii-models.workspace = true
 tobii-protocol.workspace = true
 tobii-usb.workspace = true
 
