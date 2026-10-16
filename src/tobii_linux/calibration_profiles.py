@@ -12,38 +12,32 @@ section of docs/gaze-calibration.md.
 Here a profile is a file NAME.setpm in calibration.setpm layout under
 $XDG_DATA_HOME/tobii-linux/profiles, and the name of the active profile is
 kept in the file `current` beside them.
+
+The store and the procedures are crates/tobii-gaze/src/profiles.rs.
 """
 from dataclasses import dataclass
 import os
 from pathlib import Path
 
 from . import calibration as cal
-from . import gaze_device as gd
-from .gaze_device import Eye, LocalCalibration
+from ._native import calibration_profiles as _cp
+from .gaze_device import Eye, LocalCalibration, drive
 
-PROFILE_SUFFIX = '.setpm'
-CURRENT_FILE = 'current'
-MAX_NAME_LENGTH = 255
+PROFILE_SUFFIX = _cp.PROFILE_SUFFIX
+CURRENT_FILE = _cp.CURRENT_FILE
+MAX_NAME_LENGTH = _cp.MAX_NAME_LENGTH
 NAME_PUNCTUATION = frozenset(' ()-')
 
-
-class ProfileError(ValueError):
-    pass
+ProfileError = _cp.ProfileError
 
 
 def default_directory(environ=os.environ) -> Path:
-    data_home = environ.get('XDG_DATA_HOME') or str(Path(environ.get('HOME', '~')).expanduser()/'.local/share')
-    return Path(data_home)/'tobii-linux'/'profiles'
+    return Path(_cp.default_directory(environ.get('XDG_DATA_HOME'), environ.get('HOME')))
 
 
 def check_name(name: str) -> str:
     """ConfigurationManager.ValidateUserProfileName: letters, digits, space, '(', ')', '-'; at most 255."""
-    if not name or not name.strip() or len(name) > MAX_NAME_LENGTH:
-        raise ProfileError('A profile name needs 1 to 255 characters')
-    invalid = sorted({c for c in name if not c.isalnum() and c not in NAME_PUNCTUATION})
-    if invalid:
-        raise ProfileError(f'Invalid characters in profile name: {"".join(invalid)!r}')
-    return name
+    return _cp.check_name(name)
 
 
 @dataclass(frozen=True)
@@ -53,47 +47,36 @@ class Profile:
     calibration: LocalCalibration
 
 
+def _profile(name, path, calibration):
+    return Profile(name, Path(path), LocalCalibration(*calibration))
+
+
 class ProfileStore:
     def __init__(self, directory=None):
         self.directory = Path(directory) if directory else default_directory()
 
     def path(self, name) -> Path:
-        return self.directory/f'{check_name(name)}{PROFILE_SUFFIX}'
+        return Path(_cp.profile_path(self.directory, name))
 
     def names(self):
-        if not self.directory.is_dir():
-            return []
-        return sorted(p.name[:-len(PROFILE_SUFFIX)] for p in self.directory.glob(f'*{PROFILE_SUFFIX}'))
+        return _cp.profile_names(self.directory)
 
     def load(self, name) -> Profile:
-        path = self.path(name)
-        if not path.exists():
-            raise ProfileError(f'No profile named {name!r} in {self.directory}')
-        return Profile(name, path, cal.load_backup(path))
+        return _profile(*_cp.load_profile(self.directory, name))
 
     def save(self, name, calibration: LocalCalibration, overwrite=False) -> Path:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        return cal.save_backup(self.path(name), calibration, overwrite=overwrite)
+        return Path(_cp.save_profile(self.directory, name, calibration, overwrite))
 
     def current(self):
-        marker = self.directory/CURRENT_FILE
-        name = marker.read_text().strip() if marker.exists() else ''
-        return name or None
+        return _cp.current_profile(self.directory)
 
     def set_current(self, name):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory/CURRENT_FILE).write_text(check_name(name) + '\n')
+        _cp.set_current_profile(self.directory, name)
 
 
 def save_from_device(session, store: ProfileStore, name, overwrite=False) -> Profile:
     """Read the device calibration (1490, 1100, 1490) into a profile and verify it; sends no write."""
-    calibration = cal.backup_calibration(session)
-    path = store.save(name, calibration, overwrite=overwrite)
-    check = cal.verify_backup(session, cal.load_backup(path))
-    if not check.ok:
-        raise ProfileError(f'Saved profile does not match the device (ids {check.ids_match}, '
-                           f'blob {check.blob_matches})')
-    return Profile(name, path, calibration)
+    return _profile(*drive(_cp.save_from_device(store.directory, name, overwrite), session))
 
 
 @dataclass(frozen=True)
@@ -111,17 +94,5 @@ The engine sends both on every profile change; the apply is skipped here when
 the device already reports the profile's id, as the runtime's own start check
 does. Pass a DryRunSession to report the writes instead of sending them.
 """
-    profile = store.load(name)
-    before = cal.read_device_calibration_id(session)
-    applied = before != profile.calibration.calibration_id
-    if applied:
-        session.call(lambda rid: gd.set_enabled_eye(rid, eye))
-        session.call(lambda rid: gd.calibration_apply(rid, profile.calibration.blob),
-                     timeout_s=cal.TRANSFER_TIMEOUT_S)
-    after = cal.read_device_calibration_id(session)
-    if not isinstance(session, cal.DryRunSession):
-        if after != profile.calibration.calibration_id:
-            raise ProfileError(f'Device reports calibration id {after:#x} after switching to {name!r} '
-                               f'({profile.calibration.calibration_id:#x})')
-        store.set_current(name)
-    return SwitchResult(name, before, after, applied)
+    dry_run = isinstance(session, cal.DryRunSession)
+    return SwitchResult(*drive(_cp.switch(store.directory, name, int(Eye(eye)), dry_run), session))
