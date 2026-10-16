@@ -12,6 +12,7 @@ publish = false
 tobii-protocol = { path = "crates/tobii-protocol" }
 tobii-usb = { path = "crates/tobii-usb" }
 tobii-device = { path = "crates/tobii-device" }
+tobii-service = { path = "crates/tobii-service" }
 hmac = "0.13"
 md-5 = "0.11"
 nusb = "0.2.8"

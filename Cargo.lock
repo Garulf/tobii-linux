@@ -467,6 +467,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-service"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror",
+ "tobii-device",
+ "tobii-protocol",
+]
+
+[[package]]
 name = "tobii-usb"
 version = "0.1.0"
 dependencies = [
