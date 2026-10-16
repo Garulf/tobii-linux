@@ -262,6 +262,13 @@ from `calibration.setpm` when the services start); the proximity modifier of
 the focus zone and the 3 s extra delay before "Are you there?" at the very
 start are not reproduced.
 
+The same flow also runs as a native GTK 4 app, `tobii-linux-setup`
+(`crates/tobii-setup`, see [Rust core](rust.md#setup-app)): one fullscreen window with the
+same screens, texts, timings and keys, the flow on a worker thread that owns the tracker
+session, and a move to another monitor done by the window itself
+(`fullscreen_on_monitor`) instead of a second browser. `tobii-linux setup` still opens the
+page until the binary phase switches the CLI.
+
 ## Checks
 
 - Unit tests: `tests/test_eye_positioning.py` (sizes, mirror, status order,

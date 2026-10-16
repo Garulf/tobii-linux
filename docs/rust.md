@@ -46,6 +46,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-service` | Game service: PRP envelopes, stream bodies and session codecs, the gaze PRP stream records, SESP framing and flatcc-shaped messages, the Wine counter clock (classifier, follower, `ServiceClock`, counter mapping), relay framing, property answers and presence cache of the PRP service, the SESP legacy position transform, the tet-tcp policy, answers and restamping. Pure apart from `ServiceClock` reading the host clocks; the asyncio servers stay in Python. | `tobii-protocol`, `tobii-device`, `rustix` |
 | `crates/tobii-inference` | Tobii's networks on OpenVINO: the IR4/IR6 to IR v11 translation, the OpenVINO C API loaded at run time (`openvino`, the crate's only unsafe code), the D1 crop, tensor, decoding and landmark model, the D1 quality aggregation and gate, and the face finder (letterbox, priors, decoding, suppression). Bound as `_native.legacy_ir`, `d1`, `d1_quality` and `face_detect` from `tobii-py/src/inference/`. | `libloading`, `roxmltree`, `serde_json`, `sha2` |
 | `crates/tobii-headpose` | Head-pose math rebuilt from the runtime's float32 code: the float32 inverse, face-model projection and Jacobians, mesh normalization, the installed fitting model (`load_pose_model`), the rigid, deformation and mode updates, the bounded retry policies, the temporal fitter (`TemporalPoseFitter`), LBF features, predictor and eye refinement, landmark smoothing (`LandmarkFilter`), Euler conversions, One Euro filters, the geometry stage and `HeadPoseOutput`; on top, the face tracker (`FaceTracker`: detection, re-detection, D1, smoothing and the temporal fit per frame), the supplied-box D1 fit (`D1Pose`) and `HeadPoseProcessor` (image frame to `HeadPoseSample`). Plain types in and out; bound as `_native.pose_*`, `lbf_features`, `lbf_predictor`, `eye_refine`, `landmark_smoothing`, `head_pose_pipeline`, `face_tracking`, `headpose` and `head_pose_processor` from `tobii-py/src/headpose/`. | `tobii-models`, `tobii-inference` |
+| `crates/tobii-setup` | The guided setup as a native GTK 4 app, binary `tobii-linux-setup`: the setup flow (display setup with the moving lines and monitor moves, eye positioning, the gaze-chosen calibration, profiles, backups and restore on cancel) on a worker thread that owns the session, the `UiChannel` the window polls, the dry-run channel, the simulated tracker and user, and the display-free models of the alignment step, positioning and calibration animations and keys. The window (`ui`) is behind the `gtk` feature; nothing depends on the crate. | `tobii-gaze`, `tobii-device`, `tobii-usb`, `gtk4` (optional) |
 | `crates/tobii-py` | PyO3 bindings, one submodule per Python module (`_native.ttp`, `fields`, `commands`, `frames`, `camera_info`, `gaze`, `usb`, `device`, `gaze_device`, `calibration`, `calibration_profiles`, `display_setup`, `eye_positioning`, `monitors`, `prp`, `prp_session`, `prp_service`, `qpc_clock`, `sesp`, `sesp_service`, `tet_tcp`, `tet_tcp_service`, `inference.*`, `headpose.*`; the model modules come from `src/models/`). Nothing else depends on it. | all of the above, `pyo3` |
 
 Dependencies point down the table only. A later crate never reaches into the
@@ -89,6 +90,46 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `head_pose_pipeline.py` | `tobii_headpose::pipeline` | `HeadPoseSample`, `DisplayArea` dataclasses in Python |
 | `face_tracking.py` | `tobii_headpose::tracking` | `WorkingView`, `TrackedFrame`, `CoreFrame` dataclasses and the record helpers (`frame_records`, `copy_records`) in Python; `redetect` keeps the caller's `run_network` |
 | `headpose.py` | `tobii_headpose::d1_pose` | `FramePoseResult` dataclass; `NativeD1Pose` wraps the native component |
+
+## Setup app
+
+`crates/tobii-setup` is the guided setup of `tobii-linux setup` rebuilt in GTK 4 with
+gtk4-rs; the browser page stays as it is until the binary phase switches the CLI. The flow
+runs on a worker thread that owns the tracker session and drives tobii-gaze's operations
+(`operation::run` keeps reading the device while a calibration screen is drawn); the
+window polls a `UiChannel` every 16 ms for the screen to draw and acknowledges each one
+once drawn, so no device I/O runs on the GTK main loop.
+
+Only the `ui` module and the binary need GTK, behind the `gtk` feature. `make rust-test`,
+`make rust-lint` and the pre-commit hooks build and test the rest of the crate without
+GTK. With GTK the Makefile has:
+
+```sh
+make setup-app     # release build of tobii-linux-setup (prints its path)
+make setup-test    # tests and clippy -D warnings with the gtk feature
+make setup-run SETUP_ARGS="--simulate unmapped --simulate-monitors"
+```
+
+They call cargo directly when `pkg-config` finds gtk4, else run in `nix/setup-shell.nix`
+through `nix-shell`, or through `nix-portable` with the pre-extracted nixpkgs
+(`NIXPKGS=$HOME/np-src/nixpkgs`). The shell uses nixpkgs' Rust toolchain and builds in
+`target/gtk`: proc macros linked against the store's glibc cannot be loaded by a host
+rustc. A binary built there runs inside the same shell. The flake has a `tobii-setup`
+package (buildRustPackage with gtk4 and wrapGAppsHook4).
+
+`tobii-linux-setup --help` lists the options of `tobii-linux setup` without the browser
+ones (`--host`, `--port`, `--no-browser`), plus `--windowed`, `--simulate-monitors` and
+`--simulate-compute-failure`.
+`--simulate mapped|unmapped` runs against `simulated::SimulatedTracker` (the port of
+`simulated_tracker.py`, same scripted device and user) with profiles and backups in a
+fresh temporary directory; `--simulate-monitors` adds a portrait monitor left of the
+27 inch primary one so the monitor switcher can be tried, and
+`--simulate-compute-failure N` refuses the Nth compute to show "Oops. No detection.".
+The simulated user looks at the targets as scaled into the calibration area of the
+display area the device holds (the Python simulation looks at the unscaled points, so a
+display set up with a diagonal over 700 mm stalls its calibration). On a real desktop the window
+moves with `fullscreen_on_monitor` to the monitor whose GDK connector matches the
+xrandr output.
 
 ## Conventions
 
@@ -210,7 +251,7 @@ Makefile `ORACLES` list, this document) take one line per phase.
 | Head-pose math (done) | `tobii-headpose` | `lbf_features.py`, `lbf_predictor.py`, `eye_refine.py`, `landmark_smoothing.py`, `pose_*.py`, `head_pose_pipeline.py` (`headpose.py` stays glue) | `tobii-models` | all |
 | Face tracking and HeadPoseProcessor (done) | (in `tobii-headpose`) | `face_tracking.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-inference`, `tobii-headpose` | after both |
 | Gaze device and calibration, display setup (done) | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
-| Setup app (gtk4-rs) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
+| Setup app (gtk4-rs, done; the CLI still starts the Python page until the binary phase) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
 | Inference (done) | `tobii-inference` | `legacy_ir.py`, `face_detect.py`, `d1.py`, `d1_quality.py` | none | all |
 | Binary | `tobii-linux` (bin) | `cli.py`, `streams.GazeAndImageStreams`, `serve_tracker`, `demo/` | everything | last |
 
