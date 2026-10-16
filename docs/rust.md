@@ -42,6 +42,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-protocol` | USB channel framing, TTP messages and items, typed values and the reply reader, request builders, stream ids, column sets, image frames, camera hardware info, gaze and presence stream decoding with the platmod records. Pure: no I/O, clocks or threads. | `hmac`, `md-5` |
 | `crates/tobii-usb` | nusb backend: sysfs descriptor probe, `BulkTransport` on interface 0, `UsbChannel` (vendor open/close, framed writes, demultiplexed reads) with its continuous reader thread, the raw traffic log and its replay. | `tobii-protocol`, `nusb` |
 | `crates/tobii-device` | `TrackerSession` (startup, realms, calls, hardware info, image frames), `StreamReader` and `ItemPump` (subscriptions, demultiplexing, silence and suspend checks), `DeviceClockWatch`, `ClockMapper`, `TrackerLink` with `Backoff`, reader threads (`newest`, `drained`), `usb_session`. Generic over the `Channel` trait. | `tobii-protocol`, `tobii-usb`, `rustix` |
+| `crates/tobii-inference` | Tobii's networks on OpenVINO: the IR4/IR6 to IR v11 translation, the OpenVINO C API loaded at run time (`openvino`, the crate's only unsafe code), the D1 crop, tensor, decoding and landmark model, the D1 quality aggregation and gate, and the face finder (letterbox, priors, decoding, suppression). Bound as `_native.legacy_ir`, `d1`, `d1_quality` and `face_detect` from `tobii-py/src/inference/`. | `libloading`, `roxmltree`, `serde_json`, `sha2` |
 | `crates/tobii-py` | PyO3 bindings, one submodule per Python module (`_native.ttp`, `fields`, `commands`, `frames`, `camera_info`, `gaze`, `usb`, `device`). Nothing else depends on it. | all of the above, `pyo3` |
 
 Dependencies point down the table only. A later crate never reaches into the
@@ -63,6 +64,9 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `driver.py` (session, clock mapper) | `tobii_device::session`, `clock` | `TrackerSession` keeps `pending_streams`, `usb_device`; head-pose glue stays |
 | `streams.py` (reader, watches) | `tobii_device::streams` | `GazeAndImageStreams`, `serve_tracker` stay |
 | `supervisor.py` | `tobii_device::supervisor` | `TrackerLink` holds the Python callables |
+| `legacy_ir.py` | `tobii_inference::legacy_ir` | `load_model` reads the translated IR with Python OpenVINO for the tools |
+| `d1.py`, `d1_quality.py` | `tobii_inference::{d1, d1_quality}` | the result dataclasses; arrays cross as float32 bytes and come back as NumPy arrays |
+| `face_detect.py` | `tobii_inference::face_detect` | `Letterbox`, `Detection`, the constants, and `detect_faces`, which calls the Python `run_network` between the native letterbox and decoding |
 
 ## Conventions
 
@@ -126,6 +130,29 @@ machine code computes them. The rules:
 - `log` records of the core crates go to Python `logging` under
   `tobii_linux.<module>` (`tobii-py/src/logging.rs`).
 
+### OpenVINO
+
+Tobii's networks are researched IR4/IR6 graphs, which current OpenVINO cannot read, and
+the C API cannot build graphs. `tobii_inference::legacy_ir` therefore translates each graph
+into an IR v11 document and weights buffer with exactly the opset1 operations, attributes,
+constants and topology the Python opset loader built; OpenVINO reads it from memory
+(`ov_core_read_model_from_memory_buffer`) and compiles it on the CPU with
+`INFERENCE_PRECISION_HINT=f32` and `INFERENCE_NUM_THREADS=2`
+(`ov_core_compile_model_props`). Outputs are bit-identical to the Python-built graphs.
+
+The C library is loaded at run time with libloading, from the first of:
+
+1. `TOBII_OPENVINO_LIBRARY`: the `libopenvino_c` file, or a directory containing it;
+2. directories the caller passes: the bindings pass the `libs` directory of an installed
+   `openvino` wheel (found with `importlib.util.find_spec`, without importing it), so the
+   process shares one OpenVINO with Python's; Rust tests pass `.local/inference/openvino/libs`;
+3. `libopenvino_c.so` through the dynamic loader's search path.
+
+A missing library is an ImportError in Python and `Error::Unavailable` in Rust; Rust tests
+that need it print why and skip. All foreign calls are in
+`crates/tobii-inference/src/openvino/ffi.rs`, the one module allowed `unsafe` (the crate
+denies it instead of forbidding it so that module can opt in).
+
 ### Tests
 
 - Port the vectors of the Python tests into the crate's unit tests, including the
@@ -155,6 +182,7 @@ Makefile `ORACLES` list, this document) take one line per phase.
 | Head-pose pipeline incl. OpenVINO | `tobii-headpose` | `face_detect.py`, `face_tracking.py`, `d1*.py`, `lbf*.py`, `eye_refine.py`, `landmark_smoothing.py`, `pose_*.py`, `head_pose_pipeline.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-device::session` (camera calibration, frames) | all |
 | Gaze device and calibration, display setup | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
 | Setup app (gtk4-rs) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
+| Inference (done) | `tobii-inference` | `legacy_ir.py`, `face_detect.py`, `d1.py`, `d1_quality.py` | none | all |
 | Binary | `tobii-linux` (bin) | `cli.py`, `streams.GazeAndImageStreams`, `serve_tracker`, `demo/` | everything | last |
 
 For each module moved:
