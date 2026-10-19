@@ -19,7 +19,7 @@ pub use profiles::{PageAction, ProfileItem, ProfileList};
 #[cfg(feature = "gtk")]
 pub use widgets::page;
 #[cfg(feature = "gtk")]
-pub(crate) use widgets::{PageEvent, PageModel, on_page_event, on_service_update, open_window};
+pub(crate) use widgets::{PageEvent, PageModel, on_page_event, on_service_update, on_shutdown, open_window};
 
 pub const SWITCH_TITLE: &str = "Tobii Experience";
 pub const ON_TEXT: &str = "ON";
@@ -105,6 +105,12 @@ impl GazeCapability {
     fn available(self) -> bool {
         matches!(self, GazeCapability::AvailableButNotReadyToUse | GazeCapability::ReadyToUse)
     }
+}
+
+/// Tobii's `SystemEnabled`: the persisted on/off value, read as true when it is missing, so
+/// while the app has no status yet or the service is unreachable.
+pub fn system_enabled(status: Option<&Status>) -> bool {
+    status.is_none_or(|status| status.enabled)
 }
 
 /// Tobii's `UpdateState` step 6 over the Linux device status: the device status with the
@@ -285,6 +291,17 @@ mod tests {
         let neither = Status { display_area: false, profile: None, ..status() };
         assert_eq!(state_of(Some(neither)), PageState::InvalidMonitorSetup);
         assert_eq!(state_of(Some(Status { profile: None, ..status() })), PageState::NoCalibrationProfile);
+    }
+
+    #[test]
+    fn unknown_enabled_state_reads_as_enabled() {
+        assert!(system_enabled(None));
+        assert!(system_enabled(Some(&status())));
+        assert!(!system_enabled(Some(&Status { enabled: false, ..status() })));
+        for state in [PageState::Initializing, PageState::Error] {
+            let flags = availability(state, GazeCapability::NotAvailable, None, system_enabled(None));
+            assert!(!flags.enable_disable, "{state:?}: the switch is insensitive as Tobii's");
+        }
     }
 
     #[test]

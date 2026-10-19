@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{cairo, glib};
+use gtk::{cairo, gdk, glib};
 use gtk4 as gtk;
 use tobii_control::{Request, TrackedEyes};
 
@@ -17,7 +17,7 @@ use super::{
     Availability, BOTH_EYES, DISABLE_DELAY, EYES_BODY, EYES_TITLE, GazeCapability, IMPROVE_BODY, IMPROVE_BUTTON,
     IMPROVE_TITLE, LEFT_EYE, NEW_PROFILE_BUTTON, OFF_TEXT, ON_TEXT, PREVIEW_BODY, PREVIEW_TITLE, PROFILE_BODY,
     PROFILE_TITLE, PageAction, PageState, ProfileList, RIGHT_EYE, SCREEN_BODY, SCREEN_BUTTON, SCREEN_TITLE,
-    SWITCH_TITLE, SetupFlow, UNDO_TEXT, availability, gaze_capability, page_state, visibility,
+    SWITCH_TITLE, SetupFlow, UNDO_TEXT, availability, gaze_capability, page_state, system_enabled, visibility,
 };
 use crate::app::{AppEvent, Controller, PAGE_HEIGHT, PAGE_TITLE, PAGE_WIDTH, WeakController};
 use crate::guest::{OnExit, SetupResult, setup_result};
@@ -89,7 +89,13 @@ impl Controller {
     /// Which page controls Tobii's `RefreshAvailability` enables now.
     pub fn availability(&self) -> Availability {
         let current = self.current_profile();
-        availability(self.page_state(), self.gaze_capability(), current.as_deref(), self.enabled())
+        availability(self.page_state(), self.gaze_capability(), current.as_deref(), self.system_enabled())
+    }
+
+    /// Tobii's `SystemEnabled`: true while the status is unknown, as Tobii reads a missing
+    /// value.
+    pub fn system_enabled(&self) -> bool {
+        system_enabled(self.status().as_ref())
     }
 
     /// Whether a page command is in flight; the page is insensitive meanwhile.
@@ -283,6 +289,14 @@ fn rows_changed(controller: &Controller) {
     refresh(controller);
 }
 
+/// Tobii's view-model disposal: the app quits with the page open (`gtk::Application::quit`
+/// destroys the window without a close request), so marked profiles are deleted now.
+pub(crate) fn on_shutdown(controller: &Controller) {
+    if controller.page_model().view.borrow().is_some() {
+        commit_before(controller, PageAction::NavigateFrom);
+    }
+}
+
 /// Brings the open page up to date with the controller.
 fn refresh(controller: &Controller) {
     let Some(view) = controller.page_model().view.borrow().clone() else { return };
@@ -297,7 +311,9 @@ fn refresh(controller: &Controller) {
 
 /// The window: 550 px wide, titled "Tobii Experience", holding the sidebar content under a
 /// header row with the current profile's name (Tobii shows it on the ribbon's Settings
-/// button). Closing or minimizing it is Tobii's sidebar hiding.
+/// button). Closing it, or minimizing it where the backend reports that (X11; Wayland's
+/// xdg-shell has no minimized state), is Tobii's sidebar hiding. Being merely hidden
+/// (another workspace, occluded) is not: Tobii would not delete marked profiles then.
 pub(crate) fn open_window(controller: &Controller) -> gtk::Window {
     let header = text("", "body");
     header.add_css_class("tobii-header");
@@ -328,13 +344,16 @@ pub(crate) fn open_window(controller: &Controller) -> gtk::Window {
         glib::Propagation::Proceed
     });
     let weak = controller.downgrade();
-    window.connect_suspended_notify(move |window| {
-        let Some(controller) = weak.upgrade() else { return };
-        if window.is_suspended() {
-            navigate_from(&controller);
-        } else {
-            rebuild_list(&controller);
-        }
+    window.connect_realize(move |window| {
+        let Some(toplevel) = window.surface().and_then(|surface| surface.downcast::<gdk::Toplevel>().ok()) else {
+            return;
+        };
+        let (weak, minimized) = (weak.clone(), Cell::new(false));
+        toplevel.connect_state_notify(move |toplevel| {
+            let now = toplevel.state().contains(gdk::ToplevelState::MINIMIZED);
+            let Some(controller) = weak.upgrade().filter(|_| minimized.replace(now) != now) else { return };
+            if now { navigate_from(&controller) } else { rebuild_list(&controller) }
+        });
     });
     controller.set_page_window(Some(window.clone()));
     refresh(controller);
@@ -667,8 +686,11 @@ impl PageView {
         };
         let weak = controller.downgrade();
         self.switch.button.connect_toggled(move |button| {
-            if let Some(controller) = weak.upgrade().filter(|controller| !view_updating(controller)) {
+            let Some(controller) = weak.upgrade().filter(|controller| !view_updating(controller)) else { return };
+            if controller.availability().enable_disable {
                 set_enabled(&controller, button.is_active());
+            } else {
+                refresh(&controller);
             }
         });
         let weak = controller.downgrade();
@@ -705,14 +727,14 @@ impl PageView {
         let current = controller.current_profile();
         let capability = controller.gaze_capability();
         let shown = visibility(capability);
-        let flags = availability(controller.page_state(), capability, current.as_deref(), controller.enabled());
+        let flags = availability(controller.page_state(), capability, current.as_deref(), controller.system_enabled());
         self.updating.set(true);
         self.root.set_sensitive(!controller.page_busy());
         if let Some(header) = self.header.borrow().as_ref() {
             header.set_label(current.as_deref().unwrap_or_default());
             header.set_visible(shown.profiles_section);
         }
-        self.switch.button.set_active(model.pending_enabled.get().unwrap_or_else(|| controller.enabled()));
+        self.switch.button.set_active(model.pending_enabled.get().unwrap_or_else(|| controller.system_enabled()));
         self.switch.button.set_sensitive(flags.enable_disable);
         self.profiles_section.set_visible(shown.profiles_section);
         self.calibration.set_visible(shown.calibration);

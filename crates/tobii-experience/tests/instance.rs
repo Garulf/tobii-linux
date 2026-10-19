@@ -176,6 +176,20 @@ fn button(window: &gtk::Window, label: &str) -> Option<gtk::Button> {
         .find(|button| button.label().as_deref() == Some(label))
 }
 
+/// The trash button in the page's profile row of `name`.
+fn trash_button(window: &gtk::Window, name: &str) -> Option<gtk::Button> {
+    let has_name = |widget: &gtk::Widget| {
+        descendants(widget).iter().any(|w| w.downcast_ref::<gtk::Label>().is_some_and(|l| l.label() == name))
+    };
+    let row = descendants(window.upcast_ref())
+        .into_iter()
+        .find(|widget| widget.has_css_class("tobii-profile-row") && has_name(widget))?;
+    descendants(&row)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .find(|b| b.has_css_class("tobii-trash"))
+}
+
 fn checkbox(window: &gtk::Window) -> Option<gtk::CheckButton> {
     descendants(window.upcast_ref()).into_iter().find_map(|widget| widget.downcast::<gtk::CheckButton>().ok())
 }
@@ -192,6 +206,12 @@ fn run_primary() -> Outcome {
     let _ = std::fs::remove_dir_all(&directory);
     let settings_path: PathBuf = directory.join("experience.json");
 
+    let profiles = ProfileStore::new(directory.join("profiles"));
+    std::fs::create_dir_all(&profiles.directory).unwrap();
+    for name in ["Garulf", "Alice"] {
+        std::fs::write(profiles.directory.join(format!("{name}.setpm")), b"").unwrap();
+    }
+    profiles.set_current("Garulf").unwrap();
     let unit = Arc::new(FakeUnit::default());
     let setup = Rc::new(FakeSetup::default());
     let shell = Shell::new(Deps {
@@ -199,7 +219,7 @@ fn run_primary() -> Outcome {
         setup: setup.clone(),
         settings_path: Some(settings_path.clone()),
         tray: true,
-        profiles: ProfileStore::new(directory.join("profiles")),
+        profiles: profiles.clone(),
     });
 
     let not_reached = || Err::<(), String>("not reached".into());
@@ -254,6 +274,10 @@ fn run_primary() -> Outcome {
                     if page.title().as_deref() != Some(PAGE_TITLE) || page.default_width() != PAGE_WIDTH {
                         return fail(format!("unexpected page {:?} {}", page.title(), page.default_width()));
                     }
+                    let Some(trash) = trash_button(&page, "Alice") else {
+                        return fail("the page lists no Alice to mark".into());
+                    };
+                    trash.emit_clicked();
                     result.borrow_mut().forwarding = Ok(());
                     stops.failing_stops.store(2, Ordering::Release);
                     controller.quit();
@@ -321,8 +345,11 @@ fn run_primary() -> Outcome {
         "--service-unit".into(),
         UNIT.into(),
     ]);
-    let _ = std::fs::remove_dir_all(&directory);
     let mut outcome = outcome.borrow().clone();
+    if outcome.quit.is_ok() && profiles.names().unwrap() != ["Garulf"] {
+        outcome.quit = Err(format!("quitting with the page open kept {:?}", profiles.names().unwrap()));
+    }
+    let _ = std::fs::remove_dir_all(&directory);
     let calls = unit.calls.lock().unwrap().clone();
     if outcome.forwarding.is_ok() && calls.first() != Some(&format!("start {UNIT}")) {
         outcome.forwarding = Err(format!("the unit saw {calls:?}; only the primary starts it"));

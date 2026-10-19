@@ -113,6 +113,9 @@ impl Shell {
         let cell = controller.clone();
         app.connect_shutdown(move |_| {
             let released = cell.borrow_mut().take();
+            if let Some(controller) = &released {
+                page::on_shutdown(controller);
+            }
             drop(released);
         });
         Shell { app, controller }

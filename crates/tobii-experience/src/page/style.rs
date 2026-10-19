@@ -8,10 +8,11 @@ pub const FONT_FAMILY: &str =
 
 /// The stylesheet for windows with the `tobii-page` class.
 ///
+/// GTK's min sizes are content-box sizes, so Tobii's border-box minimums lose the padding
+/// and border (the `GazeEnabledButton`'s 150 x 33 becomes 80 x 17 inside its 35/8 padding).
 /// GTK has no `Viewbox`, so a few values are adapted: the `GazeEnabledButton` pill is the
 /// whole button drawn at Tobii's scale, with its text enlarged by 1/0.95 to keep 12 pt; the
-/// toggle knob's margins are taken inside the 1 px track border; min sizes are GTK's
-/// content-box sizes.
+/// toggle knob's margins are taken inside the 1 px track border.
 pub fn css() -> String {
     format!(
         r#"
@@ -43,7 +44,7 @@ window.tobii-page .tobii-toggle:disabled .track {{ border-color: #637279; backgr
 window.tobii-page .tobii-toggle:disabled:checked .track {{ border-color: transparent; background-color: #2B3940; }}
 window.tobii-page .tobii-toggle:disabled label.state {{ color: #2B3940; }}
 
-window.tobii-page button.tobii-gaze-button {{ min-width: 150px; min-height: 33px; padding: 8px 35px;
+window.tobii-page button.tobii-gaze-button {{ min-width: 80px; min-height: 17px; padding: 8px 35px;
   margin: 10px 0 15px -5px; border: none; border-radius: 9999px; box-shadow: none; outline: none;
   background-image: none; background-color: #004B66; color: #D9F4FF; transform: scale(0.95);
   transition: background-color 100ms, color 100ms, transform 100ms; }}
@@ -290,6 +291,10 @@ mod tests {
         assert!(css.contains(r#"font-family: "Selawik Light", "Segoe UI Light""#));
         assert!(css.contains("label.h3 { font-size: 16pt; color: #FFFFFF; }"));
         assert!(css.contains("label.body { font-size: 12pt; color: #D5D5D5; }"));
+        assert!(
+            css.contains("button.tobii-gaze-button { min-width: 80px; min-height: 17px; padding: 8px 35px;"),
+            "Tobii's 150 x 33 border box less the 35/8 padding, as GTK content-box minimums"
+        );
     }
 
     #[test]

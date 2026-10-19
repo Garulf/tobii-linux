@@ -269,7 +269,7 @@ fn button(window: &gtk::Window, text: &str) -> Result<gtk::Button, String> {
     find(window, |button: &gtk::Button| has_text(button.upcast_ref(), text)).map_err(|_| format!("no button {text:?}"))
 }
 
-fn toggles(window: &gtk::Window) -> Vec<gtk::ToggleButton> {
+fn toggles(window: &impl IsA<gtk::Widget>) -> Vec<gtk::ToggleButton> {
     descendants(window.upcast_ref()).into_iter().filter_map(|widget| widget.downcast().ok()).collect()
 }
 
@@ -543,6 +543,48 @@ fn select_sends_switch_request(f: &Fixture) -> Result<(), String> {
     f.closed()
 }
 
+fn deps(setup: Rc<FakeSetup>, store: &ProfileStore) -> Deps {
+    Deps { service: Arc::new(NoUnit), setup, settings_path: None, tray: false, profiles: store.clone() }
+}
+
+/// With no status yet (Initializing) and with the service unreachable (Error), Tobii's
+/// `SystemEnabled` reads as true: the switch shows ON, the 4.3 table makes it insensitive,
+/// and a click sends nothing.
+fn unknown_state_keeps_the_switch_on(app: &gtk::Application, store: &ProfileStore) -> Result<(), String> {
+    let unreachable = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let options = Options { service: unreachable, ..Options::default() };
+    let failing = Controller::new(app, &options, deps(Rc::default(), store));
+    spin_until("state Error", || failing.page_state() == PageState::Error)?;
+    let service = StubService::start(store.clone());
+    let options = Options { service: service.addr, ..Options::default() };
+    let starting = Controller::new(app, &options, deps(Rc::default(), store));
+    for (state, controller) in [(PageState::Error, &failing), (PageState::Initializing, &starting)] {
+        check(controller.page_state() == state, || format!("expected {state:?}, got {:?}", controller.page_state()))?;
+        let page = tobii_experience::page::page(controller);
+        let switch = toggles(&page).into_iter().next().ok_or("no switch")?;
+        check(switch.is_active() && switch.label_is_on(), || format!("{state:?}: the switch shows OFF"))?;
+        check(!switch.is_sensitive(), || format!("{state:?}: the switch is sensitive"))?;
+        switch.set_active(false);
+        check(!controller.page_busy() && switch.is_active(), || format!("{state:?}: the click was taken"))?;
+    }
+    spin_until("state Tracking", || starting.page_state() == PageState::Tracking)?;
+    spin_for(Duration::from_millis(200));
+    check(!service.requests().iter().any(|request| matches!(request, Request::SetEnabled(_))), || {
+        format!("the service saw {:?}", service.requests())
+    })?;
+    check(!failing.page_busy(), || "Error: the page is busy".into())
+}
+
+trait SwitchLabel {
+    fn label_is_on(&self) -> bool;
+}
+
+impl SwitchLabel for gtk::ToggleButton {
+    fn label_is_on(&self) -> bool {
+        has_text(self.upcast_ref(), "ON")
+    }
+}
+
 /// Renders the window through its own renderer into a PNG.
 fn save_screenshot(window: &gtk::Window, path: &Path) -> Result<(), String> {
     let paintable = gtk::WidgetPaintable::new(Some(window));
@@ -581,13 +623,7 @@ fn run(screenshot: Option<PathBuf>) -> Vec<(&'static str, Result<(), String>)> {
     let service = StubService::start(store.clone());
     let setup = Rc::new(FakeSetup::default());
     let options = Options { service: service.addr, ..Options::default() };
-    let deps = Deps {
-        service: Arc::new(NoUnit),
-        setup: setup.clone(),
-        settings_path: Some(directory.join("experience.json")),
-        tray: false,
-        profiles: store.clone(),
-    };
+    let deps = Deps { settings_path: Some(directory.join("experience.json")), ..deps(setup.clone(), &store) };
     let controller = Controller::new(&app, &options, deps);
     let fixture = Fixture { controller, service, setup, store };
     let mut results = vec![(
@@ -602,6 +638,7 @@ fn run(screenshot: Option<PathBuf>) -> Vec<(&'static str, Result<(), String>)> {
         results.push(("tracked_eyes_follow_the_radios", tracked_eyes_follow_the_radios(&fixture)));
         results.push(("deletions_commit_on_close", deletions_commit_on_close(&fixture)));
         results.push(("select_sends_switch_request", select_sends_switch_request(&fixture)));
+        results.push(("unknown_state_keeps_the_switch_on", unknown_state_keeps_the_switch_on(&app, &fixture.store)));
     }
     if let Some(window) = fixture.controller.page_window() {
         window.close();
