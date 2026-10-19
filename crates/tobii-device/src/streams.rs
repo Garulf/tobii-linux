@@ -7,6 +7,8 @@
 //! rather than waited on.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tobii_protocol::Message;
@@ -245,12 +247,19 @@ pub struct ItemPump {
     pending: VecDeque<Message>,
     silence: Duration,
     last_data: Instant,
+    paused: Arc<AtomicBool>,
 }
 
 impl ItemPump {
     /// Starts with the stream messages that arrived during earlier calls.
     pub fn new(pending: Vec<Message>, silence: Duration) -> Self {
-        Self { pending: pending.into(), silence, last_data: Instant::now() }
+        Self::with_pause(pending, silence, Arc::default())
+    }
+
+    /// Like [`ItemPump::new`], but while `paused` is set the silence clock is held at zero,
+    /// so a tracker that was paused on purpose is not taken for a dead one.
+    pub fn with_pause(pending: Vec<Message>, silence: Duration, paused: Arc<AtomicBool>) -> Self {
+        Self { pending: pending.into(), silence, last_data: Instant::now(), paused }
     }
 
     /// The next item among messages already received; `Stopped` when `stop` is set first.
@@ -267,14 +276,15 @@ impl ItemPump {
     }
 
     /// Bytes from one read of [`READ_SLICE_MS`]. Fails, marking the session dead, when the
-    /// host was suspended (`resumed`) or no stream data arrived for the silence timeout.
+    /// host was suspended (`resumed`) or no stream data arrived for the silence timeout
+    /// while not paused.
     pub fn received<C: Channel>(&mut self, session: &mut TrackerSession<C>, data: &[u8], resumed: bool) -> Result<()> {
         self.pending = if data.is_empty() { VecDeque::new() } else { session.decode(data)?.into() };
         if resumed {
             session.set_dead(true);
             return Err(DeviceError::Suspended);
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || self.paused.load(Ordering::Relaxed) {
             self.last_data = Instant::now();
         } else if self.last_data.elapsed() > self.silence {
             session.set_dead(true);
