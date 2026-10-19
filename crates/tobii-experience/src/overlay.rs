@@ -90,12 +90,12 @@ impl Renderer {
         if formats.is_empty() {
             return Err(format!("{}: no float colour buffer (EXT_color_buffer_float/half_float)", gl.description()));
         }
-        let gradient: Vec<u8> = trail::gradient().into_iter().flatten().collect();
+        let gradient = trail::gradient().as_flattened();
         Ok(Renderer {
             trail: gl.program(VERTEX, TRAIL)?,
             composite: gl.program(VERTEX, COMPOSITE)?,
             params: gl.uniform_buffer(UNIFORMS_SIZE)?,
-            gradient: gl.rgba_texture(GRADIENT_WIDTH as i32, 1, &gradient)?,
+            gradient: gl.rgba_texture(GRADIENT_WIDTH as i32, 1, gradient)?,
             gl,
             formats,
             format: None,
@@ -191,7 +191,8 @@ struct State {
     size: Cell<[i32; 2]>,
     timer: RefCell<Option<glib::SourceId>>,
     next_tick: Cell<Instant>,
-    output: RefCell<Option<gdk::Monitor>>,
+    /// The monitor shown on, with its geometry and scale notifications.
+    output: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     clear: Cell<bool>,
     description: RefCell<Option<String>>,
 }
@@ -200,6 +201,7 @@ impl Drop for State {
     /// Releases the GL objects, then the window, which GTK would otherwise keep.
     fn drop(&mut self) {
         self.renderer.take();
+        unwatch(self);
         if let Some(timer) = self.timer.take() {
             timer.remove();
         }
@@ -217,7 +219,7 @@ impl fmt::Debug for Overlay {
         f.debug_struct("Overlay")
             .field("layer_shell", &state.layer_shell)
             .field("shown", &self.is_shown())
-            .field("output", &state.output.borrow().as_ref().and_then(|monitor| monitor.connector()))
+            .field("output", &state.output.borrow().as_ref().and_then(|(monitor, _)| monitor.connector()))
             .field("renderer", &state.description.borrow())
             .finish_non_exhaustive()
     }
@@ -292,16 +294,14 @@ impl Overlay {
             return;
         };
         let state = &self.0;
-        if state.output.borrow().as_ref() != Some(monitor) {
-            let geometry = monitor.geometry();
-            state.trail.borrow_mut().set_bounds([geometry.x(), geometry.y(), geometry.width(), geometry.height()]);
+        if state.output.borrow().as_ref().map(|(watched, _)| watched) != Some(monitor) {
+            unwatch(state);
             if state.layer_shell {
                 state.window.set_monitor(Some(monitor));
-            } else {
-                state.window.set_default_size(geometry.width(), geometry.height());
             }
-            state.output.replace(Some(monitor.clone()));
+            state.output.replace(Some((monitor.clone(), watch(state, monitor))));
         }
+        apply_geometry(state, monitor);
         if state.timer.borrow().is_some() {
             return;
         }
@@ -331,7 +331,7 @@ impl Overlay {
         state.steps.borrow_mut().clear();
         state.latest.set(None);
         state.clear.set(true);
-        state.output.replace(None);
+        unwatch(state);
         state.window.set_visible(false);
     }
 
@@ -355,6 +355,42 @@ impl Overlay {
     /// The GL version, renderer and accumulation format in use, once a frame was drawn.
     pub fn renderer_description(&self) -> Option<String> {
         self.0.description.borrow().clone()
+    }
+}
+
+/// The trail's bounds from `monitor`'s current geometry, as Tobii refreshes the screen
+/// bounds on display changes; the GLArea's `resize` follows the surface size.
+fn apply_geometry(state: &State, monitor: &gdk::Monitor) {
+    let geometry = monitor.geometry();
+    state.trail.borrow_mut().set_bounds([geometry.x(), geometry.y(), geometry.width(), geometry.height()]);
+    if !state.layer_shell {
+        state.window.set_default_size(geometry.width(), geometry.height());
+    }
+    state.area.queue_render();
+}
+
+/// Re-reads the geometry whenever `monitor` changes position, size or scale.
+fn watch(state: &Rc<State>, monitor: &gdk::Monitor) -> Vec<glib::SignalHandlerId> {
+    let changed = {
+        let weak = Rc::downgrade(state);
+        move |monitor: &gdk::Monitor| {
+            if let Some(state) = weak.upgrade() {
+                apply_geometry(&state, monitor);
+            }
+        }
+    };
+    vec![
+        monitor.connect_geometry_notify(changed.clone()),
+        monitor.connect_scale_factor_notify(changed.clone()),
+        monitor.connect_scale_notify(changed),
+    ]
+}
+
+fn unwatch(state: &State) {
+    if let Some((monitor, handlers)) = state.output.take() {
+        for handler in handlers {
+            monitor.disconnect(handler);
+        }
     }
 }
 

@@ -259,16 +259,33 @@ pub fn scissors(bounds: [i32; 4], device_size: [i32; 2], scale: f64) -> Scissors
     }
 }
 
-/// Gradient 0 of `GazeNative.dll` as the piecewise-linear fit of docs/gaze-preview.md
-/// ("Gradient"): white, alpha rising to 255 at texel 256, opaque to 320, back to 0 at 369.
-pub fn gradient() -> Vec<[u8; 4]> {
-    let alpha = |i: usize| match i {
-        0..256 => 255 * i / 256,
+/// The bubble's colour gradient: 1536 R8G8B8A8 texels, white, alpha rising to 255 at texel
+/// 256, opaque to 320, back to 0 at 368: the shape of `GazeNative.dll`'s table 0, computed
+/// rather than copied (docs/gaze-preview.md, "Gradient").
+pub fn gradient() -> &'static [[u8; 4]] {
+    static TABLE: [[u8; 4]; GRADIENT_WIDTH] = gradient_table();
+    &TABLE
+}
+
+const fn gradient_table() -> [[u8; 4]; GRADIENT_WIDTH] {
+    let mut table = [[0xff; 4]; GRADIENT_WIDTH];
+    let mut texel = 0;
+    while texel < GRADIENT_WIDTH {
+        table[texel][3] = gradient_alpha(texel);
+        texel += 1;
+    }
+    table
+}
+
+/// Rounded `255 i / 256`, then 255, then rounded `255 (368 - i) / 48`.
+const fn gradient_alpha(texel: usize) -> u8 {
+    let alpha = match texel {
+        0..256 => (255 * texel + 128) / 256,
         256..=320 => 255,
-        321..369 => 255 * (369 - i) / 49,
+        321..368 => (255 * (368 - texel) + 24) / 48,
         _ => 0,
     };
-    (0..GRADIENT_WIDTH).map(|i| [255, 255, 255, alpha(i) as u8]).collect()
+    alpha as u8
 }
 
 #[cfg(test)]
@@ -445,13 +462,41 @@ mod tests {
     }
 
     #[test]
-    fn gradient_fits_tobii_table() {
+    fn gradient_has_the_shape_of_tobiis_table() {
         let table = gradient();
         assert_eq!(table.len(), GRADIENT_WIDTH);
-        assert!(table.iter().all(|texel| texel[..3] == [255, 255, 255]));
+        assert!(table.iter().all(|texel| texel[..3] == [0xff; 3]), "white");
         let alpha = |i: usize| table[i][3];
-        assert_eq!((alpha(0), alpha(128), alpha(256), alpha(320), alpha(369), alpha(1535)), (0, 127, 255, 255, 0, 0));
-        assert!((alpha(345) as i32 - 125).abs() <= 1, "falling edge: {}", alpha(345));
+        assert_eq!(
+            (alpha(0), alpha(128), alpha(256), alpha(320), alpha(321), alpha(367), alpha(368), alpha(1535)),
+            (0, 128, 255, 255, 250, 5, 0, 0)
+        );
+        for i in 0..GRADIENT_WIDTH {
+            let fit = match i {
+                0..256 => 255.0 * i as f64 / 256.0,
+                256..=320 => 255.0,
+                _ => (255.0 * (369.0 - i as f64) / 49.0).max(0.0),
+            };
+            assert!((f64::from(alpha(i)) - fit).abs() <= 5.5, "texel {i}: {} against the fit {fit:.1}", alpha(i));
+        }
+    }
+
+    #[test]
+    fn changed_bounds_move_points_and_box() {
+        let t0 = Instant::now();
+        let mut trail = shown_trail();
+        trail.params.filter = 0.0;
+        trail.add(sample(0.5, 0.5), t0);
+        assert_eq!(trail.update(t0)[0], Point { x: 960.0, y: 540.0 });
+        let small = trail.bounding_box(1920, 1080);
+
+        trail.set_bounds([1920, 0, 2560, 1440]);
+        trail.add(sample(0.5, 0.5), t0 + ms(12));
+        assert_eq!(trail.update(t0 + ms(12))[1], Point { x: 1280.0, y: 720.0 }, "relative to the new output");
+        let large = trail.bounding_box(2560, 1440);
+        let r = 2560.0f32 * 0.075 * 1.1;
+        assert_eq!(large[3], (720.0 + r) as i32, "the pad follows the new width at once");
+        assert!(large[3] > small[3] && large[2] > small[2], "{small:?} then {large:?}");
     }
 
     #[test]

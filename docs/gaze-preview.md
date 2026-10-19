@@ -641,6 +641,44 @@ Inference, for the GTK overlay; none of this is Tobii's code.
   windows, not focusable and absent from the taskbar, covering the tracked
   monitor.
 
+## Linux port
+
+`crates/tobii-experience` (`trail`, `overlay`, `overlay/gl.rs`, `src/shaders/`) follows the
+notes above. It differs from `GazeNative.dll` where GL or Linux requires it:
+
+- **Window**: a `wlr-layer-shell` surface on the overlay layer, anchored to every edge of
+  the tracked monitor, exclusive zone -1, no keyboard, an empty input region, drawn in a
+  `gtk::GLArea`. GTK 4 takes the GLArea's buffer as premultiplied, so the composite output
+  goes in unchanged. The trail's screen bounds are re-read from the monitor whenever it is
+  shown and whenever the monitor's geometry or scale changes, as Tobii refreshes them on
+  display changes. Points are in the monitor's logical pixels; the targets are in device
+  pixels, so the boxes are scaled by the buffer size over the widget size.
+- **Tick**: 12 ms on a wall-clock schedule. When the main loop was busy (a slow frame),
+  every missed tick still runs, each at its scheduled time, so the trail decays per 12 ms
+  as Tobii's nominal rate gives. At most 64 ticks (0.77 s) run at once; further behind,
+  the schedule restarts from now. Tobii's loop would instead slow down with its renderer.
+  The ticks queue their trail passes, and the next GLArea render runs them in order before
+  compositing.
+- **Quad**: no vertex buffer. The vertex shader takes the six corners from `gl_VertexID`
+  and uses `gl_Position = (2p - 1, 1, 1)`, `uv = p`, with `gaze.y` uploaded as
+  `(H - y) / H` and the scissor rectangles flipped, as in the orientation note.
+- **Clear pass**: the four strips outside the box and the hide clear are scissored
+  `glClear` to 0 instead of drawing the clear shader (blob 0): the same zeros, without a
+  draw.
+- **Accumulation format**: R32F (`R32_FLOAT`) on desktop GL, and on GLES when float colour
+  buffers (ES 3.2, or `EXT_color_buffer_float`) and `OES_texture_float_linear` are present;
+  else R16F with `EXT_color_buffer_float` or `EXT_color_buffer_half_float`; an incomplete
+  framebuffer falls through to the next one. With neither, the overlay logs and draws
+  nothing. The chosen path is logged once, for example `OpenGL ES 3.2 Mesa 26.2.4
+  (llvmpipe ...), accumulation R32F`.
+- **Gradient**: computed by `trail::gradient` instead of copied from `GazeNative.dll`: 1536
+  white texels with alpha `round(255 i / 256)` for i < 256, 255 up to 320, then
+  `round(255 (368 - i) / 48)` down to 0 at i = 368 and after, within 5.5/255 of the fit to
+  table 0 above at every texel. It is uploaded as 1536 x 1 `RGBA8` (bytes R, G, B, A per
+  texel, the `R8G8B8A8_UNORM` order).
+- **No layer-shell**: no overlay and no gaze subscription. Tests run the same renderer in
+  a plain undecorated window under Xvfb with Mesa's llvmpipe.
+
 ## Not recovered
 
 - How the overlay looks and its real tick rate on Windows: it was not run

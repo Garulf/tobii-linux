@@ -167,7 +167,9 @@ window is active and the device is tracking. The trail, the visibility rules and
 output choice (`trail`, `preview`) build and test without GTK. Without layer-shell (X11)
 the preview stays off. The OpenGL calls go through `glow` in
 `crates/tobii-experience/src/overlay/gl.rs`, the crate's one module allowed `unsafe` (the
-crate denies it instead of forbidding it). The shell adds Mesa's llvmpipe so the overlay
+crate denies it instead of forbidding it). The colour gradient
+(`trail::gradient`) is computed to the shape of Tobii's table. The shell adds
+Mesa's llvmpipe so the overlay
 test renders under Xvfb; `TOBII_EXPERIENCE_BUBBLE_FRAMES=<directory>` makes it write the
 frames it checks as PNGs.
 

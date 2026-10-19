@@ -724,7 +724,22 @@ How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
 - Data: valid samples only; point = screen origin + normalised gaze point x
   screen size, on the monitor the default tracker is mapped to
   (`:258-286`).
-- Linux: same (spec); the overlay drawing is a later task.
+- Linux: differs (why):
+  - The bubble also needs state `Tracking` and the tracked monitor to be connected:
+    `tobii-linux serve` reports the state, and the monitor can be unplugged under a running
+    app. Leaving `Tracking` or losing the monitor hides the bubble and ends the gaze
+    subscription. The toggle keeps its value, and the bubble comes back with the state or
+    the monitor.
+  - The tracked monitor is the one recorded by the last display setup
+    (`$XDG_DATA_HOME/tobii-linux/display-setup.json`). The output is the GDK monitor whose
+    connector equals the recorded one after stripping a leading `cardN-`, else the one
+    whose EDID manufacturer and model match (the EDID monitor name, or the product code
+    when the EDID has no name). No match hides the bubble.
+  - The overlay is a click-through `wlr-layer-shell` surface (overlay layer, all edges,
+    no keyboard). Without layer-shell (X11, or a Wayland compositor without it) the
+    preview stays off: X11 offers GTK 4 no way to keep a window above the others on a
+    given monitor.
+  - Drawing: [gaze-preview.md](gaze-preview.md), "Linux port".
 
 ## 5. Styles
 

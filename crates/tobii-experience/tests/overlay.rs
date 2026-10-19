@@ -86,6 +86,14 @@ fn ring(alpha: &[u8], width: usize, centre: (f64, f64)) -> (f64, f64, u8) {
     (if weight > 0.0 { sum / weight } else { 0.0 }, farthest, at_centre)
 }
 
+/// The distance from `point` to the nearest drawn pixel.
+fn nearest(alpha: &[u8], width: usize, point: (f64, f64)) -> f64 {
+    let drawn = alpha.iter().enumerate().filter(|(_, value)| **value > 0);
+    drawn
+        .map(|(index, _)| ((index % width) as f64 + 0.5 - point.0).hypot((index / width) as f64 + 0.5 - point.1))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// The leftmost and rightmost drawn columns.
 fn extent(alpha: &[u8], width: usize) -> (usize, usize) {
     let columns = alpha.iter().enumerate().filter(|(_, value)| **value > 0).map(|(index, _)| index % width);
@@ -121,7 +129,7 @@ fn bubble_follows_simulated_gaze(frames: Option<&Path>) -> Result<(), String> {
     let geometry = monitor.geometry();
     let (width, height) = (f64::from(geometry.width()), f64::from(geometry.height()));
     let overlay = Overlay::windowed();
-    let gaze = Rc::new(Cell::new((0.3, 0.5)));
+    let gaze = Rc::new(Cell::new((0.3, 0.3)));
     let feeder = {
         let (overlay, gaze) = (overlay.clone(), gaze.clone());
         glib::timeout_add_local(Duration::from_millis(8), move || {
@@ -146,12 +154,18 @@ fn bubble_follows_simulated_gaze(frames: Option<&Path>) -> Result<(), String> {
     save(&overlay, frames, "1-still")?;
     let (values, stride) = alpha(&still);
     let radius = SIZE * height;
-    let (mean, farthest, centre) = ring(&values, stride, (0.3 * width, 0.5 * height));
-    println!("still gaze: mean drawn distance {mean:.1} px, farthest {farthest:.1} px, radius {radius:.1} px");
+    let (mean, farthest, centre) = ring(&values, stride, (0.3 * width, 0.3 * height));
+    println!(
+        "still gaze at (0.3, 0.3): mean drawn distance {mean:.1} px, farthest {farthest:.1} px, radius {radius:.1} px"
+    );
     if !(0.8 * radius..=1.05 * radius).contains(&mean) || farthest > 1.15 * radius || centre != 0 {
         return Err(format!(
-            "not a ring of radius {radius:.1}: mean {mean:.1}, farthest {farthest:.1}, centre {centre}"
+            "not a ring of radius {radius:.1} around the gaze: mean {mean:.1}, farthest {farthest:.1}, centre {centre}"
         ));
+    }
+    let mirrored = nearest(&values, stride, (0.3 * width, 0.7 * height));
+    if mirrored < 0.4 * height - 1.15 * radius {
+        return Err(format!("drawn {mirrored:.1} px from the vertically mirrored point: the y orientation is flipped"));
     }
 
     let start = Instant::now();
@@ -159,7 +173,7 @@ fn bubble_follows_simulated_gaze(frames: Option<&Path>) -> Result<(), String> {
     let mut moving = None;
     while start.elapsed() < travel {
         let t = start.elapsed().as_secs_f64() / travel.as_secs_f64();
-        gaze.set((0.3 + 0.4 * t, 0.5 - 0.1 * (t * std::f64::consts::PI).sin()));
+        gaze.set((0.3 + 0.4 * t, 0.3 + 0.2 * t - 0.1 * (t * std::f64::consts::PI).sin()));
         pump(Duration::from_millis(8));
         if moving.is_none() && t >= 0.5 {
             moving = Some(render(&overlay, None)?);
@@ -169,7 +183,8 @@ fn bubble_follows_simulated_gaze(frames: Option<&Path>) -> Result<(), String> {
     let (values, stride) = alpha(&moving.ok_or("no frame while moving")?);
     let (left, right) = extent(&values, stride);
     println!("moving: drawn from x {left} to {right}");
-    if (right.saturating_sub(left) as f64) < 2.5 * radius {
+    // A still ring is at most 2 x 1.15 r wide; anything wider is the trail.
+    if (right.saturating_sub(left) as f64) <= 2.0 * 1.15 * radius {
         return Err(format!("no trail behind the moving gaze: drawn from x {left} to {right}"));
     }
     gaze.set((0.7, 0.5));
