@@ -14,10 +14,13 @@ let
   ] ++ lib.optionals (cfg.headPoseService.displayId != null) [
     "--display-id" cfg.headPoseService.displayId
   ] ++ lib.optionals cfg.headPoseService.tetTcp [ "--tet-tcp" ];
+  serviceUnit = "tobii-head-pose.service";
 in {
   options.hardware.tobii-eye-tracker-5 = {
     enable = lib.mkEnableOption
       "Eye Tracker 5 USB access and the experimental head-pose command";
+    experience.enable = lib.mkEnableOption
+      "the Tobii Experience tray app and an always-running service";
     headPoseService = {
       enable = lib.mkEnableOption
         "a systemd user service that serves head pose to Windows games through the Wine pipe bridge";
@@ -99,14 +102,31 @@ in {
         SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2104", ATTR{idProduct}=="0313", TAG+="uaccess"
       '';
     }) ];
-    systemd.user.services.tobii-head-pose = lib.mkIf cfg.headPoseService.enable {
-      description = "Eye Tracker 5 head pose for Windows games under Wine";
+    systemd.user.services.tobii-head-pose = lib.mkIf (cfg.headPoseService.enable || cfg.experience.enable) {
+      description = "Eye Tracker 5 service for Tobii Experience and Windows games under Wine";
       wantedBy = [ "default.target" ];
       environment = lib.mkIf (cfg.headPoseService.models != null) {
         TOBII_LINUX_MODELS = cfg.headPoseService.models;
       };
       serviceConfig = {
         ExecStart = lib.escapeShellArgs ([ (lib.getExe package) ] ++ serveArguments);
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+    };
+    # Quit in the app stops the service unit; starting the app starts it again.
+    systemd.user.services.tobii-linux-experience = lib.mkIf cfg.experience.enable {
+      description = "Tobii Experience tray app";
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      wants = [ serviceUnit ];
+      after = [ "graphical-session.target" serviceUnit ];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${package}/bin/tobii-linux-experience"
+          "--service" "127.0.0.1:${toString cfg.headPoseService.port}"
+          "--service-unit" serviceUnit
+        ];
         Restart = "on-failure";
         RestartSec = 2;
       };

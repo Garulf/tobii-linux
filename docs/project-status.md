@@ -5,6 +5,36 @@ next steps; detailed evidence is linked below.
 
 ## Latest continuation checkpoint
 
+### Tobii Experience app checkpoint
+
+Recorded 2026-10-19.
+
+- **Service:** `tobii-linux serve` no longer needs `--display` (it reads the
+  display area from the tracker), keeps Tobii's on/off state in
+  `$XDG_STATE_HOME/tobii-linux/eye-tracking-enabled` and pauses the tracker
+  for every client while it is off, puts the current profile (tracked eyes
+  and the calibration for the recorded monitor) on the tracker at attach, and
+  serves a private control channel on the relay port
+  ([control channel](control-channel.md)).
+- **App:** `tobii-linux-experience` (`crates/tobii-experience`, GTK 4) has
+  Tobii's tray icon, tooltip and menu, the Eye tracking page, the quit dialog
+  (Quit stops the service unit), `--guest` for the Ctrl+Shift+F10 shortcut,
+  and the gaze preview as a layer-shell overlay drawn with Tobii's gradient
+  ([Tobii Experience](experience-app.md), [gaze preview](gaze-preview.md)).
+  `tobii-linux-setup` takes Tobii's `-C`, `-N`, `-S`, `-R` and `-G` and
+  borrows the tracker from a running service.
+- **NixOS:** `packages.tobii-experience` (with Microsoft's Selawik font, which
+  nixpkgs lacks, from `nix/selawik.nix`), linked into the default package, and
+  `hardware.tobii-eye-tracker-5.experience.enable`, which runs the service from
+  login and the app with `graphical-session.target`
+  ([launching games](game-launch.md#tobii-experience)). Built and evaluated
+  with nix-portable in a container, not on NixOS hardware.
+- **Checked:** scripted trackers, a stub service, Xvfb with Mesa's llvmpipe.
+  Not run: a real tracker, a Wayland compositor, a tray host. The
+  [live checklist](experience-live-checklist.md) lists the checks and the
+  open questions about the tracker (pause across sessions, 1430 while paused,
+  3160 across a power cycle, release on nusb).
+
 ### Driver checkpoint: live USB, full pipeline, Wine route
 
 - **Live hardware (WSL2 on the reference host, usbipd-win):** channel 0
@@ -337,6 +367,7 @@ Last verification:
 - [Managed API, ABI and Windows sample observations](managed-api.md)
 - [Star Citizen PRP format and REA evidence ledger](game-interface.md)
 - [Tobii Experience tray, page, on/off, quit and guest behaviour](experience-app.md)
+- [Tobii Experience live checklist](experience-live-checklist.md)
 
 The detailed reports retain source hashes, addresses and actual REA Evidence IDs
 where available. Static analysis, offline emulation and observed Windows runtime

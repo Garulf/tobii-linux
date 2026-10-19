@@ -162,6 +162,18 @@ They run like the setup targets. `experience-test` also needs a session bus for 
 single-instance test (`dbus-run-session` from the shell) and starts Xvfb when there is no
 display; the test is skipped without either.
 
+The flake's `tobii-experience` package (buildRustPackage with gtk4, gtk4-layer-shell and
+wrapGAppsHook4) wraps the binary with a fontconfig file that adds Selawik
+(`nix/selawik.nix`; nixpkgs has no package for it) and with `tobii-setup` on its `PATH`,
+and installs a "Tobii Experience" launcher entry. The default package links the binary
+as `bin/tobii-linux-experience`. The build runs the crate's tests; those that need a
+display or a session bus skip there.
+
+```sh
+~/.local/bin/nix-portable nix build -L --no-link \
+  --override-input nixpkgs "path:$HOME/np-src/nixpkgs" '.#packages.x86_64-linux.tobii-experience'
+```
+
 "Preview my gaze" ([gaze-preview.md](gaze-preview.md)) is `overlay`: a click-through
 layer-shell surface (`gtk4-layer-shell`) over the monitor of the last display setup, drawing
 `GazeNative.dll`'s passes in a `gtk::GLArea` every 12 ms while the toggle is on, the page
