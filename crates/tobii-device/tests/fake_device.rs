@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tobii_device::channel::{Channel, ChannelError};
 use tobii_device::session::{HEAD_POSE_REALM_EXTRA, HEAD_POSE_REALM_KEY, TrackerSession, UNLOCK_REALM_KEY};
 use tobii_device::stop::{StopFlag, StopSignal};
-use tobii_device::streams::{ItemPump, StreamReader, StreamValue};
+use tobii_device::streams::{ItemPump, Pending, StreamReader, StreamValue};
 use tobii_device::supervisor::{Backoff, LinkHost, LinkState, TrackerLink};
 use tobii_device::{DeviceError, threads};
 use tobii_protocol::Message;
@@ -282,6 +282,18 @@ fn a_dropped_gaze_message_and_a_malformed_image_are_counted_not_yielded() {
     assert_eq!(reader.stats.decode_errors[&Stream::Image], 1);
     assert_eq!(reader.stats.unexpected, 1);
     assert!(reader.stats.last_error.as_deref().unwrap().starts_with("image message: "));
+}
+
+#[test]
+fn stream_messages_kept_during_a_call_reach_the_pump() {
+    let (_, mut session) = started(Duration::from_secs(10));
+    let mut reader = StreamReader::new(&[Stream::Gaze], &[]);
+    let mut pump = ItemPump::new(session.take_pending_streams(), Duration::from_secs(1));
+    let stop = StopFlag::new();
+    assert!(matches!(pump.pending_item(&mut reader, &stop), Pending::Empty));
+    pump.extend(vec![gaze_message(9)]);
+    let Pending::Item(item) = pump.pending_item(&mut reader, &stop) else { panic!("no item") };
+    assert_eq!(item.stream, Stream::Gaze);
 }
 
 #[test]

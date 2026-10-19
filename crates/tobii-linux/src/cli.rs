@@ -229,8 +229,10 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
     fn attempt(&mut self, stop: &dyn StopSignal, opened: &mut dyn FnMut()) -> Result<()> {
         let mut session = (self.open)()?;
         opened();
+        let (requests, inbox) = std::sync::mpsc::channel();
+        let _ = self.events.send(Event::Requests(requests));
         let suspend = Box::new(HostSuspendWatch::default());
-        serve_tracker(&mut session, self.processor, self.clock.clone(), self.feed, stop, Some(suspend))
+        serve_tracker(&mut session, self.processor, self.clock.clone(), self.feed, stop, Some(suspend), Some(inbox))
     }
 
     fn now_s(&mut self) -> f64 {

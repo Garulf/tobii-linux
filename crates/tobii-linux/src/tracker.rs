@@ -7,9 +7,11 @@
 //! that falls silent, a restarted tracker or a host resume ends the session.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+use tobii_device::channel::ChannelError;
 use tobii_device::clock::{ClockMapper, HostClock};
 use tobii_device::streams::{
     DeviceClockWatch, ItemPump, Pending, SILENCE_TIMEOUT, StreamItem, StreamReader, StreamStats, StreamValue,
@@ -17,11 +19,11 @@ use tobii_device::streams::{
 };
 use tobii_device::{CameraCalibration, Channel, DeviceError, StopFlag, StopSignal, TrackerSession};
 use tobii_headpose::pipeline::{DisplayArea, HeadPoseSample};
-use tobii_protocol::Message;
 use tobii_protocol::commands::{Stream, command, header_only_request, request};
 use tobii_protocol::fields::Value;
 use tobii_protocol::frames::ImageFrame;
 use tobii_protocol::gaze::{GazeFrame, PLATMOD_UNKNOWN, platmod_presence};
+use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp_service::presence_subscribe_time;
 use tobii_service::tet_tcp::CAPTURED_GETTERS;
 
@@ -226,6 +228,30 @@ impl<T> Newest<T> {
     }
 }
 
+/// A request for the running session; `build` gets the request id to send it with.
+pub struct DeviceRequest {
+    pub build: Box<dyn FnOnce(u32) -> Result<Message, ProtocolError> + Send>,
+    pub timeout: Duration,
+    pub reply: tokio::sync::oneshot::Sender<Result<Message, DeviceError>>,
+}
+
+impl std::fmt::Debug for DeviceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRequest").field("timeout", &self.timeout).finish_non_exhaustive()
+    }
+}
+
+/// The requests a running session answers between its reads.
+pub type DeviceRequests = std::sync::mpsc::Receiver<DeviceRequest>;
+
+/// The same failure for a second recipient; only the session's own error keeps its source.
+fn reported(error: &DeviceError) -> DeviceError {
+    match error {
+        DeviceError::Timeout { command } => DeviceError::Timeout { command: *command },
+        other => DeviceError::Channel(ChannelError::new(true, other.to_string())),
+    }
+}
+
 type GazeCallback<'a> = &'a (dyn Fn(GazeFrame) + Sync);
 type PresenceCallback<'a> = &'a (dyn Fn(i64, i64) + Sync);
 type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
@@ -242,6 +268,8 @@ type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
 /// head pose timing is the same as without gaze. A device clock that jumps back, as
 /// `device_clock` judges it, ends the session. `device_stream`, when given, also receives
 /// each gaze and presence message as the device sent it, with its time on `clock`.
+/// `requests` are answered on the reading thread between reads, also while no stream data
+/// arrives; while `paused` is set the session is not taken for dead when it falls silent.
 pub struct LiveStreams<'a> {
     pub clock: HostTime,
     pub gaze: GazeCallback<'a>,
@@ -250,6 +278,8 @@ pub struct LiveStreams<'a> {
     pub silence: Duration,
     pub suspend: Option<Box<dyn SuspendWatch>>,
     pub device_clock: DeviceClockWatch,
+    pub requests: Option<DeviceRequests>,
+    pub paused: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LiveStreams<'_> {
@@ -271,6 +301,8 @@ impl<'a> LiveStreams<'a> {
             silence: SILENCE_TIMEOUT,
             suspend: None,
             device_clock: DeviceClockWatch::default(),
+            requests: None,
+            paused: Arc::default(),
         }
     }
 
@@ -309,6 +341,8 @@ impl<'a> LiveStreams<'a> {
                 device_clock: self.device_clock,
                 image_time,
                 frames,
+                requests: self.requests,
+                paused: self.paused,
             };
             let mut suspend = self.suspend;
             let silence = self.silence;
@@ -358,6 +392,8 @@ struct Reading<'a, 's> {
     device_clock: DeviceClockWatch,
     image_time: &'s Mutex<ClockMapper<HostTime>>,
     frames: &'s Newest<ImageFrame>,
+    requests: Option<DeviceRequests>,
+    paused: Arc<AtomicBool>,
 }
 
 impl Reading<'_, '_> {
@@ -369,7 +405,7 @@ impl Reading<'_, '_> {
         suspend: &mut Option<Box<dyn SuspendWatch>>,
         stop: &dyn StopSignal,
     ) -> Result<()> {
-        let mut pump = ItemPump::new(session.take_pending_streams(), silence);
+        let mut pump = ItemPump::with_pause(session.take_pending_streams(), silence, Arc::clone(&self.paused));
         let failed = |session: &mut TrackerSession<C>, error: DeviceError| {
             if error.is_device_error() {
                 session.set_dead(true);
@@ -377,16 +413,51 @@ impl Reading<'_, '_> {
             Error::from(error)
         };
         loop {
-            let watch = suspend.as_deref_mut().map(|watch| watch as &mut dyn SuspendWatch);
-            let item = match pump.next(reader, session, watch, stop) {
-                Ok(Some(item)) => item,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(failed(session, error)),
-            };
-            if let Err(error) = self.dispatch(item) {
+            match pump.pending_item(reader, stop) {
+                Pending::Item(item) => {
+                    if let Err(error) = self.dispatch(*item) {
+                        return Err(failed(session, error));
+                    }
+                    continue;
+                }
+                Pending::Stopped => return Ok(()),
+                Pending::Empty => {}
+            }
+            if stop.is_set() {
+                return Ok(());
+            }
+            if let Err(error) = self.answer_requests(session) {
                 return Err(failed(session, error));
             }
+            if !session.pending_streams.is_empty() {
+                pump.extend(session.take_pending_streams());
+                continue;
+            }
+            let data = session.read(READ_SLICE_MS).map_err(|error| failed(session, error))?;
+            let resumed = suspend.as_deref_mut().is_some_and(|watch| watch.resumed());
+            pump.received(session, &data, resumed).map_err(|error| failed(session, error))?;
         }
+    }
+
+    /// Answers every waiting request; fails when one leaves the session dead.
+    fn answer_requests<C: Channel>(&self, session: &mut TrackerSession<C>) -> std::result::Result<(), DeviceError> {
+        let Some(requests) = &self.requests else { return Ok(()) };
+        while let Ok(request) = requests.try_recv() {
+            let outcome = (request.build)(session.next_id()).map_err(DeviceError::from).and_then(|message| {
+                let reply = session.request(&message, request.timeout)?;
+                session.finish_call(&message, reply)
+            });
+            match outcome {
+                Err(error) if session.is_dead() => {
+                    let _ = request.reply.send(Err(reported(&error)));
+                    return Err(error);
+                }
+                outcome => {
+                    let _ = request.reply.send(outcome);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn device_time(&mut self, device_us: i64) -> i64 {
@@ -452,7 +523,8 @@ impl std::fmt::Debug for ServiceFeed {
 
 /// One service session on a started tracker: calibration, streams, then samples until it ends.
 ///
-/// Returns when `stop` is set; fails when the tracker fails or goes silent.
+/// `requests` wait until the streams run and are then answered between reads. Returns when
+/// `stop` is set; fails when the tracker fails or goes silent.
 pub fn serve_tracker<C: Channel>(
     session: &mut TrackerSession<C>,
     processor: &mut dyn FrameProcessor,
@@ -460,6 +532,7 @@ pub fn serve_tracker<C: Channel>(
     feed: &ServiceFeed,
     stop: &dyn StopSignal,
     suspend: Option<Box<dyn SuspendWatch>>,
+    requests: Option<DeviceRequests>,
 ) -> Result<()> {
     processor.start(&session.camera_calibration(0)?);
     let calibration_id = device_calibration_id(session)?;
@@ -473,6 +546,7 @@ pub fn serve_tracker<C: Channel>(
     streams.presence = feed.presence.as_deref().map(|p| p as PresenceCallback);
     streams.device_stream = feed.device_stream.as_deref().map(|d| d as DeviceStreamCallback);
     streams.suspend = suspend;
+    streams.requests = requests;
     streams.run(
         session,
         stop,

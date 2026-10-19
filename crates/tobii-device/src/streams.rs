@@ -275,6 +275,15 @@ impl ItemPump {
         Pending::Empty
     }
 
+    /// Queues stream messages received outside the pump, such as those the session kept
+    /// while waiting for a reply; any message counts as stream data for the silence clock.
+    pub fn extend(&mut self, messages: Vec<Message>) {
+        if !messages.is_empty() {
+            self.pending.extend(messages);
+            self.last_data = Instant::now();
+        }
+    }
+
     /// Bytes from one read of [`READ_SLICE_MS`]. Fails, marking the session dead, when the
     /// host was suspended (`resumed`) or no stream data arrived for the silence timeout
     /// while not paused.

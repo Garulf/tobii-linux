@@ -15,16 +15,17 @@ use common::fake_tracker::FakeTracker;
 use common::*;
 use tobii_device::supervisor::{Backoff, LinkCounters, TrackerLink};
 use tobii_device::{CameraCalibration, DeviceError, StopFlag, TrackerSession};
+use tobii_gaze::operation::{Operation, OperationError};
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::cli::{ServiceLink, service_feed};
 use tobii_linux::error::Result;
 use tobii_linux::service::clock::{Clocks, ServiceTime, wine_clock};
-use tobii_linux::service::{Options, PrpService};
+use tobii_linux::service::{DeviceCallError, Options, PrpService};
 use tobii_linux::tracker::{FrameProcessor, HostTime};
-use tobii_protocol::Message;
 use tobii_protocol::commands::{Stream, command, header_only_request, unsubscribe_stream};
 use tobii_protocol::gaze::PRESENCE_PRESENT;
 use tobii_protocol::ttp::Decoder;
+use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope};
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_STREAM_START, ConnectRequest, PropertyResponse,
@@ -298,6 +299,112 @@ fn tet_tcp_replies_come_from_the_session_and_the_port_follows_the_tracker() {
         plug(&slot, Some(FakeTracker::streaming()));
         until("route bound again", || tet_tcp.port_bound().is_some()).await;
         assert_eq!(link.sessions_and_failures(), (2, 1));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+fn device_status_requests(device: &FakeTracker) -> Vec<Message> {
+    device.log().into_iter().filter(|m| m.command == command::GET_DEVICE_STATUS).collect()
+}
+
+#[test]
+fn device_call_reaches_the_tracker_while_streaming() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        let (_command, mut subscription, _) = streaming_client(port).await;
+        subscription.packet().await;
+        let before = device_status_requests(&device).len();
+        let reply = service
+            .device_call(|id| header_only_request(id, command::GET_DEVICE_STATUS), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!((reply.command, reply.word4), (command::GET_DEVICE_STATUS, 0));
+        let sent = device_status_requests(&device);
+        assert_eq!(sent.len(), before + 1);
+        assert_eq!(sent.last().unwrap().request_id, reply.request_id);
+        let unbuilt = service.device_call(|_| Err(ProtocolError::new("unbuilt")), Duration::from_secs(1)).await;
+        assert!(matches!(unbuilt, Err(DeviceCallError::Device(DeviceError::Protocol(_)))), "{unbuilt:?}");
+        for _ in 0..3 {
+            let package = subscription.packet().await;
+            assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
+        }
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn device_call_is_answered_while_the_tracker_sends_nothing() {
+    run(async {
+        let (service, _, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::scripted(Vec::new(), 1);
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        until("attached", || service.tracker_attached()).await;
+        let reply = service
+            .device_call(|id| header_only_request(id, command::GET_DEVICE_STATUS), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(reply.word4, 0);
+        assert_eq!(device_status_requests(&device).last().unwrap().request_id, reply.request_id);
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn device_call_without_tracker_is_not_attached() {
+    run(async {
+        let (service, _, accept) = service(options("ET5-TEST")).await;
+        let outcome =
+            service.device_call(|id| header_only_request(id, command::GET_DEVICE_STATUS), Duration::from_secs(1)).await;
+        assert!(matches!(outcome, Err(DeviceCallError::NotAttached)), "{outcome:?}");
+
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        device.unplug();
+        plug(&slot, None);
+        until("detached", || !service.tracker_attached()).await;
+        let outcome =
+            service.device_call(|id| header_only_request(id, command::GET_DEVICE_STATUS), Duration::from_secs(1)).await;
+        assert!(matches!(outcome, Err(DeviceCallError::NotAttached)), "{outcome:?}");
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn operations_run_their_calls_through_the_session() {
+    run(async {
+        let (service, _, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        let before = device_status_requests(&device).len();
+        let operation = Operation::new(|io| async move {
+            io.check().await.map_err(OperationError::External)?;
+            io.log("status", Vec::new()).await;
+            let request = header_only_request(0, command::GET_DEVICE_STATUS)?;
+            let values = io.call(request, Some(1.0)).await.map_err(OperationError::External)?;
+            Ok(values.len())
+        });
+        assert_eq!(service.run_operation(operation).await.unwrap(), 0);
+        assert_eq!(device_status_requests(&device).len(), before + 1);
+
+        let reading = Operation::new(|io| async move { io.read().await.map_err(OperationError::External) });
+        assert!(matches!(service.run_operation(reading).await, Err(OperationError::Gaze(_))));
         assert!(link.stop().await);
         service.close();
         accept.abort();

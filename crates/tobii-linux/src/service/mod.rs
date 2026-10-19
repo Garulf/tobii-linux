@@ -25,11 +25,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tobii_device::DeviceError;
+use tobii_gaze::error::GazeError;
+use tobii_gaze::operation::{
+    Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
+};
 use tobii_headpose::pipeline::HeadPoseSample;
-use tobii_protocol::Message;
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
+use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
 use tobii_service::prp_service::{
     self as decisions, FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
@@ -52,7 +57,7 @@ use tobii_service::qpc_clock::{Basis, ClockSwitch, CounterMapping, QpcClockFollo
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use crate::tracker::DeviceReplies;
+use crate::tracker::{DeviceReplies, DeviceRequest};
 use clock::{Clock, now_us, readings};
 use hub::Hub;
 use link::{Ended, Frames, Link, Outcome, peer_repr, refused};
@@ -108,6 +113,41 @@ pub enum Event {
     Presence(i64, i64),
     Device(Box<DeviceReplies>),
     DeviceStream(Box<Message>, i64),
+    /// Where the session that just started takes device requests.
+    Requests(std::sync::mpsc::Sender<DeviceRequest>),
+}
+
+/// Why [`PrpService::device_call`] got no reply.
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceCallError {
+    #[error("No tracker session is running")]
+    NotAttached,
+    #[error(transparent)]
+    Device(DeviceError),
+    #[error("The tracker session ended before replying")]
+    Dropped,
+}
+
+impl External for DeviceCallError {
+    fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+fn log_value(value: &LogValue) -> String {
+    match value {
+        LogValue::Int(n) => n.to_string(),
+        LogValue::Float(x) => x.to_string(),
+        LogValue::Bool(flag) => flag.to_string(),
+        LogValue::Text(text) => text.clone(),
+        LogValue::StimulusPoints(points) => format!("{} point(s)", points.len()),
+    }
+}
+
+fn log_record(record: &LogRecord) {
+    let values: Vec<String> =
+        record.values.iter().map(|(name, value)| format!("{name}={}", log_value(value))).collect();
+    log::info!("{} {}", record.kind, values.join(" "));
 }
 
 /// Service-clock microseconds as the game's QueryPerformanceCounter microseconds.
@@ -205,6 +245,7 @@ struct Inner {
     presence: Cell<UserPresence>,
     tracker_attached: Cell<bool>,
     calibration_id: Cell<u32>,
+    device: RefCell<Option<std::sync::mpsc::Sender<DeviceRequest>>>,
 }
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
@@ -304,6 +345,7 @@ impl PrpService {
             presence: Cell::new(UserPresence::default()),
             tracker_attached: Cell::new(false),
             calibration_id: Cell::new(0),
+            device: RefCell::new(None),
         }))
     }
 
@@ -400,6 +442,67 @@ impl PrpService {
             Event::Presence(time_us, value) => self.publish_presence(time_us, value),
             Event::Device(replies) => self.attach_device(*replies),
             Event::DeviceStream(message, time_us) => self.publish_device_stream(&message, time_us),
+            Event::Requests(sender) => self.set_device(Some(sender)),
+        }
+    }
+
+    /// Where device requests go; `None` while no session runs.
+    pub fn set_device(&self, sender: Option<std::sync::mpsc::Sender<DeviceRequest>>) {
+        *self.0.device.borrow_mut() = sender;
+    }
+
+    /// Sends the request `build` makes through the running tracker session and waits for
+    /// the reply, which fails on a nonzero status or when none arrives within `timeout`.
+    pub async fn device_call(
+        &self,
+        build: impl FnOnce(u32) -> Result<Message, ProtocolError> + Send + 'static,
+        timeout: Duration,
+    ) -> Result<Message, DeviceCallError> {
+        let Some(sender) = self.0.device.borrow().clone() else { return Err(DeviceCallError::NotAttached) };
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        sender
+            .send(DeviceRequest { build: Box::new(build), timeout, reply })
+            .map_err(|_| DeviceCallError::NotAttached)?;
+        match replied.await {
+            Ok(outcome) => outcome.map_err(DeviceCallError::Device),
+            Err(_) => Err(DeviceCallError::Dropped),
+        }
+    }
+
+    /// Drives an operation that only sends requests (profile switching) on the running session.
+    pub async fn run_operation<T>(
+        &self,
+        mut operation: Operation<T, DeviceCallError>,
+    ) -> OperationResult<T, DeviceCallError> {
+        let start = Instant::now();
+        let mut input = Input::Start;
+        loop {
+            let action = match operation.resume(input, start.elapsed().as_secs_f64()) {
+                Step::Finished(result) => return result,
+                Step::Action(action) => action,
+            };
+            input = match action {
+                Action::Call(call) => {
+                    let timeout =
+                        call.timeout_s.map_or(tobii_device::session::REQUEST_TIMEOUT, Duration::from_secs_f64);
+                    let reply = self.device_call(move |id| Ok(call.request(id)), timeout).await;
+                    match reply.and_then(|reply| {
+                        tobii_protocol::fields::values(&reply.payload)
+                            .map_err(|error| DeviceCallError::Device(error.into()))
+                    }) {
+                        Ok(values) => Input::Replied(values),
+                        Err(error) => Input::Failed(error),
+                    }
+                }
+                Action::Check => Input::Done,
+                Action::Log(record) => {
+                    log_record(&record);
+                    Input::Done
+                }
+                other => {
+                    return Err(OperationError::Gaze(GazeError::Value(format!("The service cannot drive {other:?}"))));
+                }
+            };
         }
     }
 
@@ -424,6 +527,7 @@ impl PrpService {
             log::info!("tracker detached; closing {} client connection(s)", self.0.connections.borrow().len());
         }
         self.0.tracker_attached.set(false);
+        self.set_device(None);
         let connections = self.0.connections.borrow().clone();
         for connection in connections {
             connection.link.close();
