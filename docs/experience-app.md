@@ -378,8 +378,8 @@ Dialog geometry and style (`QDV:ConfirmationDialogWindow.xaml:2,191-274`):
 | Title text | style H3 (16 pt) with foreground `#FF000000`, margin `40 80 40 20`, wraps |
 | Body text | style Body (12 pt) with foreground black, margin `40 0 40 0`, wraps |
 | Bottom row | docked bottom, margin `0 0 10 10`: checkbox left (margin `20 10 20 0`, scaled 1.5 x 1.5, label Body style 8 pt black, margin `0 2 0 0`); Cancel and Confirm docked right, Cancel declared first so it is the right-most; both 40 px high, 12 pt |
-| Cancel | `TobiiButtonStyle` (5.4) |
-| Confirm | `TobiiActionButtonStyle`: as `TobiiButtonStyle` but fill `#008DBF`, hover `#00ACE9`, pressed `#00BEFF`, padding `25 0`, min size 120 x 33 (`BR:buttons.xaml:349-682`) |
+| Cancel | `TobiiButtonStyle` unchanged: padding `25 0`, min size 120 x 33, fill `#004B66`, text `#D9F4FF`; height 40 and 12 pt set on the button (`QDV:ConfirmationDialogWindow.xaml:240`; 5.4, first table) |
+| Confirm | `TobiiActionButtonStyle` (`QDV:ConfirmationDialogWindow.xaml:256`): padding, min size and text colour are the same as `TobiiButtonStyle` (`BR:buttons.xaml:355-357` vs `:21-23`); only the fills differ: normal `#008DBF` (`:367`), hover `#00ACE9`, pressed `#00BEFF` (`BR:buttons.xaml:349-682`) |
 | Not read | which title bar buttons the dialog shows (`BR:titlebar.xaml`) |
 
 Linux: same strings and quit semantics (decision, spec 7). Linux differs (why)
@@ -749,9 +749,20 @@ The scale applies to the knob only (`:61-80`).
 
 ### 5.4 Buttons
 
-`GazeEnabledButton` (`TH:tobiistyleguide.xaml:3-32`) on `TobiiButtonStyle`
-(`BR:buttons.xaml:15-348`): "Improve calibration", "Set up display" and the
-dialog's Cancel.
+`TobiiButtonStyle` (`BR:buttons.xaml:15-348`) is the base pill button and is
+used as is by the quit dialog's Cancel:
+
+| Part | Value |
+| --- | --- |
+| Padding | `25 0` (`BR:buttons.xaml:21`) |
+| Size | min width 120 (`:22`), min height 33 (`:23`) |
+| Font | `TobiiFontFamily` (`:38`); the size is set by the user of the style (the dialog sets 12 pt and height 40) |
+| Colours | text `#D9F4FF` (`:24-30`), fill `#004B66` (`:31-37`) |
+| Shape, states, transitions | as in the table below (`:60-97,111-162,267-345`); only padding, size and margin differ |
+
+`GazeEnabledButton` (`TH:tobiistyleguide.xaml:3-32`) is `TobiiButtonStyle` with
+the overrides below. It is used for "Improve calibration" and "Set up display"
+on the page, not in the dialog:
 
 | Part | Value |
 | --- | --- |
