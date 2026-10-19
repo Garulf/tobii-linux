@@ -11,6 +11,8 @@ gtk = []
 
 [dependencies]
 tobii-control.workspace = true
+ksni.workspace = true
+png.workspace = true
 
 [lints]
 workspace = true

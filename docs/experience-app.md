@@ -248,6 +248,20 @@ Spinner animation (question (i)):
   on the Home page banner and the overview overlay, not on the Eye tracking page
   and not in the tray (`VIEW:HomePage.xaml:265`, `VIEW:OverviewPage.xaml:25`).
 
+Tray artwork (Linux): the icons in `crates/tobii-experience/assets/tray/` are this project's
+own, drawn by `tools/draw_tray_icons.py` with the standard library only; it prints the
+SHA-256 of each PNG, and `tests/test_draw_tray_icons.py` checks the committed icons against
+it:
+
+    python3 tools/draw_tray_icons.py
+
+They take the roles of Tobii's `Enabled`, `Disabled`, `GetStarted` and `Progress` icons
+without copying them: a blue eye for Enabled, the same eye in grey with a slash for Disabled,
+the blue eye with an amber dot for GetStarted, and a ring of fading dots for Progress.
+`Enabled`, `Disabled` and `GetStarted` are 33 x 33 like Tobii's. A PNG holds one image, so
+`Progress` ships as `Progress-16.png` to `Progress-64.png` (16, 24, 32, 48, 64 px: the sizes a
+tray draws). They are sizes of one static image, not animation frames.
+
 ### 1.4 Interaction and menu
 
 - Left click: `MouseClick` with the left button flag `0x100000` raises

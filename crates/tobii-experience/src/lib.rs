@@ -3,8 +3,10 @@
 
 pub mod link;
 pub mod status;
+pub mod tray;
 
 pub use link::{Link, LinkUpdate};
 pub use status::{
     DeviceStatus, IconName, IconState, OPEN_TEXT, QUIT_TEXT, device_status, enable_disable_text, icon_info, icon_state,
 };
+pub use tray::{Tray, TrayAction};

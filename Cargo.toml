@@ -33,6 +33,8 @@ miniz_oxide = "0.8"
 roxmltree = "0.21"
 sha2 = "0.11"
 libloading = "0.9"
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+png = "0.18"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
