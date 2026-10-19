@@ -12,9 +12,9 @@ use std::time::Duration;
 use common::*;
 use tobii_device::channel::{Channel, ChannelError};
 use tobii_device::session::TrackerSession;
+use tobii_linux::service::PrpService;
 use tobii_linux::service::clock::{Clocks, wine_clock};
 use tobii_linux::service::tet_tcp::TetTcpService;
-use tobii_linux::service::{Options, PrpService};
 use tobii_linux::tracker::DeviceReplies;
 use tobii_protocol::Message;
 use tobii_protocol::commands::{
@@ -25,6 +25,7 @@ use tobii_protocol::fields::{encode_payload, int32_field};
 use tobii_protocol::gaze::build::{columns_payload, int64_column, uint32_column, vec2_column};
 use tobii_protocol::gaze::decode_gaze_message;
 use tobii_protocol::ttp::{Decoder, REQUEST_KIND, protocol_upgrade};
+use tobii_service::prp_service::DEFAULT_NAME;
 use tobii_service::qpc_clock::encode_qpc_report;
 use tobii_service::tet_tcp::{DISPLAY_AREA_WRITABLE, GAZE_STREAM, PRESENCE_STREAM, UNSUPPORTED_OPERATION};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -135,7 +136,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let clock = wine_clock("raw", Clocks::Scripted(Arc::new(|_| HOST_US))).unwrap();
-        let (prp, port, _) = service(Options::default(), clock).await;
+        let (prp, port, _) = service(common::options(DEFAULT_NAME), clock).await;
         let counter = (HOST_US - GAME_OFFSET_US) as u64 * 10;
         Bridge::attach(port).await.report(&prp, &encode_qpc_report(counter, 10_000_000, &[])).await;
         let service = TetTcpService::new(prp.game_time().clone(), "127.0.0.1".into(), 0);
