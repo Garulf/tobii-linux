@@ -28,6 +28,12 @@ pub const FRAME_REPLY_PIPE: u32 = 4;
 pub const FRAME_MESSAGE: u32 = 5;
 pub const FRAME_DISPLAY_ID: u32 = 6;
 pub const FRAME_QPC: u32 = 7;
+/// First frame of a control connection (docs/control-channel.md); tobii-linux's own, not Tobii's.
+pub const FRAME_CONTROL_HELLO: u32 = 8;
+pub const FRAME_CONTROL_REQUEST: u32 = 9;
+pub const FRAME_CONTROL_REPLY: u32 = 10;
+pub const FRAME_CONTROL_EVENT: u32 = 11;
+pub const FRAME_CONTROL_GAZE: u32 = 12;
 pub const MAX_FRAME: usize = 1 << 20;
 pub const DEFAULT_PORT: u16 = 7760;
 pub const DEFAULT_NAME: &str = "ET5-LINUX";

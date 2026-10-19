@@ -14,6 +14,7 @@
 //! tobii_service::prp_service; this module runs them on a single-threaded tokio loop.
 
 pub mod clock;
+pub mod control;
 pub mod enabled;
 pub mod hub;
 pub mod link;
@@ -35,16 +36,17 @@ use tobii_gaze::error::GazeError;
 use tobii_gaze::operation::{
     Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
 };
+use tobii_gaze::profiles::ProfileStore;
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
 use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
 use tobii_service::prp_service::{
-    self as decisions, FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
-    GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS, LICENSED_SUBSCRIPTIONS,
-    PROPERTY_DEVICE_PAUSED, PropertySource, STATUS_CONNECTION_FAILED, STATUS_INSUFFICIENT_LICENSE,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence, display_area_notification, encode_names,
-    paused_notification,
+    self as decisions, FRAME_BRIDGE_HELLO, FRAME_CONTROL_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES,
+    FRAME_QPC, FRAME_REPLY_PIPE, GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS,
+    LICENSED_SUBSCRIPTIONS, PROPERTY_DEVICE_PAUSED, PropertySource, STATUS_CONNECTION_FAILED,
+    STATUS_INSUFFICIENT_LICENSE, STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence,
+    display_area_notification, encode_names, paused_notification,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
@@ -61,6 +63,7 @@ use tobii_service::qpc_clock::{Basis, ClockSwitch, CounterMapping, QpcClockFollo
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::cli::ReleaseGate;
 use crate::tracker::{DeviceReplies, DeviceRequest};
 use clock::{Clock, now_us, readings};
 use enabled::EnabledState;
@@ -93,6 +96,8 @@ pub struct Options {
     pub compensate_sesp_position: bool,
     /// Where the on/off state is kept; `None` keeps it in memory, enabled at start.
     pub enabled_state: Option<PathBuf>,
+    /// The profiles directory the control status reads; `None` uses the default location.
+    pub profiles: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -108,6 +113,7 @@ impl Default for Options {
             tet_tcp_port: tobii_service::tet_tcp::COMMAND_PORT,
             compensate_sesp_position: true,
             enabled_state: None,
+            profiles: None,
         }
     }
 }
@@ -261,6 +267,11 @@ struct Inner {
     device: RefCell<Option<std::sync::mpsc::Sender<DeviceRequest>>>,
     enabled_state: Option<EnabledState>,
     paused: Arc<AtomicBool>,
+    profiles: ProfileStore,
+    controls: RefCell<Vec<Rc<control::ControlConnection>>>,
+    control_keys: Cell<u64>,
+    release_gate: Arc<ReleaseGate>,
+    release_holder: Cell<Option<u64>>,
 }
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
@@ -370,6 +381,11 @@ impl PrpService {
             device: RefCell::new(None),
             enabled_state,
             paused: Arc::new(AtomicBool::new(!enabled)),
+            profiles: options.profiles.map_or_else(ProfileStore::default_location, ProfileStore::new),
+            controls: RefCell::new(Vec::new()),
+            control_keys: Cell::new(0),
+            release_gate: Arc::new(ReleaseGate::default()),
+            release_holder: Cell::new(None),
         }))
     }
 
@@ -407,6 +423,11 @@ impl PrpService {
     /// with it set and do not take its silence for a lost tracker.
     pub fn pause_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.0.paused)
+    }
+
+    /// The gate through which control clients borrow the tracker; tracker sessions wait on it.
+    pub fn release_gate(&self) -> Arc<ReleaseGate> {
+        Arc::clone(&self.0.release_gate)
     }
 
     pub fn tracker_attached(&self) -> bool {
@@ -478,6 +499,7 @@ impl PrpService {
                 if let Some(hub) = &self.0.gaze_hub {
                     hub.publish(&frame);
                 }
+                self.publish_control_gaze(&frame);
             }
             Event::Presence(time_us, value) => self.publish_presence(time_us, value),
             Event::Device(replies) => self.attach_device(*replies),
@@ -524,6 +546,7 @@ impl PrpService {
         if was_paused == enabled {
             self.notify(PROPERTY_DEVICE_PAUSED, &paused_notification(!enabled));
             log::info!("eye tracking {}", if enabled { "enabled" } else { "disabled" });
+            self.broadcast_status();
         }
         Ok(())
     }
@@ -588,6 +611,7 @@ impl PrpService {
             log::info!("tracker attached; accepting game clients (calibration id {:#x})", self.0.calibration_id.get());
         }
         self.0.tracker_attached.set(true);
+        self.broadcast_status();
     }
 
     /// Stores the tracker's display area and notifies property 1 subscribers when it changed.
@@ -610,7 +634,7 @@ impl PrpService {
     ///
     /// The real service shuts its server down when the device is removed or the host goes
     /// to sleep, destroying every command, subscription and timesync client, and listens
-    /// again once the device is re-added; clients reconnect.
+    /// again once the device is re-added; clients reconnect. Control connections stay.
     pub fn detach_tracker(&self) {
         if self.0.tracker_attached.get() {
             log::info!("tracker detached; closing {} client connection(s)", self.0.connections.borrow().len());
@@ -635,6 +659,7 @@ impl PrpService {
         if let Some(tet_tcp) = &self.0.tet_tcp {
             tet_tcp.detach();
         }
+        self.broadcast_status();
     }
 
     /// One platmod presence record on the service clock; pushes operation 2 when due.
@@ -986,6 +1011,7 @@ impl PrpService {
                     link.frame(FRAME_PIPES, &encode_names(&self.pipe_names())?);
                     self.serve_bridge(&peer, &link, &mut frames).await
                 }
+                FRAME_CONTROL_HELLO => control::serve(self, link.clone(), &mut frames, &payload).await,
                 FRAME_PIPE_OPEN => {
                     let (client_pid, pipe) = decisions::decode_pipe_open(&payload)?;
                     if !self.0.tracker_attached.get() {
@@ -1166,7 +1192,7 @@ impl PrpService {
         })
     }
 
-    /// Disconnects every client and bridge.
+    /// Disconnects every client, control connection and bridge.
     pub fn close(&self) {
         self.detach_tracker();
         if let Some(tet_tcp) = &self.0.tet_tcp {
@@ -1176,6 +1202,7 @@ impl PrpService {
         for bridge in bridges {
             bridge.link.close();
         }
+        self.close_controls();
     }
 
     /// Applies the events of a tracker session until their sender is dropped.

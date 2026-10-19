@@ -1,0 +1,138 @@
+# Control channel
+
+The Tobii Experience app (tray, settings, gaze bubble) and `tobii-linux-setup`
+talk to a running `tobii-linux serve` over a small control channel on the
+service's relay TCP port (default `127.0.0.1:7760`). This is tobii-linux's own
+protocol. Tobii's runtime has nothing like it: on Windows the Experience app
+and the setup tools reach the service through the platform runtime's PRP
+property and calibration commands, whose write layouts have not been recovered
+([experience-app.md](experience-app.md)). Games never use this channel; they
+still see Tobii's real property 4 (device paused) and its notifications over
+PRP ([prp-bridge.md](prp-bridge.md)).
+
+The messages and a blocking client are `crates/tobii-control`; the service side
+is `crates/tobii-linux/src/service/control.rs`.
+
+Evidence labels:
+
+- **unit**: `crates/tobii-control/src/protocol.rs` tests, no network.
+- **service**: `crates/tobii-linux/tests/control.rs`, the blocking client
+  against the service over loopback TCP, fed by scripted trackers (no USB).
+
+## Frames
+
+Control connections use the relay framing of the bridge (`u32 type, u32
+length, payload`, little-endian, payload at most 1 MiB,
+[prp-bridge.md](prp-bridge.md#relay-protocol)). Types 8 to 12 follow the
+bridge's 1 to 7 on the same port.
+
+| Type | Name | Direction | Payload |
+| --- | --- | --- | --- |
+| 8 | `CONTROL_HELLO` | client to service, first frame | JSON `{"version":1,"client":"experience"}`; `client` is `experience` or `setup` and only appears in the log |
+| 9 | `CONTROL_REQUEST` | client to service | JSON request with a client-chosen `id` |
+| 10 | `CONTROL_REPLY` | service to client | JSON reply echoing the request's `id` |
+| 11 | `CONTROL_EVENT` | service to client | JSON event |
+| 12 | `CONTROL_GAZE` | service to client, while subscribed | 28 bytes: i64 timestamp (µs), f64 x, f64 y, u32 valid |
+
+A HELLO with another version, a frame of another type after the HELLO, or a
+request that is not JSON with an `id` makes the service close the connection
+(logged as a warning). A request with an `id` that does not decode is answered
+with an error reply.
+
+## Requests
+
+Every request is answered by exactly one reply. Requests on one connection are
+handled in the order sent, one at a time, so replies come back in request
+order. A reply carries either the service status after the request or an error:
+
+```json
+{"id":1,"request":"status"}
+{"id":1,"status":{"attached":true,"enabled":true,"released":false,"display_area":true,"profile":"Default","calibration_matches_profile":false}}
+
+{"id":2,"request":{"set_tracked_eyes":"left"}}
+{"id":2,"error":"unsupported"}
+```
+
+| Request | JSON | Effect | Reaches the device |
+| --- | --- | --- | --- |
+| Status | `"status"` | none | no |
+| SetEnabled | `{"set_enabled":false}` | stores the on/off state, then pauses or resumes the tracker for every client, as the tray's toggle does | yes: the running session sends 3100 (pause 1, resume 0); a session that starts later pauses first |
+| SwitchProfile | `{"switch_profile":{"name":"Guest"}}` | refused with `unsupported` for now | not yet |
+| SetTrackedEyes | `{"set_tracked_eyes":"both"}` (`both`, `left`, `right`) | refused with `unsupported` for now | not yet |
+| Release | `"release"` | lends the tracker to this client (see below) | closes USB |
+| Reacquire | `"reacquire"` | ends a release held by this client | the next session opens USB |
+| SubscribeGaze | `{"subscribe_gaze":true}` | starts or stops `CONTROL_GAZE` frames on this connection | no |
+
+`SetEnabled` fails with an error reply when the state cannot be stored; nothing
+changes then.
+
+Tracked eyes use Tobii's registry encoding `both 0, left 1, right 2`
+(`TrackedEyes::registry_value`) and the device's eye selector `both 3, left 1,
+right 2` (`TrackedEyes::device_eye`).
+
+## Status and events
+
+| Field | Meaning |
+| --- | --- |
+| `attached` | a tracker session runs; false while released |
+| `enabled` | eye tracking is on |
+| `released` | a control client holds the tracker |
+| `display_area` | the service has a display area, from `--display` or read from the tracker |
+| `profile` | the current profile name from the profile store, or `null` |
+| `calibration_matches_profile` | always `false` for now |
+
+Right after accepting the HELLO the service sends one status event, so a client
+learns the state without asking:
+
+```json
+{"status":{"attached":false,"enabled":true,"released":false,"display_area":false,"profile":null,"calibration_matches_profile":false}}
+```
+
+After that it sends a status event to every control connection whenever the
+status differs from the last one that connection was sent: on tracker attach
+and detach, on/off, release and reacquire, a display area read at attach. The
+profile is read when an event is due; changing the profile file alone sends
+nothing. When a request changes the status, its event comes before its reply.
+Mapping the status to Tobii's device states (Configuring while released, Device
+not connected while detached) is the app's job.
+
+Control connections are not part of the game clients: they stay open when the
+tracker is lost, while it is released and while eye tracking is off (service).
+
+## Gaze
+
+`CONTROL_GAZE` carries the gaze point record games get as PRP stream 3: x and y
+normalized to the display (0,0 top left, 1,1 bottom right), valid when the
+device reported a combined gaze point. The timestamp is the service's host
+clock in microseconds. Frames are sent while the connection is subscribed,
+whether or not `serve` serves gaze to games (`--no-gaze`); a slow client misses
+frames instead of queueing them (service).
+
+## Release lifecycle
+
+`tobii-linux-setup` opens the tracker's USB device itself, so it asks the
+service to let go first:
+
+1. Setup connects (`client` `setup`) and sends `release`.
+2. The service holds its release gate and sends a status event with
+   `released: true`, `attached: false`. The running tracker session sees the
+   gate, unsubscribes its streams and closes USB; games see the tracker as
+   lost, as on an unplug.
+3. The service replies once the session has closed USB, so setup can open the
+   device as soon as the reply arrives (service).
+4. While the gate is held the service opens no session; its retry loop waits
+   on the gate (service).
+5. Setup sends `reacquire`, or its connection closes for any reason, including
+   a crash. The gate opens, the service reports `released: false`, and the
+   next session starts within the retry delay (service).
+
+Only the client holding the release can reacquire; a second `release` or a
+`reacquire` from another client gets an error reply (service).
+
+## What remains
+
+- `switch_profile` and `set_tracked_eyes` answer `unsupported` until the
+  service puts profiles and tracked eyes on the device.
+- `calibration_matches_profile` is always `false` until the service compares
+  the device's calibration with the current profile.
+- Not run against a real tracker or the GTK apps yet.

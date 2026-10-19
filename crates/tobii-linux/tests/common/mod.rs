@@ -247,3 +247,4 @@ pub fn take_logs(level: log::Level) -> Vec<String> {
 }
 
 pub mod fake_tracker;
+pub mod link;

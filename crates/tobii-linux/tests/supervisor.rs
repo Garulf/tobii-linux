@@ -6,24 +6,19 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::fake_tracker::{DEVICE_AREA, FakeTracker};
+use common::link::{Link, Plugged, WAIT, plug, until};
 use common::*;
 use tobii_device::streams::SILENCE_TIMEOUT;
-use tobii_device::supervisor::{Backoff, LinkCounters, TrackerLink};
-use tobii_device::{CameraCalibration, DeviceError, StopFlag, TrackerSession};
+use tobii_device::{DeviceError, TrackerSession};
 use tobii_gaze::operation::{Operation, OperationError};
-use tobii_headpose::pipeline::HeadPoseSample;
-use tobii_linux::cli::{ServiceLink, service_feed};
-use tobii_linux::error::Result;
-use tobii_linux::service::clock::{Clocks, ServiceTime, wine_clock};
+use tobii_linux::service::clock::{Clocks, wine_clock};
 use tobii_linux::service::enabled::EnabledState;
 use tobii_linux::service::{Corners, DeviceCallError, Options, PrpService};
-use tobii_linux::tracker::{FrameProcessor, HostTime};
 use tobii_protocol::commands::{Stream, command, header_only_request, unsubscribe_stream};
 use tobii_protocol::fields::{Value, values};
 use tobii_protocol::gaze::PRESENCE_PRESENT;
@@ -38,133 +33,6 @@ use tobii_service::prp_session::{
     encode_property_subscribe_request, encode_stream_request,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const WAIT: Duration = Duration::from_secs(5);
-
-/// Counts calibrations and keeps the display areas it is given; every sample is invalid.
-struct FakeProcessor {
-    starts: Arc<AtomicUsize>,
-    areas: Arc<Mutex<Vec<Corners>>>,
-}
-
-impl FrameProcessor for FakeProcessor {
-    fn set_display_area(&mut self, area: &Corners) {
-        self.areas.lock().unwrap().push(*area);
-    }
-
-    fn start(&mut self, _: &CameraCalibration) {
-        self.starts.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn process(&mut self, frame: &tobii_protocol::frames::ImageFrame) -> Result<HeadPoseSample> {
-        Ok(HeadPoseSample {
-            timestamp_us: frame.timestamp,
-            valid: false,
-            position_mm: [0.0; 3],
-            rotation_rad: [0.0; 3],
-        })
-    }
-}
-
-/// The tracker the next session finds, if any.
-type Plugged = Arc<Mutex<Option<FakeTracker>>>;
-
-fn plug(slot: &Plugged, device: Option<FakeTracker>) {
-    *slot.lock().unwrap() = device;
-}
-
-fn open(slot: &Plugged) -> Result<TrackerSession<FakeTracker>> {
-    let device = slot.lock().unwrap().clone();
-    let device = device.ok_or_else(|| DeviceError::NoTracker("No Eye Tracker 5 is visible to libusb".into()))?;
-    let mut session = TrackerSession::new(device);
-    session.initialize()?;
-    Ok(session)
-}
-
-/// `cli.service_link` of the Python tests: a TrackerLink thread feeding `service`.
-struct Link {
-    stop: StopFlag,
-    counters: Arc<LinkCounters>,
-    starts: Arc<AtomicUsize>,
-    areas: Arc<Mutex<Vec<Corners>>>,
-    streams: Arc<Mutex<Option<BTreeSet<u32>>>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Link {
-    fn start(service: &PrpService, tet_tcp: bool, slot: &Plugged) -> Self {
-        Self::with_display(service, tet_tcp, slot, None)
-    }
-
-    /// A link whose sessions use `display_area` instead of the tracker's.
-    fn with_display(service: &PrpService, tet_tcp: bool, slot: &Plugged, display_area: Option<Corners>) -> Self {
-        let (events, received) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let service = service.clone();
-            tokio::task::spawn_local(async move { service.follow(received).await });
-        }
-        let mut feed = service_feed(&events, false, tet_tcp);
-        let streams: Arc<Mutex<Option<BTreeSet<u32>>>> = Arc::default();
-        if let Some(device) = feed.device.take() {
-            let streams = Arc::clone(&streams);
-            feed.device = Some(Box::new(move |replies| {
-                *streams.lock().unwrap() = Some(replies.streams.clone());
-                device(replies);
-            }));
-        }
-        let clock = HostTime(Arc::new(ServiceTime(Arc::clone(service.clock()))));
-        let paused = service.pause_flag();
-        let mut link = TrackerLink::new(Backoff::new(0.02, 0.05, 10.0));
-        let (stop, counters, starts) = (StopFlag::new(), Arc::clone(&link.counters), Arc::new(AtomicUsize::new(0)));
-        let areas: Arc<Mutex<Vec<Corners>>> = Arc::default();
-        let thread = {
-            let (stop, starts, slot) = (stop.clone(), Arc::clone(&starts), Arc::clone(slot));
-            let areas = Arc::clone(&areas);
-            std::thread::spawn(move || {
-                let mut processor = FakeProcessor { starts, areas };
-                let mut open = || open(&slot);
-                let mut host = ServiceLink {
-                    open: &mut open,
-                    processor: &mut processor,
-                    clock,
-                    feed: &feed,
-                    events,
-                    paused,
-                    display_area,
-                };
-                link.run(&mut host, &stop);
-            })
-        };
-        Self { stop, counters, starts, areas, streams, thread: Some(thread) }
-    }
-
-    fn sessions_and_failures(&self) -> (u64, u64) {
-        (self.counters.sessions(), self.counters.failures())
-    }
-
-    /// Stops the link and waits for its thread; true when it finished in time.
-    async fn stop(&mut self) -> bool {
-        self.stop.set();
-        let Some(thread) = self.thread.take() else { return true };
-        let deadline = Instant::now() + WAIT;
-        while !thread.is_finished() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let finished = thread.is_finished();
-        if finished {
-            thread.join().unwrap();
-        }
-        finished
-    }
-}
-
-async fn until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !condition() {
-        assert!(Instant::now() < deadline, "condition not reached: {what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
 
 async fn service(options: Options) -> (PrpService, u16, tokio::task::JoinHandle<()>) {
     common::service(options, wine_clock("auto", Clocks::Host).unwrap()).await

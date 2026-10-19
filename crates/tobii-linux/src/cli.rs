@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tobii_device::streams::HostSuspendWatch;
 use tobii_device::supervisor::{Backoff, LinkHost, LinkState, TrackerLink};
@@ -205,6 +205,121 @@ impl Serve {
     }
 }
 
+/// How often a wait on the gate looks at the process-wide stop signal.
+const GATE_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Lends the tracker to another program (`tobii-linux-setup`) through the control channel.
+///
+/// While the gate is held the running session stops and no new one opens USB. Sessions take
+/// a [`UsbClaim`] before opening the tracker and drop it after closing it, so a holder can
+/// wait in [`ReleaseGate::closed`] until USB is free.
+#[derive(Debug)]
+pub struct ReleaseGate {
+    held: Mutex<bool>,
+    changed: Condvar,
+    usb: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ReleaseGate {
+    fn default() -> Self {
+        Self { held: Mutex::new(false), changed: Condvar::new(), usb: tokio::sync::watch::Sender::new(false) }
+    }
+}
+
+impl ReleaseGate {
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set(&self, held: bool) {
+        *self.lock() = held;
+        self.changed.notify_all();
+    }
+
+    /// Stops the running session and keeps new ones from opening the tracker.
+    pub fn hold(&self) {
+        self.set(true);
+    }
+
+    pub fn open(&self) {
+        self.set(false);
+    }
+
+    pub fn is_held(&self) -> bool {
+        *self.lock()
+    }
+
+    /// Whether a session holds the tracker's USB device.
+    pub fn usb_open(&self) -> bool {
+        *self.usb.borrow()
+    }
+
+    /// Waits until the gate is open, then claims USB until the claim is dropped; `None` when
+    /// `stop` is set first.
+    pub fn wait_open(&self, stop: &dyn StopSignal) -> Option<UsbClaim<'_>> {
+        let mut held = self.lock();
+        loop {
+            if stop.is_set() {
+                return None;
+            }
+            if !*held {
+                self.usb.send_replace(true);
+                return Some(UsbClaim(self));
+            }
+            held = self.changed.wait_timeout(held, GATE_STOP_POLL).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// Waits up to `timeout` until the gate is held or `stop` is set; true when either is.
+    fn wait_held(&self, stop: &dyn StopSignal, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut held = self.lock();
+        loop {
+            if *held || stop.is_set() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let slice = remaining.min(GATE_STOP_POLL);
+            held = self.changed.wait_timeout(held, slice).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// Returns once no session holds USB.
+    pub async fn closed(&self) {
+        let mut usb = self.usb.subscribe();
+        let _ = usb.wait_for(|open| !open).await;
+    }
+}
+
+/// A session's hold on the tracker's USB device, taken from [`ReleaseGate::wait_open`].
+#[derive(Debug)]
+pub struct UsbClaim<'a>(&'a ReleaseGate);
+
+impl Drop for UsbClaim<'_> {
+    fn drop(&mut self) {
+        self.0.usb.send_replace(false);
+    }
+}
+
+/// A session's stop: the process-wide one, or the gate being held.
+struct SessionStop<'a> {
+    stop: &'a dyn StopSignal,
+    gate: &'a ReleaseGate,
+}
+
+impl StopSignal for SessionStop<'_> {
+    fn is_set(&self) -> bool {
+        self.stop.is_set() || self.gate.is_held()
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        self.gate.wait_held(self.stop, timeout)
+    }
+}
+
 /// Opens a started tracker session: the USB tracker, or a scripted one in tests.
 pub type OpenTracker<'a, C> = &'a mut dyn FnMut() -> Result<TrackerSession<C>>;
 
@@ -217,6 +332,8 @@ pub struct ServiceLink<'a, C> {
     pub events: mpsc::UnboundedSender<Event>,
     /// The service's pause flag, set while eye tracking is off.
     pub paused: Arc<AtomicBool>,
+    /// The service's release gate; sessions open the tracker only while it is open.
+    pub gate: Arc<ReleaseGate>,
     /// The configured display area; each session reads the tracker's when `None`.
     pub display_area: Option<Corners>,
 }
@@ -232,11 +349,14 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
 
     fn on_state(&mut self, state: LinkState, detail: &str) -> Result<()> {
         let _ = self.events.send(Event::Detach);
+        let detail = if state == LinkState::Lost && self.gate.is_held() { "Released to a client" } else { detail };
         log::info!("tracker {}: {detail}", state.name());
         Ok(())
     }
 
     fn attempt(&mut self, stop: &dyn StopSignal, opened: &mut dyn FnMut()) -> Result<()> {
+        let gate = Arc::clone(&self.gate);
+        let Some(_usb) = gate.wait_open(stop) else { return Ok(()) };
         let mut session = (self.open)()?;
         opened();
         let (requests, inbox) = std::sync::mpsc::channel();
@@ -248,7 +368,7 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
             self.processor,
             self.clock.clone(),
             self.feed,
-            stop,
+            &SessionStop { stop, gate: &gate },
             Some(suspend),
             Some(inbox),
             paused,
@@ -268,7 +388,10 @@ fn rustix_monotonic() -> i64 {
 }
 
 /// The feed of one service: every callback posts an event to the service's loop.
-pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: bool) -> ServiceFeed {
+///
+/// Gaze frames are always posted, for the control channel; whether games get gaze streams
+/// is the service's `gaze` option.
+pub fn service_feed(events: &mpsc::UnboundedSender<Event>, tet_tcp: bool) -> ServiceFeed {
     let post = |events: &mpsc::UnboundedSender<Event>| {
         let events = events.clone();
         move |event: Event| {
@@ -279,7 +402,7 @@ pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: 
     let (gaze_post, device, device_stream) = (post(events), post(events), post(events));
     ServiceFeed {
         sample: Some(Box::new(move |s| sample(Event::Sample(s)))),
-        gaze: gaze.then(|| Box::new(move |frame| gaze_post(Event::Gaze(Box::new(frame)))) as Box<_>),
+        gaze: Some(Box::new(move |frame| gaze_post(Event::Gaze(Box::new(frame))))),
         presence: Some(Box::new(move |time_us, value| presence(Event::Presence(time_us, value)))),
         started: Some(Box::new(move |calibration_id, display_area| {
             started(Event::Attach(calibration_id, display_area))
@@ -332,8 +455,8 @@ async fn run_service(
         let service = service.clone();
         tokio::task::spawn_local(async move { service.follow(received).await })
     };
-    let feed = service_feed(&events, arguments.options.gaze, arguments.options.tet_tcp);
-    let paused = service.pause_flag();
+    let feed = service_feed(&events, arguments.options.tet_tcp);
+    let (paused, gate) = (service.pause_flag(), service.release_gate());
     let stop = StopFlag::new();
     let (finished, done) = tokio::sync::oneshot::channel::<(u64, u64)>();
     let link_thread = {
@@ -351,6 +474,7 @@ async fn run_service(
                 feed: &feed,
                 events,
                 paused,
+                gate,
                 display_area: session.corners,
             };
             link.run(&mut host, &stop);

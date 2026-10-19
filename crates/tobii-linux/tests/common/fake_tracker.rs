@@ -16,7 +16,7 @@ use tobii_protocol::camera_info::{CameraRecord, HardwareInfo, hardware_info_resp
 use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device};
 use tobii_protocol::fields::{array_fields, encode_payload, int32_field, triple_fixed42_fields, uint32_field};
 use tobii_protocol::gaze::PLATMOD_PRESENT;
-use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column};
+use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column, vec2_column};
 use tobii_protocol::ttp::{Decoder, Field};
 
 const SALT: &[u8] = b"0123456789abcdef";
@@ -62,6 +62,15 @@ pub fn image_message_at(timestamp: i64) -> Message {
 }
 
 pub const IMAGE_TIMESTAMP: i64 = 123_456_789;
+
+/// The combined gaze point of [`gaze_point_message`], normalized display coordinates.
+pub const GAZE_POINT: [f64; 2] = [0.25, 0.75];
+
+/// A valid combined gaze point at `timestamp`.
+pub fn gaze_point_message(timestamp: i64) -> Message {
+    let point = vec2_column(GAZE_POINT).unwrap();
+    gaze_columns_message(&[(1, int64_column(timestamp)), (27, uint32_column(1)), (28, point)])
+}
 
 pub fn image_message() -> Message {
     image_message_at(IMAGE_TIMESTAMP)
@@ -142,6 +151,7 @@ struct Device {
     paused: bool,
     pause_status: u32,
     display_area: Option<[[f64; 3]; 3]>,
+    gaze: bool,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -171,6 +181,7 @@ impl FakeTracker {
             paused: false,
             pause_status: 0,
             display_area: Some(DEVICE_AREA),
+            gaze: false,
         })))
     }
 
@@ -249,6 +260,17 @@ impl FakeTracker {
     pub fn stalled(&self) -> bool {
         self.device().stalled
     }
+
+    /// Streams a gaze message at [`GAZE_POINT`] after every image.
+    pub fn gazing(self) -> Self {
+        self.device().gaze = true;
+        self
+    }
+
+    /// Clones of this tracker alive, the caller's included; a closed session holds none.
+    pub fn handles(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
 }
 
 impl Device {
@@ -313,6 +335,10 @@ impl Device {
     fn next_stream_message(&mut self) -> Option<Message> {
         match self.behaviour {
             Behaviour::Streaming => {
+                self.sent += 1;
+                if self.gaze && self.sent.is_multiple_of(2) {
+                    return Some(gaze_point_message(self.timestamp));
+                }
                 self.timestamp += STREAMING_PERIOD_US;
                 Some(image_message_at(self.timestamp))
             }
