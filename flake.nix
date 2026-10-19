@@ -13,6 +13,16 @@
         root = ./.;
         fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./clippy.toml ./rustfmt.toml ./crates ];
       };
+      selawik = import ./nix/selawik.nix { inherit pkgs; };
+      # The system's fonts plus Selawik, so the app and the setup runs it starts both see them.
+      experienceFontsConf = pkgs.writeText "tobii-experience-fonts.conf" ''
+        <?xml version="1.0"?>
+        <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+        <fontconfig>
+          <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+          <dir>${selawik}/share/fonts</dir>
+        </fontconfig>
+      '';
     in rec {
       prp-bridge = bridge.prpBridge;
       wine-run = bridge.wineRun;
@@ -35,7 +45,7 @@
           mainProgram = "tobii-linux-setup";
         };
       };
-      selawik = import ./nix/selawik.nix { inherit pkgs; };
+      inherit selawik;
       tobii-experience = pkgs.rustPlatform.buildRustPackage {
         pname = "tobii-experience";
         version = "0.1.0";
@@ -63,7 +73,7 @@
         # Selawik for the CSS, and the setup app the page and --guest start.
         preFixup = ''
           gappsWrapperArgs+=(
-            --set-default FONTCONFIG_FILE ${pkgs.makeFontsConf { fontDirectories = [ selawik ]; }}
+            --set-default FONTCONFIG_FILE ${experienceFontsConf}
             --prefix PATH : ${lib.makeBinPath [ tobii-setup ]}
           )
         '';
