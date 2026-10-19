@@ -8,15 +8,14 @@ use std::sync::Arc;
 
 use tobii_control::protocol::{
     Event, FRAME_CONTROL_EVENT, FRAME_CONTROL_GAZE, FRAME_CONTROL_REPLY, FRAME_CONTROL_REQUEST, GazeSample,
-    PROTOCOL_VERSION, Reply, Request, Status, decode_hello, decode_request, payload, request_id,
+    PROTOCOL_VERSION, Reply, Request, Status, TrackedEyes, decode_hello, decode_request, payload, request_id,
 };
+use tobii_gaze::operation::Operation;
+use tobii_gaze::profiles::{self, GUEST, SwitchOptions, recorded_monitor_key, tracked_eye};
 use tobii_protocol::gaze::GazeFrame;
 
 use super::link::{Ended, Frames, Link, Outcome, refused};
 use super::{MAX_PENDING_STREAM_BYTES, PrpService};
-
-/// The answer to requests the service cannot carry out yet.
-pub const UNSUPPORTED: &str = "unsupported";
 
 /// One control connection: what it subscribed and the status it last saw.
 #[derive(Debug)]
@@ -95,7 +94,8 @@ async fn answer(service: &PrpService, connection: &ControlConnection, request: R
     match request {
         Request::Status => {}
         Request::SetEnabled(enabled) => service.set_enabled(enabled).await.map_err(|error| error.to_string())?,
-        Request::SwitchProfile { .. } | Request::SetTrackedEyes(_) => return Err(UNSUPPORTED.into()),
+        Request::SwitchProfile { name } => service.switch_profile(name).await?,
+        Request::SetTrackedEyes(eyes) => service.set_tracked_eyes(eyes).await?,
         Request::Release => service.release_tracker(connection).await?,
         Request::Reacquire => match service.0.release_holder.get() {
             Some(holder) if holder != connection.key => return Err(held_elsewhere()),
@@ -124,9 +124,94 @@ impl PrpService {
             enabled: self.enabled(),
             released,
             display_area: self.display_area().is_some(),
+            calibration_matches_profile: profile.is_some() && self.0.profile_matches.get() && !released,
             profile,
-            calibration_matches_profile: false,
         }
+    }
+
+    /// Why no profile can be put on the tracker now.
+    fn profile_target(&self) -> Result<(), String> {
+        if self.released() {
+            return Err("The tracker is lent to a control client".into());
+        }
+        if !self.tracker_attached() || self.0.device.borrow().is_none() {
+            return Err("No tracker is attached".into());
+        }
+        Ok(())
+    }
+
+    /// Puts the current profile on a tracker that just attached, in the background.
+    pub(super) fn apply_current_profile(&self) {
+        if self.profile_target().is_err() {
+            return;
+        }
+        let name = match self.0.profiles.current() {
+            Ok(Some(name)) => name,
+            Ok(None) => return,
+            Err(error) => {
+                log::warn!("cannot read the current profile: {error}");
+                return;
+            }
+        };
+        let service = self.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(error) = service.apply_profile(name.clone(), false).await {
+                log::warn!("could not put profile {name} on the tracker: {error}");
+            }
+        });
+    }
+
+    /// Sends 3160 with the profile's tracked eyes and 1110 with its calibration for the
+    /// recorded monitor, then makes it current; `force` sends both even when the device
+    /// already reports the calibration's id.
+    async fn apply_profile(&self, name: String, force: bool) -> Result<(), String> {
+        let _applying = self.0.profile_lock.lock().await;
+        self.profile_target()?;
+        self.0.profile_matches.set(false);
+        let store = self.0.profiles.clone();
+        let eye = tracked_eye(store.tracked_eyes(&name).map_err(|error| error.to_string())?);
+        let monitor_key = recorded_monitor_key(&self.0.display_record);
+        let options = SwitchOptions { eye, monitor_key, force, dry_run: false };
+        let switching = Operation::new(move |io| profiles::switch_with(io, store, name, options));
+        let outcome = self.run_operation(switching).await;
+        if let Ok(result) = &outcome {
+            self.0.calibration_id.set(result.device_id_after);
+            self.0.profile_matches.set(self.profile_target().is_ok());
+            let action = if result.applied { "applied" } else { "already on the tracker" };
+            log::info!("profile {} {action} (calibration id {:#x})", result.profile, result.device_id_after);
+        }
+        self.broadcast_status();
+        outcome.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    /// Makes a listed profile current, as a click in Tobii's profile list does; the current
+    /// profile and [`GUEST`] are not in that list.
+    async fn switch_profile(&self, name: String) -> Result<(), String> {
+        self.profile_target()?;
+        if name == GUEST {
+            return Err(format!("{GUEST} is not in the profile list"));
+        }
+        if !self.0.profiles.names().map_err(|error| error.to_string())?.contains(&name) {
+            return Err(format!("No profile named {name}"));
+        }
+        if self.0.profiles.current().map_err(|error| error.to_string())?.as_deref() == Some(name.as_str()) {
+            return Ok(());
+        }
+        self.apply_profile(name, false).await
+    }
+
+    /// Stores the current profile's tracked eyes and applies the profile again when they
+    /// changed, as Tobii's tracked-eyes radios do.
+    async fn set_tracked_eyes(&self, eyes: TrackedEyes) -> Result<(), String> {
+        self.profile_target()?;
+        let store = &self.0.profiles;
+        let name = store.current().map_err(|error| error.to_string())?.ok_or("No profile is current")?;
+        let value = eyes.registry_value();
+        if store.tracked_eyes(&name).map_err(|error| error.to_string())? == value {
+            return Ok(());
+        }
+        store.set_tracked_eyes(&name, value).map_err(|error| error.to_string())?;
+        self.apply_profile(name, true).await
     }
 
     /// Whether a control client holds the tracker.

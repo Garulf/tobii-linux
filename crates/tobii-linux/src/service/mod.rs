@@ -36,7 +36,7 @@ use tobii_gaze::error::GazeError;
 use tobii_gaze::operation::{
     Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
 };
-use tobii_gaze::profiles::ProfileStore;
+use tobii_gaze::profiles::{ProfileStore, default_display_record};
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
 use tobii_protocol::{Message, ProtocolError};
@@ -96,8 +96,11 @@ pub struct Options {
     pub compensate_sesp_position: bool,
     /// Where the on/off state is kept; `None` keeps it in memory, enabled at start.
     pub enabled_state: Option<PathBuf>,
-    /// The profiles directory the control status reads; `None` uses the default location.
+    /// The profiles directory; `None` uses the default location.
     pub profiles: Option<PathBuf>,
+    /// The display setup record naming the monitor whose calibration a profile applies;
+    /// `None` uses the default location.
+    pub display_record: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -114,6 +117,7 @@ impl Default for Options {
             compensate_sesp_position: true,
             enabled_state: None,
             profiles: None,
+            display_record: None,
         }
     }
 }
@@ -268,6 +272,11 @@ struct Inner {
     enabled_state: Option<EnabledState>,
     paused: Arc<AtomicBool>,
     profiles: ProfileStore,
+    display_record: PathBuf,
+    /// The device holds the current profile's calibration, as the last apply found.
+    profile_matches: Cell<bool>,
+    /// Serializes profile applies on the tracker.
+    profile_lock: tokio::sync::Mutex<()>,
     controls: RefCell<Vec<Rc<control::ControlConnection>>>,
     control_keys: Cell<u64>,
     release_gate: Arc<ReleaseGate>,
@@ -382,6 +391,12 @@ impl PrpService {
             enabled_state,
             paused: Arc::new(AtomicBool::new(!enabled)),
             profiles: options.profiles.map_or_else(ProfileStore::default_location, ProfileStore::new),
+            display_record: options.display_record.unwrap_or_else(|| {
+                let get = |name: &str| std::env::var(name).ok();
+                default_display_record(get("XDG_DATA_HOME").as_deref(), get("HOME").as_deref())
+            }),
+            profile_matches: Cell::new(false),
+            profile_lock: tokio::sync::Mutex::new(()),
             controls: RefCell::new(Vec::new()),
             control_keys: Cell::new(0),
             release_gate: Arc::new(ReleaseGate::default()),
@@ -599,7 +614,9 @@ impl PrpService {
     }
 
     /// A tracker session is running: accept clients, as the real server starts listening.
-    /// Without a configured display area the service takes the session's.
+    /// Without a configured display area the service takes the session's. The current
+    /// profile is then put on the tracker, as the EyeX engine's
+    /// `TrySetCalibrationAndProfileSettings` does when it starts.
     pub fn attach_tracker(&self, calibration_id: Option<u32>, display_area: Option<Corners>) {
         if let Some(id) = calibration_id {
             self.0.calibration_id.set(id);
@@ -612,6 +629,7 @@ impl PrpService {
         }
         self.0.tracker_attached.set(true);
         self.broadcast_status();
+        self.apply_current_profile();
     }
 
     /// Stores the tracker's display area and notifies property 1 subscribers when it changed.
@@ -640,6 +658,7 @@ impl PrpService {
             log::info!("tracker detached; closing {} client connection(s)", self.0.connections.borrow().len());
         }
         self.0.tracker_attached.set(false);
+        self.0.profile_matches.set(false);
         self.set_device(None);
         let connections = self.0.connections.borrow().clone();
         for connection in connections {

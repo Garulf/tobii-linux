@@ -11,9 +11,14 @@
 //!
 //! Here a profile is a file NAME.setpm in calibration.setpm layout under
 //! $XDG_DATA_HOME/tobii-linux/profiles, and the name of the active profile is kept in the
-//! file `current` beside them.
+//! file `current` beside them. NAME.json, when present, holds the profile's tracked eyes and
+//! which file serves which monitor; other monitors' calibrations are NAME@<monitor key>.setpm.
+//! A profile without NAME.json tracks both eyes and its NAME.setpm serves every monitor.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
 
 use crate::calibration::{self, TRANSFER_TIMEOUT_S, load_backup, save_backup};
 use crate::device::{self, Eye, LocalCalibration};
@@ -21,17 +26,91 @@ use crate::error::{GazeError, Result};
 use crate::operation::{External, Io, OperationError, OperationResult};
 
 pub const PROFILE_SUFFIX: &str = ".setpm";
+pub const SETTINGS_SUFFIX: &str = ".json";
+pub const MONITOR_SEPARATOR: char = '@';
 pub const CURRENT_FILE: &str = "current";
 pub const MAX_NAME_LENGTH: usize = 255;
 pub const NAME_PUNCTUATION: [char; 4] = [' ', '(', ')', '-'];
+/// The profile Tobii's guest calibration (`Tobii.Configuration.exe -G`) writes; it is never
+/// listed and cannot be deleted.
+pub const GUEST: &str = "Guest";
+/// The record of the last display setup, beside the profiles directory.
+pub const DISPLAY_RECORD: &str = "display-setup.json";
 
-/// The profiles directory for an environment's XDG_DATA_HOME and HOME.
-pub fn default_directory(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+/// $XDG_DATA_HOME/tobii-linux for an environment's XDG_DATA_HOME and HOME.
+pub fn default_data_directory(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
     let data_home = match xdg_data_home.filter(|value| !value.is_empty()) {
         Some(value) => PathBuf::from(value),
         None => expand_user(home.unwrap_or("~")).join(".local/share"),
     };
-    data_home.join("tobii-linux").join("profiles")
+    data_home.join("tobii-linux")
+}
+
+/// The profiles directory for an environment's XDG_DATA_HOME and HOME.
+pub fn default_directory(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    default_data_directory(xdg_data_home, home).join("profiles")
+}
+
+/// Where `tobii-linux-setup` records the monitor of the last display setup.
+pub fn default_display_record(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    default_data_directory(xdg_data_home, home).join(DISPLAY_RECORD)
+}
+
+/// The monitor key of the last display setup: the EDID id when it was read, else the
+/// connector. `None` when the record or both fields are missing.
+pub fn recorded_monitor_key(path: &Path) -> Option<String> {
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let monitor = record.get("monitor")?;
+    let text = |field: &str| monitor.get(field)?.as_str().filter(|text| !text.is_empty()).map(str::to_string);
+    text("edid_id").or_else(|| text("key"))
+}
+
+/// Tobii's `TrackedEyes` value as the eye the device tracks: 1 left, 2 right, else both.
+pub fn tracked_eye(tracked_eyes: u32) -> Eye {
+    match tracked_eyes {
+        1 => Eye::Left,
+        2 => Eye::Right,
+        _ => Eye::Both,
+    }
+}
+
+/// A monitor key as it appears in a file name: anything but letters, digits, `-` and `_`
+/// becomes `_`.
+fn file_key(monitor_key: &str) -> String {
+    monitor_key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+/// What NAME.json holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Settings {
+    tracked_eyes: u32,
+    calibrations: BTreeMap<String, String>,
+}
+
+impl Settings {
+    fn from_json(value: &Value) -> Self {
+        let tracked_eyes = value.get("tracked_eyes").and_then(Value::as_u64).filter(|&v| v <= 2).unwrap_or(0) as u32;
+        let calibrations = value
+            .get("calibrations")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(key, file)| Some((key.clone(), file.as_str()?.to_string())))
+                    .filter(|(_, file)| is_plain_file_name(file))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { tracked_eyes, calibrations }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"tracked_eyes": self.tracked_eyes, "calibrations": self.calibrations})
+    }
+}
+
+fn is_plain_file_name(file: &str) -> bool {
+    file.ends_with(PROFILE_SUFFIX) && !file.starts_with('.') && !file.contains(['/', '\\'])
 }
 
 /// `os.path.expanduser` for `~` and `~/...`, from the process's HOME.
@@ -115,6 +194,114 @@ impl ProfileStore {
         Ok(self.directory.join(format!("{}{PROFILE_SUFFIX}", check_name(name)?)))
     }
 
+    fn settings_path(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.directory.join(format!("{}{SETTINGS_SUFFIX}", check_name(name)?)))
+    }
+
+    fn settings(&self, name: &str) -> Result<Settings> {
+        let path = self.settings_path(name)?;
+        if !path.exists() {
+            return Ok(Settings::default());
+        }
+        let text = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&text).map(|value| Settings::from_json(&value)).unwrap_or_default())
+    }
+
+    fn store_settings(&self, name: &str, settings: &Settings) -> Result<()> {
+        let path = self.settings_path(name)?;
+        let temporary = path.with_extension("json.partial");
+        std::fs::write(&temporary, format!("{}\n", settings.to_json()))?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
+    fn require(&self, name: &str) -> Result<PathBuf> {
+        let path = self.path(name)?;
+        if !path.exists() {
+            let message = format!("No profile named {} in {}", python_repr(name), self.directory.display());
+            return Err(GazeError::Profile(message));
+        }
+        Ok(path)
+    }
+
+    /// Tobii's `TrackedEyes` of a profile: 0 both, 1 left, 2 right; 0 without NAME.json.
+    pub fn tracked_eyes(&self, name: &str) -> Result<u32> {
+        Ok(self.settings(name)?.tracked_eyes)
+    }
+
+    pub fn set_tracked_eyes(&self, name: &str, value: u32) -> Result<()> {
+        if value > 2 {
+            return Err(GazeError::Profile(format!("Tracked eyes must be 0, 1 or 2, not {value}")));
+        }
+        self.require(name)?;
+        let mut settings = self.settings(name)?;
+        settings.tracked_eyes = value;
+        self.store_settings(name, &settings)
+    }
+
+    /// The profile's calibration for a monitor, else its NAME.setpm.
+    pub fn calibration_for(&self, name: &str, monitor_key: Option<&str>) -> Result<LocalCalibration> {
+        let settings = self.settings(name)?;
+        match monitor_key.and_then(|key| settings.calibrations.get(key)) {
+            Some(file) => Ok(load_backup(&self.directory.join(file))?),
+            None => Ok(self.load(name)?.calibration),
+        }
+    }
+
+    /// Stores a calibration for a monitor. A new profile's first calibration is NAME.setpm;
+    /// a monitor the profile has none for gets NAME@<monitor key>.setpm.
+    pub fn save_for(
+        &self,
+        name: &str,
+        monitor_key: Option<&str>,
+        calibration: &LocalCalibration,
+        overwrite: bool,
+    ) -> Result<PathBuf> {
+        let legacy = self.path(name)?;
+        let Some(key) = monitor_key else { return self.save(name, calibration, overwrite) };
+        let mut settings = self.settings(name)?;
+        let file = match settings.calibrations.get(key) {
+            Some(file) => file.clone(),
+            None if !legacy.exists() => format!("{name}{PROFILE_SUFFIX}"),
+            None => format!("{name}{MONITOR_SEPARATOR}{}{PROFILE_SUFFIX}", file_key(key)),
+        };
+        std::fs::create_dir_all(&self.directory)?;
+        let path = save_backup(&self.directory.join(&file), calibration, overwrite)?;
+        settings.calibrations.insert(key.to_string(), file);
+        self.store_settings(name, &settings)?;
+        Ok(path)
+    }
+
+    /// Removes a profile with every calibration and its settings; refuses the current
+    /// profile and [`GUEST`].
+    pub fn delete(&self, name: &str) -> Result<()> {
+        let legacy = self.path(name)?;
+        if name == GUEST {
+            return Err(GazeError::Profile(format!("{GUEST} cannot be deleted")));
+        }
+        if self.current()?.as_deref() == Some(name) {
+            return Err(GazeError::Profile(format!("{} is the current profile", python_repr(name))));
+        }
+        let settings = self.settings_path(name)?;
+        if !legacy.exists() && !settings.exists() {
+            self.require(name)?;
+        }
+        let prefix = format!("{name}{MONITOR_SEPARATOR}");
+        for entry in std::fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            let Some(file_name) = path.file_name().and_then(|file| file.to_str()) else { continue };
+            if file_name.starts_with(&prefix) && file_name.ends_with(PROFILE_SUFFIX) {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        for path in [settings, legacy] {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn names(&self) -> Result<Vec<String>> {
         if !self.directory.is_dir() {
             return Ok(Vec::new());
@@ -127,7 +314,7 @@ impl ProfileStore {
             if file_name.starts_with('.') {
                 continue;
             }
-            if let Some(name) = file_name.strip_suffix(PROFILE_SUFFIX) {
+            if let Some(name) = file_name.strip_suffix(PROFILE_SUFFIX).filter(|name| check_name(name).is_ok()) {
                 names.push(name.to_string());
             }
         }
@@ -200,6 +387,17 @@ pub struct SwitchResult {
     pub applied: bool,
 }
 
+/// How [`switch_with`] puts a profile on the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchOptions {
+    pub eye: Eye,
+    /// The monitor whose calibration is applied; `None` applies NAME.setpm.
+    pub monitor_key: Option<String>,
+    /// Sends 3160 and 1110 even when the device already reports the profile's id.
+    pub force: bool,
+    pub dry_run: bool,
+}
+
 /// Makes a profile active: 3160 enabled eye, then 1110 with its blob, then 1490 to confirm the id.
 ///
 /// The engine sends both on every profile change; the apply is skipped here when the device
@@ -213,17 +411,27 @@ pub async fn switch<E: External>(
     eye: Eye,
     dry_run: bool,
 ) -> OperationResult<SwitchResult, E> {
-    let profile = store.load(&name)?;
-    let wanted = profile.calibration.calibration_id;
+    switch_with(io, store, name, SwitchOptions { eye, monitor_key: None, force: false, dry_run }).await
+}
+
+/// [`switch`] with the calibration of a monitor, optionally forcing the apply.
+pub async fn switch_with<E: External>(
+    io: Io<E>,
+    store: ProfileStore,
+    name: String,
+    options: SwitchOptions,
+) -> OperationResult<SwitchResult, E> {
+    let calibration = store.calibration_for(&name, options.monitor_key.as_deref())?;
+    let wanted = calibration.calibration_id;
     let before = calibration::read_device_calibration_id(&io).await?;
-    let applied = before != wanted;
+    let applied = options.force || before != wanted;
     if applied {
-        io.call(device::set_enabled_eye(0, eye), None).await.map_err(OperationError::External)?;
-        let apply = device::calibration_apply(0, &profile.calibration.blob)?;
+        io.call(device::set_enabled_eye(0, options.eye), None).await.map_err(OperationError::External)?;
+        let apply = device::calibration_apply(0, &calibration.blob)?;
         io.call(apply, Some(TRANSFER_TIMEOUT_S)).await.map_err(OperationError::External)?;
     }
     let after = calibration::read_device_calibration_id(&io).await?;
-    if !dry_run {
+    if !options.dry_run {
         if after != wanted {
             return Err(profile_error(format!(
                 "Device reports calibration id {after:#x} after switching to {} ({wanted:#x})",
@@ -259,6 +467,111 @@ mod tests {
         }
         let Err(GazeError::Profile(message)) = check_name("../x") else { panic!() };
         assert_eq!(message, "Invalid characters in profile name: './'");
+    }
+
+    fn temporary_store(name: &str) -> ProfileStore {
+        let directory = std::env::temp_dir().join(format!("tobii-gaze-profiles-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        ProfileStore::new(directory)
+    }
+
+    fn calibration(id: u32) -> LocalCalibration {
+        let mut blob = vec![0u8; 32];
+        blob[20..24].copy_from_slice(&id.to_le_bytes());
+        LocalCalibration { calibration_id: id, blob }
+    }
+
+    #[test]
+    fn legacy_profile_reads_as_both_eyes() {
+        let store = temporary_store("legacy");
+        store.save("Garulf", &calibration(1), false).unwrap();
+        assert_eq!(store.tracked_eyes("Garulf").unwrap(), 0);
+        assert_eq!(tracked_eye(store.tracked_eyes("Garulf").unwrap()), Eye::Both);
+        assert_eq!(store.calibration_for("Garulf", None).unwrap(), calibration(1));
+        let _ = std::fs::remove_dir_all(&store.directory);
+    }
+
+    #[test]
+    fn tracked_eyes_round_trip() {
+        let store = temporary_store("eyes");
+        store.save("Garulf", &calibration(1), false).unwrap();
+        store.set_tracked_eyes("Garulf", 2).unwrap();
+        assert_eq!(store.tracked_eyes("Garulf").unwrap(), 2);
+        assert_eq!(tracked_eye(2), Eye::Right);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.directory.join("Garulf.json")).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({"tracked_eyes": 2, "calibrations": {}}));
+        assert!(matches!(store.set_tracked_eyes("Garulf", 3), Err(GazeError::Profile(_))));
+        assert!(matches!(store.set_tracked_eyes("Nobody", 1), Err(GazeError::Profile(_))));
+        assert_eq!(store.names().unwrap(), ["Garulf"]);
+        let _ = std::fs::remove_dir_all(&store.directory);
+    }
+
+    #[test]
+    fn per_monitor_calibration_falls_back_to_legacy() {
+        let store = temporary_store("monitors");
+        store.save("Garulf", &calibration(1), false).unwrap();
+        store.set_tracked_eyes("Garulf", 1).unwrap();
+        let path = store.save_for("Garulf", Some("10AC4C41"), &calibration(2), false).unwrap();
+        assert_eq!(path, store.directory.join("Garulf@10AC4C41.setpm"));
+        assert_eq!(store.calibration_for("Garulf", Some("10AC4C41")).unwrap(), calibration(2));
+        assert_eq!(store.calibration_for("Garulf", Some("DP-1")).unwrap(), calibration(1));
+        assert_eq!(store.calibration_for("Garulf", None).unwrap(), calibration(1));
+        assert_eq!(store.tracked_eyes("Garulf").unwrap(), 1);
+        assert!(store.save_for("Garulf", Some("10AC4C41"), &calibration(3), false).is_err());
+        store.save_for("Garulf", Some("10AC4C41"), &calibration(3), true).unwrap();
+        assert_eq!(store.calibration_for("Garulf", Some("10AC4C41")).unwrap(), calibration(3));
+        assert_eq!(store.names().unwrap(), ["Garulf"]);
+
+        let first = store.save_for("New", Some("DP-1"), &calibration(4), false).unwrap();
+        assert_eq!(first, store.directory.join("New.setpm"));
+        assert_eq!(store.calibration_for("New", Some("DP-1")).unwrap(), calibration(4));
+        assert_eq!(store.names().unwrap(), ["Garulf", "New"]);
+        let _ = std::fs::remove_dir_all(&store.directory);
+    }
+
+    #[test]
+    fn delete_refuses_current_and_guest() {
+        let store = temporary_store("delete");
+        for name in ["Garulf", GUEST, "Other", "Oth"] {
+            store.save(name, &calibration(1), false).unwrap();
+        }
+        store.save_for("Other", Some("DP-1"), &calibration(2), false).unwrap();
+        store.save_for("Oth", Some("DP-1"), &calibration(3), false).unwrap();
+        store.set_tracked_eyes("Other", 2).unwrap();
+        store.set_current("Garulf").unwrap();
+        assert!(matches!(store.delete("Garulf"), Err(GazeError::Profile(_))));
+        assert!(matches!(store.delete(GUEST), Err(GazeError::Profile(_))));
+        assert!(matches!(store.delete("Nobody"), Err(GazeError::Profile(_))));
+
+        store.delete("Other").unwrap();
+        assert_eq!(store.names().unwrap(), ["Garulf", GUEST, "Oth"]);
+        let mut left: Vec<String> = std::fs::read_dir(&store.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["Garulf.setpm", "Guest.setpm", "Oth.json", "Oth.setpm", "Oth@DP-1.setpm", "current"]);
+        let _ = std::fs::remove_dir_all(&store.directory);
+    }
+
+    #[test]
+    fn monitor_key_prefers_the_edid_id() {
+        let directory = std::env::temp_dir().join(format!("tobii-gaze-display-record-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let record = directory.join(DISPLAY_RECORD);
+        assert_eq!(recorded_monitor_key(&record), None);
+        for (text, key) in [
+            (r#"{"monitor":{"key":"DP-1","edid_id":"10AC4C41"}}"#, Some("10AC4C41")),
+            (r#"{"monitor":{"key":"DP-1","edid_id":null}}"#, Some("DP-1")),
+            (r#"{"monitor":null,"area":{}}"#, None),
+            ("not json", None),
+        ] {
+            std::fs::write(&record, text).unwrap();
+            assert_eq!(recorded_monitor_key(&record).as_deref(), key, "{text}");
+        }
+        assert_eq!(default_display_record(Some("/data"), None), PathBuf::from("/data/tobii-linux/display-setup.json"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

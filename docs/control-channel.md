@@ -49,22 +49,31 @@ order. A reply carries either the service status after the request or an error:
 {"id":1,"request":"status"}
 {"id":1,"status":{"attached":true,"enabled":true,"released":false,"display_area":true,"profile":"Default","calibration_matches_profile":false}}
 
-{"id":2,"request":{"set_tracked_eyes":"left"}}
-{"id":2,"error":"unsupported"}
+{"id":2,"request":{"switch_profile":{"name":"Nobody"}}}
+{"id":2,"error":"No profile named Nobody"}
 ```
 
 | Request | JSON | Effect | Reaches the device |
 | --- | --- | --- | --- |
 | Status | `"status"` | none | no |
 | SetEnabled | `{"set_enabled":false}` | stores the on/off state, then pauses or resumes the tracker for every client, as the tray's toggle does | yes: the running session sends 3100 (pause 1, resume 0); a session that starts later pauses first |
-| SwitchProfile | `{"switch_profile":{"name":"Guest"}}` | refused with `unsupported` for now | not yet |
-| SetTrackedEyes | `{"set_tracked_eyes":"both"}` (`both`, `left`, `right`) | refused with `unsupported` for now | not yet |
+| SwitchProfile | `{"switch_profile":{"name":"Other"}}` | puts a listed profile on the tracker and makes it current, as a click in Tobii's profile list; the current name does nothing; unknown names and `Guest` (never listed) are refused | yes: 3160 with the profile's tracked eyes, then 1110 with its calibration for the recorded monitor, unless the device already reports that calibration's id |
+| SetTrackedEyes | `{"set_tracked_eyes":"both"}` (`both`, `left`, `right`) | stores the current profile's tracked eyes and applies the profile again, as Tobii's radios do; an unchanged value does nothing | yes: 3160, then 1110, even when the ids match |
 | Release | `"release"` | lends the tracker to this client (see below) | closes USB |
 | Reacquire | `"reacquire"` | ends a release held by this client | the next session opens USB |
 | SubscribeGaze | `{"subscribe_gaze":true}` | starts or stops `CONTROL_GAZE` frames on this connection | no |
 
 `SetEnabled` fails with an error reply when the state cannot be stored; nothing
-changes then.
+changes then. `SwitchProfile` and `SetTrackedEyes` fail with an error reply
+while no tracker is attached or it is released, and when the apply fails; a
+failed apply leaves `calibration_matches_profile` false.
+
+When a tracker session starts, the service puts the current profile on it the
+same way, as the EyeX engine does at start
+(`TrySetCalibrationAndProfileSettings`); nothing is sent when the device
+already reports the calibration's id, and a failure is logged without stopping
+the service. Profile storage is in docs/gaze-calibration.md (Calibration
+profiles).
 
 Tracked eyes use Tobii's registry encoding `both 0, left 1, right 2`
 (`TrackedEyes::registry_value`) and the device's eye selector `both 3, left 1,
@@ -79,7 +88,7 @@ right 2` (`TrackedEyes::device_eye`).
 | `released` | a control client holds the tracker |
 | `display_area` | the service has a display area, from `--display` or read from the tracker |
 | `profile` | the current profile name from the profile store, or `null` |
-| `calibration_matches_profile` | always `false` for now |
+| `calibration_matches_profile` | the last apply of the current profile on the attached tracker succeeded; false while detached or released, before the apply finishes and after a failed one |
 
 Right after accepting the HELLO the service sends one status event, so a client
 learns the state without asking:
@@ -90,9 +99,11 @@ learns the state without asking:
 
 After that it sends a status event to every control connection whenever the
 status differs from the last one that connection was sent: on tracker attach
-and detach, on/off, release and reacquire, a display area read at attach. The
-profile is read when an event is due; changing the profile file alone sends
-nothing. When a request changes the status, its event comes before its reply.
+and detach, on/off, release and reacquire, a display area read at attach, and
+after each profile apply. The profile is read when an event is due; changing
+the profile file alone sends nothing. `ControlClient` skips events it cannot
+decode, so a service may add event kinds; a field added to the status needs a
+default for older services. When a request changes the status, its event comes before its reply.
 Mapping the status to Tobii's device states (Configuring while released, Device
 not connected while detached) is the app's job.
 
@@ -131,8 +142,4 @@ Only the client holding the release can reacquire; a second `release` or a
 
 ## What remains
 
-- `switch_profile` and `set_tracked_eyes` answer `unsupported` until the
-  service puts profiles and tracked eyes on the device.
-- `calibration_matches_profile` is always `false` until the service compares
-  the device's calibration with the current profile.
 - Not run against a real tracker or the GTK apps yet.

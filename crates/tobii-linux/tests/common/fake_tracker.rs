@@ -10,11 +10,16 @@ use std::time::{Duration, Instant};
 
 use tobii_device::channel::{Channel, ChannelError};
 use tobii_device::clock::HostClock;
+use tobii_gaze::device::{STATUS_CALIBRATION_ID, STATUS_STRUCT, blob_calibration_id, gaze_command};
 use tobii_linux::tracker::HostTime;
 use tobii_protocol::Message;
 use tobii_protocol::camera_info::{CameraRecord, HardwareInfo, hardware_info_response};
-use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device};
-use tobii_protocol::fields::{array_fields, encode_payload, int32_field, triple_fixed42_fields, uint32_field};
+use tobii_protocol::commands::{
+    RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device, string_field,
+};
+use tobii_protocol::fields::{
+    Value, array_fields, encode_payload, int32_field, struct_field, triple_fixed42_fields, uint32_field, values,
+};
 use tobii_protocol::gaze::PLATMOD_PRESENT;
 use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column, vec2_column};
 use tobii_protocol::ttp::{Decoder, Field};
@@ -152,6 +157,7 @@ struct Device {
     pause_status: u32,
     display_area: Option<[[f64; 3]; 3]>,
     gaze: bool,
+    calibration_id: Option<u32>,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -182,6 +188,7 @@ impl FakeTracker {
             pause_status: 0,
             display_area: Some(DEVICE_AREA),
             gaze: false,
+            calibration_id: None,
         })))
     }
 
@@ -245,6 +252,16 @@ impl FakeTracker {
         self
     }
 
+    /// Reports this calibration id in 1490 and takes the id of the blob a 1110 applies.
+    pub fn calibrated(self, calibration_id: u32) -> Self {
+        self.device().calibration_id = Some(calibration_id);
+        self
+    }
+
+    pub fn calibration_id(&self) -> Option<u32> {
+        self.device().calibration_id
+    }
+
     pub fn log(&self) -> Vec<Message> {
         self.device().log.clone()
     }
@@ -292,6 +309,18 @@ impl Device {
                 Some(area) => reply(&request, 0, &display_area_fields(area)),
                 None => reply(&request, REFUSED_STATUS, &[]),
             },
+            command::GET_DEVICE_STATUS if self.calibration_id.is_some() => {
+                let id = self.calibration_id.unwrap_or_default().to_string();
+                let header = struct_field(2, STATUS_STRUCT).unwrap();
+                let entry = [header, uint32_field(STATUS_CALIBRATION_ID as u32), string_field(&id).unwrap()];
+                reply(&request, 0, &entry)
+            }
+            gaze_command::CALIBRATION_APPLY if self.calibration_id.is_some() => {
+                let fields = values(&request.payload).unwrap();
+                let Some(Value::Bytes(blob)) = fields.first() else { panic!("1110 without a blob") };
+                self.calibration_id = Some(blob_calibration_id(blob).unwrap());
+                reply(&request, 0, &[])
+            }
             command::PAUSE_DEVICE if self.pause_status != 0 => reply(&request, self.pause_status, &[]),
             command::PAUSE_DEVICE if self.pausable => {
                 self.paused = request.payload == pause_device(0).payload;
