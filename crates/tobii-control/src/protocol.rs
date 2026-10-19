@@ -74,8 +74,10 @@ pub enum Request {
     SubscribeGaze(bool),
 }
 
-/// The service's state as the tray and the setup app see it.
+/// The service's state as the tray and the setup app see it; fields an older service does
+/// not send decode as their defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Status {
     /// A tracker session runs; false while released.
     pub attached: bool,
@@ -278,6 +280,16 @@ mod tests {
         assert_eq!(payload(&refused).unwrap(), br#"{"id":6,"error":"unsupported"}"#);
         assert_eq!(decode_reply(br#"{"id":6,"error":"unsupported"}"#).unwrap(), refused);
         assert!(decode_reply(br#"{"id":7}"#).is_err());
+    }
+
+    #[test]
+    fn status_from_an_older_service_takes_defaults() {
+        let reply = decode_reply(br#"{"id":3,"status":{"attached":true,"enabled":true,"profile":"Default"}}"#);
+        let status = Status { attached: true, enabled: true, profile: Some("Default".into()), ..Status::default() };
+        assert_eq!(reply.unwrap(), Reply { id: 3, result: Ok(status) });
+        let event = decode_event(br#"{"status":{"released":true,"calibration_matches_profile":false}}"#).unwrap();
+        assert_eq!(event, Event::Status(Status { released: true, ..Status::default() }));
+        assert_eq!(decode_event(br#"{"status":{}}"#).unwrap(), Event::Status(Status::default()));
     }
 
     #[test]
