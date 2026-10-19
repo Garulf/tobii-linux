@@ -506,9 +506,12 @@ not Tobii's:
 | `NAME@<monitor key>.setpm` | the calibration for another monitor |
 | `current` | the name of the active profile |
 
-The monitor key is the monitor's EDID id (hex) when it was read, else its
-connector, as `tobii-linux-setup` records it in
-`$XDG_DATA_HOME/tobii-linux/display-setup.json`; characters other than letters,
+The monitor key is the record's `monitor.edid_id` (the EDID id in hex) when it
+was read, else its `monitor.key` (the output name the desktop reports, `DP-1`),
+both as `tobii-linux-setup` records them in
+`$XDG_DATA_HOME/tobii-linux/display-setup.json`
+(`recorded_monitor_key`, `crates/tobii-gaze/src/profiles.rs`); the record's
+`connector` field is not used for it; characters other than letters,
 digits, `-` and `_` become `_` in a file name. A profile's first calibration
 is `NAME.setpm`, which stays the calibration of the monitor it was made on and
 serves every monitor without one of its own. A profile without `NAME.json`
@@ -531,11 +534,17 @@ in a name and `NAME@...` files never list as profiles.
   a `DryRunSession` the writes are reported instead. Unlike the engine it
   skips both writes when the device already holds the profile's calibration,
   as the runtime's start check does. `switch_with` (Rust) takes the monitor
-  key and can force both writes.
+  key, can force both writes (`force`), and can send 3160 even when the ids
+  match (`always_set_eye`); `switch` and the Python binding set neither.
 - `tobii-linux serve` applies the current profile with `switch_with` whenever
   a tracker session starts, with the eye from `NAME.json` and the calibration
   for the recorded monitor, and on the control channel's `switch_profile` and
-  `set_tracked_eyes` (docs/control-channel.md).
+  `set_tracked_eyes` (docs/control-channel.md). It always sends 3160 with the
+  profile's eye and sends 1110 only when the device reports another calibration
+  id (`set_tracked_eyes` sends both), so a profile that `tobii-linux-setup` or
+  `profiles switch` made current with other tracked eyes reaches the device on
+  the next attach, as the engine puts calibration and tracked eyes on the
+  device at every start.
 
 `tools/gaze_calibrate.py`:
 

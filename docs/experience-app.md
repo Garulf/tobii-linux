@@ -734,9 +734,11 @@ How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
     the monitor.
   - The tracked monitor is the one recorded by the last display setup
     (`$XDG_DATA_HOME/tobii-linux/display-setup.json`). The output is the GDK monitor whose
-    connector equals the recorded one after stripping a leading `cardN-`, else the one
-    whose EDID manufacturer and model match (the EDID monitor name, or the product code
-    when the EDID has no name). No match hides the bubble.
+    connector equals the recorded `monitor.connector` after stripping a leading `cardN-`,
+    else the one whose connector equals `monitor.key` (the output name setup matched, the
+    only name in records written before `connector` existed and in Python setup records),
+    else the one whose EDID manufacturer and model match (the EDID monitor name, or the
+    product code when the EDID has no name). No match hides the bubble.
   - The overlay is a click-through `wlr-layer-shell` surface (overlay layer, all edges,
     no keyboard). Without layer-shell (X11, or a Wayland compositor without it) the
     preview stays off: X11 offers GTK 4 no way to keep a window above the others on a
@@ -938,7 +940,10 @@ binds in Hyprland (decision, spec 8; Wayland apps cannot grab global keys). The
 command starts `tobii-linux-setup --guest`, setup's spelling of `-G`; setup takes
 either (decision). Apply the same status gate: only when the
 status is `InvalidConfiguration` or `Tracking` (proposal), and the same
-re-entrancy rule (an active setup run makes it do nothing). The page keeps the
+re-entrancy rule (an active setup run makes it do nothing). Setup puts both
+eyes on the device (3160) before the guest calibration, whatever the current
+profile tracks, to match the flow's "tracked eyes both"
+([setup flow](setup-flow.md#tobii-linux-setup-arguments)). The page keeps the
 resource text, including the key name and the "Shft" spelling (proposal, for
 1:1 wording); the user binds the key.
 

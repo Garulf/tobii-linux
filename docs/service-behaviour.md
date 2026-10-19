@@ -125,6 +125,24 @@ not subscribed gives status 5. Only two byte ranges differ: the display id's
 padding and the refused 0x13 block, both uninitialised memory in the real
 service.
 
+Change notifications for property 1 (display area) and property 4 (device
+paused) are a static reconstruction; the real service was never seen sending
+either. The Linux service (`display_area_notification`, `paused_notification`,
+`crates/tobii-service/src/prp_service.rs`) builds them from two observed parts:
+the operation 2 framing of `encode_property_notification`, which reproduces
+the live 0x11 notification and the game DLL serializer `0x18004f730` byte for
+byte (above), and the value block a command 5 answer carries for that
+property (nine floats for property 1, one word for property 4), which matches
+the recorded subscription answers
+(`tests/data/real-property-subscriptions.json`). That the real service queues
+the same value block for these properties, and when it does, follows from the
+presence path (`0x1400fd220` stores the record in the cache and queues the
+same record as the notification, step 3 above) and was not traced for
+properties 1 and 4 (static). They are sent when the display area a session
+reads (1430) differs from the last one, and when eye tracking is turned off or
+on ([control-channel.md](control-channel.md)), to clients subscribed to the
+property with command 5 (unit: `crates/tobii-linux/tests/prp_service.rs`).
+
 ## Tracker loss, replug and host suspend
 
 ### Windows

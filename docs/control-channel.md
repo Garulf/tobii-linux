@@ -36,7 +36,18 @@ bridge's 1 to 7 on the same port.
 
 A HELLO with another version, a frame of another type after the HELLO, or a
 request that is not JSON with an `id` makes the service close the connection
-(logged as a warning). A request with an `id` that does not decode is answered
+(logged as a warning).
+
+Only loopback peers (`127.0.0.0/8`, `::1`, and IPv4-mapped loopback) may open a
+control connection. With `serve --host 0.0.0.0` the relay port is reachable
+from the network for the game bridge, and any host could otherwise release
+the tracker, turn eye tracking off, switch profiles or read gaze. A
+`CONTROL_HELLO` from another address is logged as a warning and the
+connection closed before any reply; bridge and pipe connections from the same
+address are served as before (service: `control_refuses_non_loopback_peers`;
+unit: `only_loopback_peers_control` in `control.rs`).
+
+A request with an `id` that does not decode is answered
 with an error reply.
 
 ## Requests
@@ -57,8 +68,8 @@ order. A reply carries either the service status after the request or an error:
 | --- | --- | --- | --- |
 | Status | `"status"` | none | no |
 | SetEnabled | `{"set_enabled":false}` | stores the on/off state, then pauses or resumes the tracker for every client, as the tray's toggle does | yes: the running session sends 3100 (pause 1, resume 0); a session that starts later pauses first |
-| SwitchProfile | `{"switch_profile":{"name":"Other"}}` | puts a listed profile on the tracker and makes it current, as a click in Tobii's profile list; the current name does nothing; unknown names and `Guest` (never listed) are refused | yes: 3160 with the profile's tracked eyes, then 1110 with its calibration for the recorded monitor, unless the device already reports that calibration's id |
-| SetTrackedEyes | `{"set_tracked_eyes":"both"}` (`both`, `left`, `right`) | stores the current profile's tracked eyes and applies the profile again, as Tobii's radios do; an unchanged value does nothing | yes: 3160, then 1110, even when the ids match |
+| SwitchProfile | `{"switch_profile":{"name":"Other"}}` | puts a listed profile on the tracker and makes it current, as a click in Tobii's profile list; the current name does nothing; unknown names and `Guest` (never listed) are refused | yes: 3160 with the profile's tracked eyes, then 1110 with its calibration for the recorded monitor unless the device already reports that calibration's id |
+| SetTrackedEyes | `{"set_tracked_eyes":"both"}` (`both`, `left`, `right`) | stores the current profile's tracked eyes and applies the profile again, as Tobii's radios do; an unchanged value is applied too, since the device may hold another eye (Tobii only applies a change: the Linux service cannot read the device's eye, and setup or `profiles switch` may have changed it) | yes: 3160, then 1110, even when the ids match |
 | Release | `"release"` | lends the tracker to this client (see below) | closes USB |
 | Reacquire | `"reacquire"` | ends a release held by this client | the next session opens USB |
 | SubscribeGaze | `{"subscribe_gaze":true}` | starts or stops `CONTROL_GAZE` frames on this connection | no |
@@ -68,12 +79,25 @@ changes then. `SwitchProfile` and `SetTrackedEyes` fail with an error reply
 while no tracker is attached or it is released, and when the apply fails; a
 failed apply leaves `calibration_matches_profile` false.
 
-When a tracker session starts, the service puts the current profile on it the
-same way, as the EyeX engine does at start
-(`TrySetCalibrationAndProfileSettings`); nothing is sent when the device
-already reports the calibration's id, and a failure is logged without stopping
-the service. Profile storage is in docs/gaze-calibration.md (Calibration
+When a tracker session starts (plug-in, service start, reacquire after a
+release), the service puts the current profile on it, as the EyeX engine does
+at start (`TrySetCalibrationAndProfileSettings`): 3160 with the profile's
+tracked eyes every time, then 1110 only when the device reports another
+calibration id. So a profile that `tobii-linux-setup` (`-N`, `-G`) or the
+Python `profiles switch` made current reaches the device with its own eyes
+even when its calibration is already there. Nothing is sent without a current
+profile, and a failure is logged without stopping the service (service).
+Profile storage is in docs/gaze-calibration.md (Calibration
 profiles).
+
+The experience app (`crates/tobii-experience/src/link.rs`) waits 2 s for a
+reply, except for `SwitchProfile` and `SetTrackedEyes`, which reach the
+device: one apply can take 24 s on the service (1490, 3160 and 1490 with the
+3 s device-call timeout, 1110 with `TRANSFER_TIMEOUT_S` of 15 s), and a request
+may first wait for the apply of an attach, so the app waits 50 s for those. A
+reply that does not come in time drops the connection, which the tray shows as
+an error until the reconnect (unit, and `a_slow_profile_switch_keeps_the_connection`
+in `crates/tobii-experience/tests/link.rs`).
 
 Tracked eyes use Tobii's registry encoding `both 0, left 1, right 2`
 (`TrackedEyes::registry_value`) and the device's eye selector `both 3, left 1,
@@ -103,7 +127,9 @@ and detach, on/off, release and reacquire, a display area read at attach, and
 after each profile apply. The profile is read when an event is due; changing
 the profile file alone sends nothing. `ControlClient` skips events it cannot
 decode, so a service may add event kinds; a field added to the status needs a
-default for older services. When a request changes the status, its event comes before its reply.
+default for older services: `Status` decodes missing fields as their defaults
+(`false`, no profile), so a newer app reads an older service's status (unit).
+When a request changes the status, its event comes before its reply.
 Mapping the status to Tobii's device states (Configuring while released, Device
 not connected while detached) is the app's job.
 

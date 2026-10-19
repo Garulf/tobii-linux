@@ -242,6 +242,13 @@ Record: the apply log line; whether one-eye tracking survived the replug.
 
 ## 11. Gaze preview: placement, click-through and monitor
 
+First: check that `~/.local/share/tobii-linux/display-setup.json` has a `monitor.connector`
+field. Records written by an older setup (or by the Python setup) have only `monitor.key`
+and `monitor.edid_id`; the app then finds the monitor by that output name, else by the
+EDID manufacturer and product code, which two identical monitors share. If `connector` is
+missing, rerun `Set up display` on the page so the record names the output and carries the
+full EDID.
+
 Do: on the page, turn on `Preview my gaze` while the page window is focused. Look around
 the monitor the tracker is mounted on. Click on a window under the bubble. Move focus to
 another window, then back. With two monitors, check that the bubble stays on the tracked
@@ -266,7 +273,7 @@ it first ([rust.md](rust.md#experience-app)), so this line means a binary built 
 Record: a short screen recording; whether the bubble sits under the gaze point and on the
 right monitor; whether clicks pass through; size, colour and trail compared with Windows;
 the app log line naming the GL path (`accumulation R32F` or similar); whether the
-layer-shell warning appeared.
+layer-shell warning appeared; whether the record had `connector` before the test.
 
 ## 12. Minimizing the page (X11 only)
 

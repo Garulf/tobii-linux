@@ -143,7 +143,9 @@ xrandr output.
 `gtk::Application` (`org.tobii_linux.Experience`): the first instance starts the service
 unit with `systemctl --user start`, opens the link to `tobii-linux serve` and publishes the
 tray; a later instance hands its command line (`--guest`, `--page`) to the first one and
-exits. The link and the tray report on their own threads into one `async_channel` that a
+exits, and the first one opens its page for a command line without `--guest` (decision: a
+second launch shows the running app instead of a second tray icon). The link and the tray
+report on their own threads into one `async_channel` that a
 future on the GTK main context drains. Quit asks with Tobii's dialog unless "Don’t show
 this again." was ticked, then stops the unit and exits; `--guest` runs
 `tobii-linux-setup --guest` while the device is in use or needs setting up. Every setup run
@@ -165,8 +167,11 @@ single-instance test (`dbus-run-session` from the shell) and starts Xvfb when th
 display; the test is skipped without either.
 
 The flake's `tobii-experience` package (buildRustPackage with gtk4, gtk4-layer-shell and
-wrapGAppsHook4) wraps the binary with a fontconfig file that adds Selawik
-(`nix/selawik.nix`; nixpkgs has no package for it) and with `tobii-setup` on its `PATH`,
+wrapGAppsHook4) wraps the binary with a fontconfig file (`FONTCONFIG_FILE`, unless one is
+set) that includes the system's `/etc/fonts/fonts.conf` and adds Selawik
+(`nix/selawik.nix`; nixpkgs has no package for it), so the app and the setup runs it
+starts, which inherit the variable, see the system's fonts and Selawik; and with
+`tobii-setup` on its `PATH`,
 and installs a "Tobii Experience" launcher entry. The default package links the binary
 as `bin/tobii-linux-experience`. The build runs the crate's tests; those that need a
 display or a session bus skip there.
@@ -206,13 +211,14 @@ it unchanged:
 
 - `probe`, `headpose`: the descriptor probe and the head-pose JSON lines;
 - `serve` (with `--tet-tcp`, `--wine-clock`, `--no-gaze`, `--sesp-positions`): the
-  game service;
-  Unlike the Python command, `serve` does not require `--display`: as Tobii's runtime
-  does, each tracker session reads the display area the tracker holds (1430) and the
-  service answers property 1 with it, notifying subscribers when it changes. `--display`
-  (the NixOS module's `displayArea`) overrides it and then no 1430 read is sent. With
-  neither, the session serves gaze and presence without head pose and property 1 stays
-  refused. `headpose` still requires `--display`;
+  game service. Unlike the Python command, `serve` does not require `--display`: as
+  Tobii's runtime does, each tracker session reads the display area the tracker holds
+  (1430) and the service answers property 1 with it, notifying subscribers when it
+  changes. `--display` (the NixOS module's `displayArea`) overrides it, and then the
+  session sends no 1430 of its own; with `--tet-tcp` the getter capture at session start
+  (`CAPTURED_GETTERS`, `crates/tobii-service/src/tet_tcp.rs`) still sends 1430, but its
+  reply only feeds TCP 4455. With neither, the session serves gaze and presence without
+  head pose and property 1 stays refused. `headpose` still requires `--display`;
 - `demo`: the browser demo, serving `src/tobii_linux/demo/static` compiled in;
 - `setup`: runs `tobii-linux-setup` (the GTK app, `crates/tobii-setup`) with the same
   arguments, found beside the executable or on `PATH`. Its exit codes are the Python
