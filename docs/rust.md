@@ -134,6 +134,32 @@ display set up with a diagonal over 700 mm stalls its calibration). On a real de
 moves with `fullscreen_on_monitor` to the monitor whose GDK connector matches the
 xrandr output.
 
+## Experience app
+
+`crates/tobii-experience` is Tobii Experience for Linux (behaviour in
+[experience-app.md](experience-app.md)). Its binary `tobii-linux-experience` is a unique
+`gtk::Application` (`org.tobii_linux.Experience`): the first instance starts the service
+unit with `systemctl --user start`, opens the link to `tobii-linux serve` and publishes the
+tray; a later instance hands its command line (`--guest`, `--page`) to the first one and
+exits. The link and the tray report on their own threads into one `async_channel` that a
+future on the GTK main context drains. Quit asks with Tobii's dialog unless "Don’t show
+this again." was ticked, then stops the unit and exits; `--guest` runs
+`tobii-linux-setup --guest` while the device is in use or needs setting up. Settings live in
+`$XDG_CONFIG_HOME/tobii-linux/experience.json`.
+
+The status mapping, link, tray, command line, settings, quit decisions and guest launcher
+build and test without GTK; `app`, the dialogs and the binary need the `gtk` feature:
+
+```sh
+make experience-app    # release build of tobii-linux-experience (prints its path)
+make experience-test   # tests and clippy -D warnings with the gtk feature
+make experience-run EXPERIENCE_ARGS="--page"
+```
+
+They run like the setup targets. `experience-test` also needs a session bus for the
+single-instance test (`dbus-run-session` from the shell) and starts Xvfb when there is no
+display; the test is skipped without either.
+
 ## Binary
 
 `crates/tobii-linux` builds the `tobii-linux` command without Python. Subcommands,

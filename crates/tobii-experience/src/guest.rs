@@ -1,0 +1,170 @@
+//! Tobii's guest calibration launcher (docs/experience-app.md section 6): `--guest` stands in
+//! for Ctrl+Shift+F10 and runs `tobii-linux-setup --guest`, Tobii's `-G`.
+
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::status::DeviceStatus;
+
+pub const SETUP_BINARY: &str = "tobii-linux-setup";
+pub const GUEST_ARGUMENTS: [&str; 1] = ["--guest"];
+
+/// Whether Tobii's `TrackingDeviceStatusConstraint` lets the guest shortcut run.
+pub fn guest_allowed(status: DeviceStatus) -> bool {
+    matches!(status, DeviceStatus::Tracking | DeviceStatus::InvalidConfiguration)
+}
+
+/// Called with the setup run's exit once it ends.
+pub type OnExit = Box<dyn FnOnce(io::Result<ExitStatus>) + Send>;
+
+/// Why a setup run did not start.
+#[derive(Debug)]
+pub enum LaunchError {
+    /// A setup run started by this app has not ended yet (Tobii's `AlreadyRunning`).
+    AlreadyRunning,
+    Spawn(io::Error),
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LaunchError::AlreadyRunning => f.write_str("a setup run is already active"),
+            LaunchError::Spawn(error) => write!(f, "cannot start {SETUP_BINARY}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LaunchError {}
+
+/// Starts `tobii-linux-setup` runs, one at a time.
+pub trait SetupLauncher: fmt::Debug {
+    fn launch(&self, arguments: &[&str], on_exit: OnExit) -> Result<(), LaunchError>;
+}
+
+/// The real launcher: one child process at a time, waited for on its own thread.
+#[derive(Debug)]
+pub struct SetupProcess {
+    binary: PathBuf,
+    running: Arc<AtomicBool>,
+}
+
+impl SetupProcess {
+    pub fn new(binary: PathBuf) -> SetupProcess {
+        SetupProcess { binary, running: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// The command line of a run with `arguments`.
+    pub fn command(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.binary);
+        command.args(arguments);
+        command
+    }
+}
+
+impl SetupLauncher for SetupProcess {
+    fn launch(&self, arguments: &[&str], on_exit: OnExit) -> Result<(), LaunchError> {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return Err(LaunchError::AlreadyRunning);
+        }
+        let mut child = match self.command(arguments).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.running.store(false, Ordering::Release);
+                return Err(LaunchError::Spawn(error));
+            }
+        };
+        let running = self.running.clone();
+        let waiter = std::thread::Builder::new().name("tobii-experience-setup".into()).spawn(move || {
+            let status = child.wait();
+            running.store(false, Ordering::Release);
+            on_exit(status);
+        });
+        if let Err(error) = waiter {
+            self.running.store(false, Ordering::Release);
+            return Err(LaunchError::Spawn(error));
+        }
+        Ok(())
+    }
+}
+
+/// `tobii-linux-setup` next to this executable when it is there (a build tree or one install
+/// prefix), else the bare name for a `PATH` lookup.
+pub fn setup_binary(current_exe: Option<&Path>) -> PathBuf {
+    current_exe
+        .and_then(Path::parent)
+        .map(|directory| directory.join(SETUP_BINARY))
+        .filter(|sibling| sibling.is_file())
+        .unwrap_or_else(|| PathBuf::from(SETUP_BINARY))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn guest_runs_only_while_tracking_or_needing_setup() {
+        use DeviceStatus as D;
+        let allowed = [D::Tracking, D::InvalidConfiguration];
+        for status in [
+            D::Initializing,
+            D::Tracking,
+            D::TrackingPaused,
+            D::DeviceNotConnected,
+            D::InvalidConfiguration,
+            D::Configuring,
+            D::Error,
+        ] {
+            assert_eq!(guest_allowed(status), allowed.contains(&status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn guest_command_is_setup_with_guest() {
+        let launcher = SetupProcess::new(PathBuf::from(SETUP_BINARY));
+        let command = launcher.command(&GUEST_ARGUMENTS);
+        assert_eq!(command.get_program(), "tobii-linux-setup");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--guest"]);
+    }
+
+    #[test]
+    fn setup_binary_prefers_the_sibling() {
+        let directory = std::env::temp_dir().join(format!("tobii-experience-sibling-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exe = directory.join("tobii-linux-experience");
+        assert_eq!(setup_binary(Some(&exe)), PathBuf::from("tobii-linux-setup"));
+        std::fs::write(directory.join("tobii-linux-setup"), "").unwrap();
+        assert_eq!(setup_binary(Some(&exe)), directory.join("tobii-linux-setup"));
+        assert_eq!(setup_binary(None), PathBuf::from("tobii-linux-setup"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_second_run_is_refused_while_the_first_one_runs() {
+        let launcher = SetupProcess::new(PathBuf::from("sleep"));
+        let (exited, exits) = mpsc::channel();
+        let report = |exited: mpsc::Sender<bool>| -> OnExit {
+            Box::new(move |status: io::Result<ExitStatus>| {
+                let _ = exited.send(status.unwrap().success());
+            })
+        };
+        launcher.launch(&["0.3"], report(exited.clone())).unwrap();
+        assert!(matches!(launcher.launch(&["0"], report(exited.clone())), Err(LaunchError::AlreadyRunning)));
+        assert!(exits.recv_timeout(Duration::from_secs(5)).unwrap());
+        launcher.launch(&["0"], report(exited)).unwrap();
+        assert!(exits.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn a_missing_binary_does_not_count_as_running() {
+        let launcher = SetupProcess::new(PathBuf::from("/nonexistent/tobii-linux-setup"));
+        assert!(matches!(launcher.launch(&GUEST_ARGUMENTS, Box::new(drop)), Err(LaunchError::Spawn(_))));
+        assert!(matches!(launcher.launch(&GUEST_ARGUMENTS, Box::new(drop)), Err(LaunchError::Spawn(_))));
+    }
+}

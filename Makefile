@@ -87,3 +87,30 @@ setup-test:
 
 setup-run: setup-app
 	$(GTK_RUN) '$(GTK_TARGET_DIR)/release/tobii-linux-setup $(SETUP_ARGS)'
+
+# The GTK 4 experience app (crates/tobii-experience, feature gtk). Its single-instance test
+# needs a display and a session bus: it gets a private bus from dbus-run-session, and Xvfb
+# when there is no display. Xvfb is waited for: nix-portable's proot exits with the status
+# of the last process to end, which would otherwise hide a failed test.
+EXPERIENCE_ARGS ?=
+EXPERIENCE_DISPLAY ?= :97
+EXPERIENCE_XVFB := xvfb=; if [ -z "$$DISPLAY$$WAYLAND_DISPLAY" ]; then \
+		Xvfb $(EXPERIENCE_DISPLAY) -screen 0 1920x1080x24 -nolisten tcp 2>/dev/null & xvfb=$$!; \
+		export DISPLAY=$(EXPERIENCE_DISPLAY); sleep 1; fi; \
+	export GDK_BACKEND=$${GDK_BACKEND:-$$( [ -n "$$WAYLAND_DISPLAY" ] && echo wayland || echo x11 )};
+EXPERIENCE_BUS := dbus-run-session $${DBUS_SESSION_CONFIG:+--config-file=$$DBUS_SESSION_CONFIG} --
+
+.PHONY: experience-app experience-test experience-run
+
+experience-app:
+	$(GTK_RUN) '$(GTK_CARGO) build --release -p tobii-experience --features gtk'
+	@echo $(GTK_TARGET_DIR)/release/tobii-linux-experience
+
+experience-test:
+	$(GTK_RUN) '$(EXPERIENCE_XVFB) \
+		$(EXPERIENCE_BUS) env $(GTK_CARGO) test -p tobii-experience --features gtk; status=$$?; \
+		[ -z "$$xvfb" ] || { kill $$xvfb; wait $$xvfb; }; [ $$status = 0 ] && \
+		$(GTK_CARGO) clippy -p tobii-experience --features gtk --all-targets -- -D warnings'
+
+experience-run: experience-app
+	$(GTK_RUN) '$(GTK_TARGET_DIR)/release/tobii-linux-experience $(EXPERIENCE_ARGS)'

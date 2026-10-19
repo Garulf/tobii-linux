@@ -35,6 +35,7 @@ sha2 = "0.11"
 libloading = "0.9"
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 png = "0.18"
+async-channel = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
