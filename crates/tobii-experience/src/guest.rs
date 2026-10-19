@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
@@ -66,22 +67,25 @@ pub trait SetupLauncher: fmt::Debug {
     fn launch(&self, arguments: &[&str], on_exit: OnExit) -> Result<(), LaunchError>;
 }
 
-/// The real launcher: one child process at a time, waited for on its own thread.
+/// The real launcher: one child process at a time, waited for on its own thread. Every run
+/// gets `--service` with the app's service address, so setup borrows the tracker from the
+/// same `tobii-linux serve` the app talks to.
 #[derive(Debug)]
 pub struct SetupProcess {
     binary: PathBuf,
+    service: SocketAddr,
     running: Arc<AtomicBool>,
 }
 
 impl SetupProcess {
-    pub fn new(binary: PathBuf) -> SetupProcess {
-        SetupProcess { binary, running: Arc::new(AtomicBool::new(false)) }
+    pub fn new(binary: PathBuf, service: SocketAddr) -> SetupProcess {
+        SetupProcess { binary, service, running: Arc::new(AtomicBool::new(false)) }
     }
 
     /// The command line of a run with `arguments`.
     pub fn command(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(&self.binary);
-        command.args(arguments);
+        command.args(arguments).arg("--service").arg(self.service.to_string());
         command
     }
 }
@@ -128,6 +132,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::cli::DEFAULT_ADDR;
+
+    fn launcher(binary: &str) -> SetupProcess {
+        SetupProcess::new(PathBuf::from(binary), DEFAULT_ADDR)
+    }
 
     #[test]
     fn guest_runs_only_while_tracking_or_needing_setup() {
@@ -161,10 +170,16 @@ mod tests {
 
     #[test]
     fn guest_command_is_setup_with_guest() {
-        let launcher = SetupProcess::new(PathBuf::from(SETUP_BINARY));
-        let command = launcher.command(&GUEST_ARGUMENTS);
+        let command = launcher(SETUP_BINARY).command(&GUEST_ARGUMENTS);
         assert_eq!(command.get_program(), "tobii-linux-setup");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--guest"]);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--guest", "--service", "127.0.0.1:7760"]);
+    }
+
+    #[test]
+    fn every_run_names_the_apps_service() {
+        let other: SocketAddr = "127.0.0.1:7761".parse().unwrap();
+        let command = SetupProcess::new(PathBuf::from(SETUP_BINARY), other).command(&["-C"]);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["-C", "--service", "127.0.0.1:7761"]);
     }
 
     #[test]
@@ -181,23 +196,23 @@ mod tests {
 
     #[test]
     fn a_second_run_is_refused_while_the_first_one_runs() {
-        let launcher = SetupProcess::new(PathBuf::from("sleep"));
+        let launcher = launcher("sh");
         let (exited, exits) = mpsc::channel();
         let report = |exited: mpsc::Sender<bool>| -> OnExit {
             Box::new(move |status: io::Result<ExitStatus>| {
                 let _ = exited.send(status.unwrap().success());
             })
         };
-        launcher.launch(&["0.3"], report(exited.clone())).unwrap();
-        assert!(matches!(launcher.launch(&["0"], report(exited.clone())), Err(LaunchError::AlreadyRunning)));
+        launcher.launch(&["-c", "sleep 0.3"], report(exited.clone())).unwrap();
+        assert!(matches!(launcher.launch(&["-c", "true"], report(exited.clone())), Err(LaunchError::AlreadyRunning)));
         assert!(exits.recv_timeout(Duration::from_secs(5)).unwrap());
-        launcher.launch(&["0"], report(exited)).unwrap();
+        launcher.launch(&["-c", "true"], report(exited)).unwrap();
         assert!(exits.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 
     #[test]
     fn a_missing_binary_does_not_count_as_running() {
-        let launcher = SetupProcess::new(PathBuf::from("/nonexistent/tobii-linux-setup"));
+        let launcher = launcher("/nonexistent/tobii-linux-setup");
         assert!(matches!(launcher.launch(&GUEST_ARGUMENTS, Box::new(drop)), Err(LaunchError::Spawn(_))));
         assert!(matches!(launcher.launch(&GUEST_ARGUMENTS, Box::new(drop)), Err(LaunchError::Spawn(_))));
     }

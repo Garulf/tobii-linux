@@ -396,18 +396,25 @@ mod tests {
 
     #[test]
     fn buttons_start_setup_with_tobiis_arguments() {
-        let launcher = SetupProcess::new(PathBuf::from(SETUP_BINARY));
+        let launcher = SetupProcess::new(PathBuf::from(SETUP_BINARY), crate::cli::DEFAULT_ADDR);
         let command_line = |flow: SetupFlow| {
             let command = launcher.command(&[flow.argument()]);
             let mut line = vec![command.get_program().to_string_lossy().into_owned()];
             line.extend(command.get_args().map(|argument| argument.to_string_lossy().into_owned()));
             line
         };
-        assert_eq!(command_line(SetupFlow::Calibrate), ["tobii-linux-setup", "-C"]);
-        assert_eq!(command_line(SetupFlow::CreateNewProfile), ["tobii-linux-setup", "-N"]);
+        assert_eq!(command_line(SetupFlow::Calibrate), ["tobii-linux-setup", "-C", "--service", "127.0.0.1:7760"]);
+        assert_eq!(
+            command_line(SetupFlow::CreateNewProfile),
+            ["tobii-linux-setup", "-N", "--service", "127.0.0.1:7760"]
+        );
         for state in PageState::ALL {
             let expected = if state == PageState::InvalidMonitorSetup { "-R" } else { "-S" };
-            assert_eq!(command_line(SetupFlow::display(state)), ["tobii-linux-setup", expected], "{state:?}");
+            assert_eq!(
+                command_line(SetupFlow::display(state)),
+                ["tobii-linux-setup", expected, "--service", "127.0.0.1:7760"],
+                "{state:?}"
+            );
         }
         assert_eq!(SetupFlow::Calibrate.action(), PageAction::ImproveCalibration);
         assert_eq!(SetupFlow::CreateNewProfile.action(), PageAction::CreateNewProfile);

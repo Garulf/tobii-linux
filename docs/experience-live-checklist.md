@@ -212,7 +212,7 @@ on/off file before and after; how long the relaunch took to reach `In use`.
 ## 9. Profile switch and tracked eyes
 
 Do: with at least two profiles, open the page and click a listed profile. Then open
-`Select eyes to detect` and choose `Left eye only`; check the gaze preview (item 10) with
+`Select eyes to detect` and choose `Left eye only`; check the gaze preview (item 11) with
 the right eye closed, then the left. Set `Both eyes` again.
 
 Expect: as in Tobii's page (section 4.6): the click makes it current, the list then shows
@@ -254,9 +254,19 @@ the display setup; clicks reach the window underneath, and keyboard focus stays 
 was ([gaze-preview.md](gaze-preview.md#linux-port)). It disappears when the page loses
 focus and comes back when it regains it.
 
+Also look in the app log for `Failed to initialize layer surface, GTK4 Layer Shell may
+have been linked after libwayland.`, which gtk4-layer-shell prints when it was loaded after
+`libwayland-client` and so cannot place the surface
+(https://github.com/wmww/gtk4-layer-shell/blob/main/linking.md). The packaged binary loads
+it first ([rust.md](rust.md#experience-app)), so this line means a binary built another way
+(for example `make experience-app` against a host GTK). Record which binary ran
+(`readlink -f $(command -v tobii-linux-experience)`) and do not work around it with
+`LD_PRELOAD`: the setup app started from the page would inherit it.
+
 Record: a short screen recording; whether the bubble sits under the gaze point and on the
 right monitor; whether clicks pass through; size, colour and trail compared with Windows;
-the app log line naming the GL path (`accumulation R32F` or similar).
+the app log line naming the GL path (`accumulation R32F` or similar); whether the
+layer-shell warning appeared.
 
 ## 12. Minimizing the page (X11 only)
 

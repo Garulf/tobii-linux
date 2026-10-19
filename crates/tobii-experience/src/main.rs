@@ -29,8 +29,8 @@ fn main() -> ExitCode {
         log::set_max_level(LevelFilter::Info);
     }
     let argv: Vec<String> = std::env::args_os().map(|argument| argument.to_string_lossy().into_owned()).collect();
-    match cli::parse(argv.iter().skip(1).cloned()) {
-        Ok(Command::Run(_)) => {}
+    let options = match cli::parse(argv.iter().skip(1).cloned()) {
+        Ok(Command::Run(options)) => options,
         Ok(Command::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -39,6 +39,6 @@ fn main() -> ExitCode {
             eprintln!("{}\nerror: {error}", USAGE.lines().next().unwrap_or_default());
             return ExitCode::from(2);
         }
-    }
-    ExitCode::from(Shell::new(Deps::system()).run(argv).get())
+    };
+    ExitCode::from(Shell::new(Deps::system(options.service)).run(argv).get())
 }

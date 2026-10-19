@@ -146,7 +146,9 @@ tray; a later instance hands its command line (`--guest`, `--page`) to the first
 exits. The link and the tray report on their own threads into one `async_channel` that a
 future on the GTK main context drains. Quit asks with Tobii's dialog unless "Don’t show
 this again." was ticked, then stops the unit and exits; `--guest` runs
-`tobii-linux-setup --guest` while the device is in use or needs setting up. Settings live in
+`tobii-linux-setup --guest` while the device is in use or needs setting up. Every setup run
+it starts (the page's buttons and `--guest`) also gets `--service` with the app's own
+service address, so a service on another port lends setup the tracker. Settings live in
 `$XDG_CONFIG_HOME/tobii-linux/experience.json`.
 
 The status mapping, link, tray, command line, settings, quit decisions and guest launcher
@@ -168,6 +170,14 @@ wrapGAppsHook4) wraps the binary with a fontconfig file that adds Selawik
 and installs a "Tobii Experience" launcher entry. The default package links the binary
 as `bin/tobii-linux-experience`. The build runs the crate's tests; those that need a
 display or a session bus skip there.
+
+gtk4-layer-shell only works when the dynamic linker loads it before `libwayland-client`
+(https://github.com/wmww/gtk4-layer-shell/blob/main/linking.md). The `gtk4-layer-shell`
+crate links it ahead of GTK, and the package's binary keeps that order:
+`readelf -d bin/.tobii-linux-experience-wrapped` lists `libgtk4-layer-shell.so.0` as the
+first `NEEDED` entry, before `libgtk-4.so.1`, with no direct `libwayland-client` (it comes
+in through gtk4-layer-shell and GTK), and `LD_TRACE_LOADED_OBJECTS=1` on it loads
+`libgtk4-layer-shell.so.0` first and `libwayland-client.so.0` 13 libraries later.
 
 ```sh
 ~/.local/bin/nix-portable nix build -L --no-link \

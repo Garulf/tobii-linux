@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -50,12 +51,13 @@ pub struct Deps {
 }
 
 impl Deps {
-    /// `systemctl --user`, `tobii-linux-setup`, the settings file and the tray.
-    pub fn system() -> Deps {
+    /// `systemctl --user`, `tobii-linux-setup` pointed at the service at `service`, the
+    /// settings file and the tray.
+    pub fn system(service: SocketAddr) -> Deps {
         let exe = std::env::current_exe().ok();
         Deps {
             service: Arc::new(Systemctl),
-            setup: Rc::new(SetupProcess::new(setup_binary(exe.as_deref()))),
+            setup: Rc::new(SetupProcess::new(setup_binary(exe.as_deref()), service)),
             settings_path: Settings::default_path(),
             tray: true,
             profiles: ProfileStore::default_location(),
