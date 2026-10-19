@@ -284,6 +284,11 @@ impl ItemPump {
         }
     }
 
+    /// Restarts the silence clock: the device answered a request, so the session is alive.
+    pub fn alive(&mut self) {
+        self.last_data = Instant::now();
+    }
+
     /// Bytes from one read of [`READ_SLICE_MS`]. Fails, marking the session dead, when the
     /// host was suspended (`resumed`) or no stream data arrived for the silence timeout
     /// while not paused.

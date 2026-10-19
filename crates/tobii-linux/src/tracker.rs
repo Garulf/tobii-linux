@@ -426,8 +426,10 @@ impl Reading<'_, '_> {
             if stop.is_set() {
                 return Ok(());
             }
-            if let Err(error) = self.answer_requests(session) {
-                return Err(failed(session, error));
+            match self.answer_requests(session) {
+                Ok(true) => pump.alive(),
+                Ok(false) => {}
+                Err(error) => return Err(failed(session, error)),
             }
             if !session.pending_streams.is_empty() {
                 pump.extend(session.take_pending_streams());
@@ -439,12 +441,15 @@ impl Reading<'_, '_> {
         }
     }
 
-    /// Answers every waiting request; fails when one leaves the session dead.
-    fn answer_requests<C: Channel>(&self, session: &mut TrackerSession<C>) -> std::result::Result<(), DeviceError> {
-        let Some(requests) = &self.requests else { return Ok(()) };
+    /// Answers every waiting request; whether the device replied to any. Fails when one
+    /// leaves the session dead.
+    fn answer_requests<C: Channel>(&self, session: &mut TrackerSession<C>) -> std::result::Result<bool, DeviceError> {
+        let Some(requests) = &self.requests else { return Ok(false) };
+        let mut replied = false;
         while let Ok(request) = requests.try_recv() {
             let outcome = (request.build)(session.next_id()).map_err(DeviceError::from).and_then(|message| {
-                let reply = session.request(&message, request.timeout)?;
+                let reply = session.request_streaming(&message, request.timeout)?;
+                replied |= reply.is_some();
                 session.finish_call(&message, reply)
             });
             match outcome {
@@ -457,7 +462,7 @@ impl Reading<'_, '_> {
                 }
             }
         }
-        Ok(())
+        Ok(replied)
     }
 
     fn device_time(&mut self, device_us: i64) -> i64 {

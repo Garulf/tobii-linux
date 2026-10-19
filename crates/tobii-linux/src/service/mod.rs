@@ -453,6 +453,8 @@ impl PrpService {
 
     /// Sends the request `build` makes through the running tracker session and waits for
     /// the reply, which fails on a nonzero status or when none arrives within `timeout`.
+    /// A missing reply ends the whole tracker session, as any unanswered call does, so
+    /// `timeout` must leave the device ample time.
     pub async fn device_call(
         &self,
         build: impl FnOnce(u32) -> Result<Message, ProtocolError> + Send + 'static,

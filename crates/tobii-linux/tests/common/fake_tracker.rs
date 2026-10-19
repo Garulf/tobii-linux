@@ -125,6 +125,9 @@ struct Device {
     stalled: bool,
     last_read: Option<Instant>,
     sent: u64,
+    trailing: Option<(u32, Vec<Message>)>,
+    slow: Option<(u32, Duration)>,
+    delayed: Option<(Instant, Vec<u8>)>,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -147,6 +150,9 @@ impl FakeTracker {
             stalled: false,
             last_read: None,
             sent: 0,
+            trailing: None,
+            slow: None,
+            delayed: None,
         })))
     }
 
@@ -176,6 +182,18 @@ impl FakeTracker {
     /// unsubscription.
     pub fn failing_unsubscribe(self, position: usize) -> Self {
         self.device().failing_request = Some(position);
+        self
+    }
+
+    /// Sends `stream` in the same read as the reply to the next `command` request.
+    pub fn trailing(self, command: u32, stream: Vec<Message>) -> Self {
+        self.device().trailing = Some((command, stream));
+        self
+    }
+
+    /// Holds every reply to `command` back for `delay`.
+    pub fn slow_reply(self, command: u32, delay: Duration) -> Self {
+        self.device().slow = Some((command, delay));
         self
     }
 
@@ -213,7 +231,15 @@ impl Device {
             command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
             _ => reply(&request, 0, &[]),
         };
-        self.outgoing.push_back(answer.encode().unwrap());
+        let mut bytes = answer.encode().unwrap();
+        if let Some((_, stream)) = self.trailing.take_if(|(command, _)| *command == request.command) {
+            stream.iter().for_each(|message| bytes.extend(message.encode().unwrap()));
+        }
+        if let Some((_, delay)) = self.slow.filter(|(command, _)| *command == request.command) {
+            self.delayed = Some((Instant::now() + delay, bytes));
+            return;
+        }
+        self.outgoing.push_back(bytes);
         if request.command == command::SUBSCRIBE_STREAM {
             self.subscribed(&request);
         }
@@ -296,6 +322,9 @@ impl Channel for FakeTracker {
             drop(device);
             idle(timeout_ms);
             return Ok(Vec::new());
+        }
+        if let Some((_, bytes)) = device.delayed.take_if(|(at, _)| *at <= now) {
+            return Ok(bytes);
         }
         if let Some(message) = device.outgoing.pop_front() {
             return Ok(message);
