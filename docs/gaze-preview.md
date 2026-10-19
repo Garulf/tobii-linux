@@ -40,7 +40,12 @@ static:
 - The constructor calls `GazeNative_Initialize` (:176), then on a worker task
   sets Size 0.075, Strength 0.95, Decay 0.95, Filter 0.75, Trail 0.7 and
   `ForegroundColor = Color.Silver` (:189-194). `Color.Silver` is packed
-  `0xFFC0C0C0` (`Tobii.Tech.NETCommon.Mathematics.Color`), so the colour is
+  `0xFFC0C0C0`: `Color.get_Silver` (RVA `0x8888`) is
+  `ldc.i4 0xFFC0C0C0; newobj Color::.ctor(uint32); ret`, the `ldc.i4` at file
+  offset `0x6a89` of
+  `portal/app/Tobii.EyeTracking.Portal.WPF/Tobii.Tech.NETCommon.Mathematics.dll`
+  (SHA-256 `3871f21bb2434ee745a6eacca17ab3a49c9348bf698162b91eb53a893dd9d3f0`,
+  bytes `20 c0 c0 c0 ff`, the only such sequence in the file). So the colour is
   (192, 192, 192, 255) / 255 = (0.75294, 0.75294, 0.75294, 1.0) through
   `ColorExtensions.ToFloat` (byte / 255). The background colour is never set.
 - It then loops: `GazeNative_Update`, then sleeps until 12 ms after the start
@@ -65,7 +70,7 @@ static:
 Every setter stores one global; the getters read it back (static,
 `0x180003880` to `0x1800039f0`).
 
-| Setter | Global | `Initialize` default | Managed value | Used by |
+| Setter | Global | `Initialize` default (overridden) | Managed value (in effect) | Used by |
 | --- | --- | --- | --- | --- |
 | `SetSize` | `0x18000de6c` | 0.04 (`0x180006db0`) | 0.075 | CB `radius`; bounding-box radius |
 | `SetStrength` | `0x18000de90` | 0.5 (`0x180006db8`) | 0.95 | CB `strength` |
@@ -462,7 +467,7 @@ precision highp float;
 layout(std140) uniform Params {
     vec4 gaze, gaze1, gaze2, aspect, decay, strength, radius, color, trail, heatmap, background_color;
 };
-uniform sampler2D previous;
+uniform highp sampler2D previous;
 in vec2 uv;
 out vec4 frag;
 void main() {
@@ -535,7 +540,7 @@ precision highp float;
 layout(std140) uniform Params {
     vec4 gaze, gaze1, gaze2, aspect, decay, strength, radius, color, trail, heatmap, background_color;
 };
-uniform sampler2D accumulation;
+uniform highp sampler2D accumulation;
 uniform sampler2D gradient;
 in vec2 uv;
 out vec4 frag;
@@ -588,6 +593,28 @@ with alpha 0 for the first texels. Neither is reachable.
 ## Notes for the GL port
 
 Inference, for the GTK overlay; none of this is Tobii's code.
+
+- Use the managed values, not the `Initialize` defaults. The managed worker
+  sets them right after `GazeNative_Initialize` and before its first
+  `GazeNative_Update` (`GazeTraceVisualization.cs:189-194`, static), so the
+  `Initialize` column of the parameter table is never in effect:
+
+  | Parameter | Value |
+  | --- | --- |
+  | Size (`radius`) | 0.075 |
+  | Strength | 0.95 |
+  | Decay | 0.95 |
+  | Filter | 0.75 (t = 0.325) |
+  | Trail | 0.7 (box history 158 entries) |
+  | Colour | Silver `0xFFC0C0C0`: (0.75294, 0.75294, 0.75294, 1.0) |
+  | Background colour | (0, 0, 0, 0), never set |
+  | Mode / `heatmap` | 0 / 0.0 |
+
+- Declare the accumulation samplers `highp` (`uniform highp sampler2D`), as
+  in the GLSL above. GLSL ES 3.00 fragment shaders default `sampler2D` to
+  `lowp`, so `texture()` would return a value only guaranteed in (-2, 2),
+  while the accumulation reaches about 57 at the centre. The gradient sampler
+  holds 0..1 colours and can stay at the default.
 
 - Run the trail pass once per update tick, as Tobii does (one render per
   `GazeNative_Update`, nominally every 12 ms). Decay is per frame, so a
