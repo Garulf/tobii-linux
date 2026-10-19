@@ -799,14 +799,15 @@ fn resolve_ends_after_the_display_on_a_calibrated_monitor() {
 }
 
 #[test]
-fn resolve_with_nothing_to_do_says_so() {
+fn resolve_with_nothing_to_do_ends_without_a_page() {
     let mut harness = Harness::new(Simulation::default(), Vec::new());
     with_current_profile(&harness, "Garulf", 0x1234);
     harness.options.flow = FlowKind::ResolveConfiguration;
     let outcome = harness.run();
     assert_eq!(outcome.status, Status::Finished, "{}", outcome.message);
-    assert!(!harness.names().contains(&"display") && !harness.names().contains(&"calibration"));
-    assert_eq!(outcome.message, "Your eye tracker is set up");
+    assert!(outcome.closes_window, "the window closes as soon as the run ends");
+    assert_eq!(harness.names(), ["connecting"], "no page of its own");
+    assert!(!harness.commands().iter().any(|c| WRITES.contains(c)));
 }
 
 #[test]

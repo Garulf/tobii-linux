@@ -227,6 +227,8 @@ pub struct SetupOutcome {
     pub backups: Vec<PathBuf>,
     pub message: String,
     pub monitor: Option<Json>,
+    /// The run ended without a last page (`-R` with nothing to resolve): close the window.
+    pub closes_window: bool,
 }
 
 #[derive(Debug, Error)]
@@ -557,12 +559,12 @@ impl SetupFlow {
             return Err(FlowError::Other("The eye tracker has no display setup; run the display setup first".into()));
         }
         if self.configuration_complete()? {
-            let (title, text) = if display_runs {
-                ("Display setup done", display_summary(&area))
+            if display_runs {
+                self.finish("Display setup done", &display_summary(&area));
             } else {
-                ("Your eye tracker is set up", "The display and your calibration are set up already.".to_string())
-            };
-            self.finish(title, &text);
+                self.outcome.status = Status::Finished;
+                self.outcome.closes_window = true;
+            }
             return Ok(());
         }
         self.positioning_step(self.outcome.display_written)?;

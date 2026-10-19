@@ -1021,7 +1021,7 @@ impl Ui {
             println!("monitor: {id} (serve --display-id for window tracking)");
         }
         self.exit.set(self.exit_codes.status(outcome.status));
-        let close = self.state.borrow().close_requested;
+        let close = self.state.borrow().close_requested || outcome.closes_window;
         self.state.borrow_mut().outcome = Some(outcome);
         if close {
             self.window.destroy();

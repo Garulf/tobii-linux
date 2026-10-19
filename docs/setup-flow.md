@@ -281,7 +281,7 @@ configuration arguments, at most one, for the Tobii Experience page
 | `-C` | Calibrate | calibrate the current profile (`--display never`) |
 | `-N` | CreateNewProfile | calibrate, then name a new profile even when one is current |
 | `-S` | SetupDisplay | the display setup only (`--display always --no-calibration`) |
-| `-R` | ResolveConfiguration | the display when the tracker has none, then calibrate only when the current profile has no calibration for the monitor of the display setup (its own `NAME@key.setpm`, or `NAME.setpm` when the record names no monitor); otherwise it ends there |
+| `-R` | ResolveConfiguration | the display when the tracker has none, then calibrate only when the current profile has no calibration for the monitor of the display setup (its own `NAME@key.setpm`, or `NAME.setpm` when the record names no monitor); otherwise it ends there; when it had nothing to do at all it exits 0 and closes its window without a page of its own, as Tobii's flow has none |
 | `-G`, `--guest` | GuestCalibration | calibrate without a name page, save as `Guest` (overwriting it) with both eyes tracked, make it current |
 
 Like Tobii's `-G`, the guest calibration is the same 7-target, three-stage
