@@ -336,6 +336,7 @@ Last verification:
 - [USB capture topology and access limitations](usb-capture-topology.md)
 - [Managed API, ABI and Windows sample observations](managed-api.md)
 - [Star Citizen PRP format and REA evidence ledger](game-interface.md)
+- [Tobii Experience tray, page, on/off, quit and guest behaviour](experience-app.md)
 
 The detailed reports retain source hashes, addresses and actual REA Evidence IDs
 where available. Static analysis, offline emulation and observed Windows runtime
