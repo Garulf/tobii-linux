@@ -36,7 +36,6 @@ use tobii_gaze::operation::{
     Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
 };
 use tobii_headpose::pipeline::HeadPoseSample;
-use tobii_protocol::commands::{pause_device, resume_device};
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
 use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
@@ -63,7 +62,7 @@ use tokio::sync::mpsc;
 
 use crate::tracker::{DeviceReplies, DeviceRequest};
 use clock::{Clock, now_us, readings};
-use enabled::{EnabledState, not_supported};
+use enabled::EnabledState;
 use hub::Hub;
 use link::{Ended, Frames, Link, Outcome, peer_repr, refused};
 
@@ -125,7 +124,7 @@ pub enum Event {
     Requests(std::sync::mpsc::Sender<DeviceRequest>),
 }
 
-/// Why [`PrpService::device_call`] got no reply.
+/// Why [`PrpService::device_call`] got no reply, or [`PrpService::set_enabled`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceCallError {
     #[error("No tracker session is running")]
@@ -134,6 +133,8 @@ pub enum DeviceCallError {
     Device(DeviceError),
     #[error("The tracker session ended before replying")]
     Dropped,
+    #[error("Could not store the eye tracking state: {0}")]
+    Store(#[source] std::io::Error),
 }
 
 impl External for DeviceCallError {
@@ -496,37 +497,19 @@ impl PrpService {
         }
     }
 
-    /// Turns eye tracking on or off for every client, as Tobii's EyeTrackerToggle does:
-    /// the running session's tracker gets 3100 with 0 (resume) or 1 (pause), the state is
-    /// stored and property 4 subscribers are notified. Without a session only the state
-    /// changes, and the next session starts paused. A not-supported reply counts as done;
-    /// any other failure leaves the state as it was.
+    /// Turns eye tracking on or off for every client, as Tobii's EyeTrackerToggle does: the
+    /// state is stored, the pause flag flipped and property 4 subscribers notified. The
+    /// running tracker session pauses (3100 with 1) or resumes (3100 with 0) the device when
+    /// it sees the flag change, and a session that starts later applies it first. A state
+    /// that cannot be stored changes nothing.
     pub async fn set_enabled(&self, enabled: bool) -> Result<(), DeviceCallError> {
-        let was_paused = self.0.paused.load(Ordering::SeqCst);
-        if !enabled {
-            self.0.paused.store(true, Ordering::SeqCst);
+        if let Some(state) = &self.0.enabled_state {
+            state.store(enabled).map_err(DeviceCallError::Store)?;
         }
-        let toggle = move |id| Ok(if enabled { resume_device(id) } else { pause_device(id) });
-        match self.device_call(toggle, tobii_device::session::REQUEST_TIMEOUT).await {
-            Ok(_) | Err(DeviceCallError::NotAttached) => {}
-            Err(DeviceCallError::Device(error)) if not_supported(&error) => {}
-            Err(error) => {
-                self.0.paused.store(was_paused, Ordering::SeqCst);
-                return Err(error);
-            }
-        }
-        self.0.paused.store(!enabled, Ordering::SeqCst);
-        if let Some(state) = &self.0.enabled_state
-            && let Err(error) = state.store(enabled)
-        {
-            log::warn!("could not store the eye tracking state in {}: {error}", state.path().display());
-        }
+        let was_paused = self.0.paused.swap(!enabled, Ordering::SeqCst);
         if was_paused == enabled {
             self.notify(PROPERTY_DEVICE_PAUSED, &paused_notification(!enabled));
-            log::info!(
-                "eye tracking {}",
-                if enabled { "enabled; tracker resumed" } else { "disabled; tracker paused" }
-            );
+            log::info!("eye tracking {}", if enabled { "enabled" } else { "disabled" });
         }
         Ok(())
     }

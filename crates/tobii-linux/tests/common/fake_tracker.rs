@@ -130,6 +130,7 @@ struct Device {
     delayed: Option<(Instant, Vec<u8>)>,
     pausable: bool,
     paused: bool,
+    pause_status: u32,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -157,6 +158,7 @@ impl FakeTracker {
             delayed: None,
             pausable: false,
             paused: false,
+            pause_status: 0,
         })))
     }
 
@@ -202,6 +204,12 @@ impl FakeTracker {
         self
     }
 
+    /// Answers every pause or resume request with this raw status and ignores it.
+    pub fn refusing_pause(self, status: u32) -> Self {
+        self.device().pause_status = status;
+        self
+    }
+
     /// Holds every reply to `command` back for `delay`.
     pub fn slow_reply(self, command: u32, delay: Duration) -> Self {
         self.device().slow = Some((command, delay));
@@ -240,6 +248,7 @@ impl Device {
                 reply(&request, status(self.refuse.contains(&requested_stream(&request))), &[])
             }
             command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
+            command::PAUSE_DEVICE if self.pause_status != 0 => reply(&request, self.pause_status, &[]),
             command::PAUSE_DEVICE if self.pausable => {
                 self.paused = request.payload == pause_device(0).payload;
                 reply(&request, 0, &[])

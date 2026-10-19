@@ -8,10 +8,13 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::*;
+use tobii_device::DeviceError;
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::service::clock::{Clocks, now_us, wine_clock};
-use tobii_linux::service::enabled::EnabledState;
-use tobii_linux::service::{Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame};
+use tobii_linux::service::enabled::{EnabledState, not_supported};
+use tobii_linux::service::{
+    DeviceCallError, Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame,
+};
 use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
@@ -575,6 +578,33 @@ fn disabling_without_a_tracker_session_is_stored_and_read_back() {
         assert_eq!(paused_answer(&mut restarted.session().await).await, word_value(1).0);
         std::fs::remove_dir_all(&directory).unwrap();
     });
+}
+
+#[test]
+fn a_state_that_cannot_be_stored_changes_nothing() {
+    run(async {
+        let directory = state_directory("unwritable");
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocker = directory.join("file");
+        std::fs::write(&blocker, "").unwrap();
+        let options =
+            Options { enabled_state: Some(blocker.join("eye-tracking-enabled")), ..common::options("ET5-TEST") };
+        let fixture = Fixture::new(options).await;
+        let mut session = fixture.session().await;
+        let outcome = fixture.service.set_enabled(false).await;
+        assert!(matches!(outcome, Err(DeviceCallError::Store(_))), "{outcome:?}");
+        assert!(fixture.service.enabled());
+        assert_eq!(paused_answer(&mut session).await, word_value(0).0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    });
+}
+
+#[test]
+fn only_not_supported_statuses_count_as_applied() {
+    let failed = |status| DeviceError::Failed { command: 3100, status, name: String::new() };
+    let applied: Vec<u32> = (0..22).filter(|&status| not_supported(&failed(status))).collect();
+    assert_eq!(applied, [9, 10, 13, 15]);
+    assert!(!not_supported(&DeviceError::Timeout { command: 3100 }));
 }
 
 async fn two_clients_receive_every_sample_with(fixture: Fixture) {

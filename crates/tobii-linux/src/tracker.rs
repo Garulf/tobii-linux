@@ -19,7 +19,7 @@ use tobii_device::streams::{
 };
 use tobii_device::{CameraCalibration, Channel, DeviceError, StopFlag, StopSignal, TrackerSession};
 use tobii_headpose::pipeline::{DisplayArea, HeadPoseSample};
-use tobii_protocol::commands::{Stream, command, header_only_request, pause_device, request};
+use tobii_protocol::commands::{Stream, command, header_only_request, pause_device, request, resume_device};
 use tobii_protocol::fields::Value;
 use tobii_protocol::frames::ImageFrame;
 use tobii_protocol::gaze::{GazeFrame, PLATMOD_UNKNOWN, platmod_presence};
@@ -269,7 +269,9 @@ type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
 /// `device_clock` judges it, ends the session. `device_stream`, when given, also receives
 /// each gaze and presence message as the device sent it, with its time on `clock`.
 /// `requests` are answered on the reading thread between reads, also while no stream data
-/// arrives; while `paused` is set the session is not taken for dead when it falls silent.
+/// arrives. Between reads the tracker is also paused or resumed whenever `paused` differs
+/// from `device_paused`, what it was last told; while `paused` is set the session is not
+/// taken for dead when it falls silent.
 pub struct LiveStreams<'a> {
     pub clock: HostTime,
     pub gaze: GazeCallback<'a>,
@@ -280,6 +282,7 @@ pub struct LiveStreams<'a> {
     pub device_clock: DeviceClockWatch,
     pub requests: Option<DeviceRequests>,
     pub paused: Arc<AtomicBool>,
+    pub device_paused: bool,
 }
 
 impl std::fmt::Debug for LiveStreams<'_> {
@@ -303,6 +306,7 @@ impl<'a> LiveStreams<'a> {
             device_clock: DeviceClockWatch::default(),
             requests: None,
             paused: Arc::default(),
+            device_paused: false,
         }
     }
 
@@ -343,6 +347,7 @@ impl<'a> LiveStreams<'a> {
                 frames,
                 requests: self.requests,
                 paused: self.paused,
+                device_paused: self.device_paused,
             };
             let mut suspend = self.suspend;
             let silence = self.silence;
@@ -394,6 +399,7 @@ struct Reading<'a, 's> {
     frames: &'s Newest<ImageFrame>,
     requests: Option<DeviceRequests>,
     paused: Arc<AtomicBool>,
+    device_paused: bool,
 }
 
 impl Reading<'_, '_> {
@@ -431,6 +437,9 @@ impl Reading<'_, '_> {
                 Ok(false) => {}
                 Err(error) => return Err(failed(session, error)),
             }
+            if let Err(error) = self.apply_pause(session, &mut pump) {
+                return Err(failed(session, error));
+            }
             if !session.pending_streams.is_empty() {
                 pump.extend(session.take_pending_streams());
                 continue;
@@ -463,6 +472,30 @@ impl Reading<'_, '_> {
             }
         }
         Ok(replied)
+    }
+
+    /// Pauses or resumes the tracker when the pause flag differs from what it was last told;
+    /// a not-supported reply counts as applied. Silence counts from the reply.
+    fn apply_pause<C: Channel>(
+        &mut self,
+        session: &mut TrackerSession<C>,
+        pump: &mut ItemPump,
+    ) -> std::result::Result<(), DeviceError> {
+        let paused = self.paused.load(Ordering::SeqCst);
+        if paused == self.device_paused {
+            return Ok(());
+        }
+        let id = session.next_id();
+        let message = if paused { pause_device(id) } else { resume_device(id) };
+        let reply = session.request_streaming(&message, tobii_device::session::REQUEST_TIMEOUT)?;
+        match session.finish_call(&message, reply) {
+            Err(error) if !crate::service::enabled::not_supported(&error) => return Err(error),
+            _ => {}
+        }
+        self.device_paused = paused;
+        pump.alive();
+        log::info!("tracker {}", if paused { "paused" } else { "resumed" });
+        Ok(())
     }
 
     fn device_time(&mut self, device_us: i64) -> i64 {
@@ -538,8 +571,9 @@ fn pause_connected<C: Channel>(session: &mut TrackerSession<C>) -> Result<()> {
 
 /// One service session on a started tracker: calibration, streams, then samples until it ends.
 ///
-/// While `paused` is set the tracker is paused first and its silence is not taken for a lost
-/// tracker. `requests` wait until the streams run and are then answered between reads.
+/// While `paused` is set the tracker is paused first; the session then pauses or resumes it
+/// whenever `paused` changes, and does not take its silence for a lost tracker. `requests`
+/// wait until the streams run and are then answered between reads.
 /// Returns when `stop` is set; fails when the tracker fails or goes silent.
 #[allow(clippy::too_many_arguments, reason = "the session, its consumers and each way the service steers it")]
 pub fn serve_tracker<C: Channel>(
@@ -552,7 +586,8 @@ pub fn serve_tracker<C: Channel>(
     requests: Option<DeviceRequests>,
     paused: Arc<AtomicBool>,
 ) -> Result<()> {
-    if paused.load(Ordering::SeqCst) {
+    let device_paused = paused.load(Ordering::SeqCst);
+    if device_paused {
         pause_connected(session)?;
     }
     processor.start(&session.camera_calibration(0)?);
@@ -569,6 +604,7 @@ pub fn serve_tracker<C: Channel>(
     streams.suspend = suspend;
     streams.requests = requests;
     streams.paused = paused;
+    streams.device_paused = device_paused;
     streams.run(
         session,
         stop,

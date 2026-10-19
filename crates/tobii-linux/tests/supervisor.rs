@@ -21,6 +21,7 @@ use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::cli::{ServiceLink, service_feed};
 use tobii_linux::error::Result;
 use tobii_linux::service::clock::{Clocks, ServiceTime, wine_clock};
+use tobii_linux::service::enabled::EnabledState;
 use tobii_linux::service::{DeviceCallError, Options, PrpService};
 use tobii_linux::tracker::{FrameProcessor, HostTime};
 use tobii_protocol::commands::{Stream, command, header_only_request, unsubscribe_stream};
@@ -471,8 +472,8 @@ fn disabling_pauses_and_keeps_clients() {
 
         service.set_enabled(false).await.unwrap();
         assert!(!service.enabled());
-        assert_eq!(pause_values(&device), [1]);
         notified(&mut subscription, &paused_notification(true)).await;
+        until("paused", || pause_values(&device) == [1]).await;
         let paused_at = Instant::now();
         let late = packages_within(&mut subscription, SILENCE_TIMEOUT + Duration::from_secs(1)).await;
         assert!(late.iter().all(|at| *at - paused_at < Duration::from_millis(500)), "data kept coming while paused");
@@ -482,8 +483,8 @@ fn disabling_pauses_and_keeps_clients() {
 
         service.set_enabled(true).await.unwrap();
         assert!(service.enabled());
-        assert_eq!(pause_values(&device), [1, 0]);
         notified(&mut subscription, &paused_notification(false)).await;
+        until("resumed", || pause_values(&device) == [1, 0]).await;
         let package = subscription.packet().await;
         assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
         assert!(link.stop().await);
@@ -501,6 +502,7 @@ fn replug_while_disabled_pauses_again() {
         let mut link = Link::start(&service, false, &slot);
         streaming(&service).await;
         service.set_enabled(false).await.unwrap();
+        until("paused", || pause_values(&device) == [1]).await;
 
         device.unplug();
         plug(&slot, None);
@@ -516,10 +518,128 @@ fn replug_while_disabled_pauses_again() {
         assert!(!service.enabled());
 
         service.set_enabled(true).await.unwrap();
-        assert_eq!(pause_values(&replugged), [1, 0]);
+        until("resumed", || pause_values(&replugged) == [1, 0]).await;
         let package = subscription.packet().await;
         assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
         assert_eq!(link.sessions_and_failures(), (2, 1));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+fn state_file(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("tobii-linux-supervisor-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory.join("eye-tracking-enabled")
+}
+
+/// Waits without yielding to the loop, so the service applies none of the session's events.
+fn block_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition not reached: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A pausable tracker whose session start hangs on the device status reply, which comes
+/// after the session has read the pause flag and before its streams run.
+fn slow_starting() -> FakeTracker {
+    FakeTracker::pausable().slow_reply(command::GET_DEVICE_STATUS, Duration::from_millis(300))
+}
+
+#[test]
+fn disabling_while_a_session_starts_pauses_it() {
+    run(async {
+        let path = state_file("start-disable");
+        let options = Options { enabled_state: Some(path.clone()), ..options("ET5-TEST") };
+        let (service, port, accept) = service(options).await;
+        let device = slow_starting();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        block_until("session starting", || device.commands().contains(&command::GET_DEVICE_STATUS));
+        service.set_enabled(false).await.unwrap();
+
+        until("attached", || service.tracker_attached()).await;
+        until("paused", || pause_values(&device) == [1]).await;
+        assert!(!service.enabled());
+        assert!(!EnabledState::new(path.clone()).load());
+        let (_command, mut subscription, _) = streaming_client(port).await;
+        let late = packages_within(&mut subscription, Duration::from_millis(800)).await;
+        assert!(late.len() <= 1, "data kept coming while paused: {}", late.len());
+        assert_eq!(link.sessions_and_failures(), (1, 0));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    });
+}
+
+#[test]
+fn enabling_while_a_paused_session_starts_resumes_it() {
+    run(async {
+        let path = state_file("start-enable");
+        EnabledState::new(path.clone()).store(false).unwrap();
+        let options = Options { enabled_state: Some(path.clone()), ..options("ET5-TEST") };
+        let (service, port, accept) = service(options).await;
+        assert!(!service.enabled());
+        let device = slow_starting();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        block_until("session starting", || device.commands().contains(&command::GET_DEVICE_STATUS));
+        assert_eq!(pause_values(&device), [1]);
+        service.set_enabled(true).await.unwrap();
+
+        until("attached", || service.tracker_attached()).await;
+        until("resumed", || pause_values(&device) == [1, 0]).await;
+        assert!(service.enabled());
+        assert!(EnabledState::new(path.clone()).load());
+        let (_command, mut subscription, _) = streaming_client(port).await;
+        let package = subscription.packet().await;
+        assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
+        let streaming = packages_within(&mut subscription, SILENCE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(streaming.len() > 10);
+        assert_eq!(link.sessions_and_failures(), (1, 0));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    });
+}
+
+#[test]
+fn a_not_supported_pause_counts_as_applied() {
+    run(async {
+        let (service, _, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::pausable().refusing_pause(tobii_service::tet_tcp::UNSUPPORTED_OPERATION);
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        service.set_enabled(false).await.unwrap();
+        until("pause sent", || pause_values(&device) == [1]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(pause_values(&device), [1], "a not-supported pause is not sent again");
+        assert!(!service.enabled());
+        assert!(service.tracker_attached());
+        assert_eq!(link.sessions_and_failures(), (1, 0));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn a_refused_pause_ends_the_session() {
+    run(async {
+        let (service, _, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::pausable().refusing_pause(0x2000_0407);
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        service.set_enabled(false).await.unwrap();
+        until("session ended", || link.sessions_and_failures().1 >= 1).await;
+        assert!(!service.enabled());
         assert!(link.stop().await);
         service.close();
         accept.abort();
