@@ -32,6 +32,8 @@ pub struct Monitor {
     pub rotation: u32,
     pub edid: Option<Vec<u8>>,
     pub instance_id: Option<String>,
+    /// DRM connector under /sys/class/drm, such as `card0-DP-1`.
+    pub connector: Option<String>,
 }
 
 impl Monitor {
@@ -244,9 +246,9 @@ pub fn parse_xrandr(text: &str) -> Result<Vec<Monitor>> {
     Ok(monitors)
 }
 
-/// Connected DRM connectors with their EDID but no geometry (Wayland without xrandr).
-pub fn drm_fallback(root: &Path) -> Result<Vec<Monitor>> {
-    let mut monitors = Vec::new();
+/// Connected DRM connectors with their non-empty EDIDs: (connector, EDID).
+fn drm_connectors(root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut connectors = Vec::new();
     for edid_path in edid_paths(root) {
         let directory = edid_path.parent().expect("edid has a parent");
         let status = directory.join("status");
@@ -258,10 +260,40 @@ pub fn drm_fallback(root: &Path) -> Result<Vec<Monitor>> {
             continue;
         }
         let connector = directory.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-        let name = connector.split_once('-').map_or(connector.as_str(), |(_, name)| name).to_string();
-        monitors.push(Monitor { key: name.clone(), name, edid: Some(edid), ..Monitor::default() });
+        connectors.push((connector, edid));
     }
-    Ok(monitors)
+    Ok(connectors)
+}
+
+/// `card0-DP-1` -> `DP-1`.
+fn output_name(connector: &str) -> &str {
+    connector.split_once('-').map_or(connector, |(_, name)| name)
+}
+
+/// Connected DRM connectors with their EDID but no geometry (Wayland without xrandr).
+pub fn drm_fallback(root: &Path) -> Result<Vec<Monitor>> {
+    let monitors = drm_connectors(root)?.into_iter().map(|(connector, edid)| {
+        let name = output_name(&connector).to_string();
+        Monitor { key: name.clone(), name, edid: Some(edid), connector: Some(connector), ..Monitor::default() }
+    });
+    Ok(monitors.collect())
+}
+
+/// Each monitor's DRM connector, found by its EDID; among connectors with the same EDID the
+/// one named like the monitor. Monitors without an EDID or a unique match get none.
+pub fn with_drm_connectors(mut monitors: Vec<Monitor>, root: &Path) -> Vec<Monitor> {
+    let connectors = drm_connectors(root).unwrap_or_default();
+    for monitor in &mut monitors {
+        let Some(edid) = &monitor.edid else { continue };
+        let same: Vec<&str> =
+            connectors.iter().filter(|(_, other)| other == edid).map(|(connector, _)| connector.as_str()).collect();
+        let found = match same.as_slice() {
+            [only] => Some(*only),
+            _ => same.iter().copied().find(|connector| output_name(connector) == monitor.name),
+        };
+        monitor.connector = found.map(str::to_string);
+    }
+    monitors
 }
 
 fn executable_on_path(name: &str) -> bool {
@@ -299,17 +331,19 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
     status.success().then_some(text)
 }
 
-/// The monitors of the Linux desktop: xrandr's outputs, else the DRM connectors.
+/// The monitors of the Linux desktop: xrandr's outputs with their DRM connectors, else the
+/// DRM connectors.
 pub fn linux_monitors() -> Result<Vec<Monitor>> {
+    let drm = Path::new("/sys/class/drm");
     if executable_on_path("xrandr")
         && let Some(text) = command_output("xrandr", &["--prop"])
     {
         let monitors = parse_xrandr(&text)?;
         if !monitors.is_empty() {
-            return Ok(monitors);
+            return Ok(with_drm_connectors(monitors, drm));
         }
     }
-    drm_fallback(Path::new("/sys/class/drm"))
+    drm_fallback(drm)
 }
 
 /// `\\?\DISPLAY#GSM5B7F#5&5028a6b&0&UID41221#{guid}` -> `DISPLAY\GSM5B7F\5&5028A6B&0&UID41221`.
@@ -409,6 +443,7 @@ pub fn parse_windows_monitors(text: &str) -> Result<Vec<Monitor>> {
                 rotation: windows_rotation(item.get("orientation")),
                 edid,
                 instance_id,
+                connector: None,
             })
         })
         .collect()
@@ -497,6 +532,51 @@ mod tests {
         assert_eq!(initial_monitor(&all[1..2], None), Some(0));
         assert_eq!(initial_monitor(&all, Some("portrait")), Some(1));
         assert_eq!(initial_monitor(&all, Some("unplugged")), Some(0));
+    }
+
+    fn drm_root(name: &str, connectors: &[(&str, &[u8], &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("tobii-gaze-drm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (connector, edid, status) in connectors {
+            let directory = root.join(connector);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("edid"), edid).unwrap();
+            std::fs::write(directory.join("status"), format!("{status}\n")).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn monitors_get_their_drm_connector() {
+        let other = {
+            let mut other = edid();
+            other[12] ^= 0xff;
+            other
+        };
+        let root = drm_root(
+            "connectors",
+            &[("card0-DP-1", &edid(), "connected"), ("card0-HDMI-A-1", &other, "connected"), ("card0-DP-2", &[], "")],
+        );
+        let fallback = drm_fallback(&root).unwrap();
+        let names: Vec<_> = fallback.iter().map(|m| (m.key.as_str(), m.connector.as_deref())).collect();
+        assert_eq!(names, [("DP-1", Some("card0-DP-1")), ("HDMI-A-1", Some("card0-HDMI-A-1"))]);
+
+        let mut xrandr = vec![monitor("XWAYLAND0", [0, 0, 2560, 1440]), monitor("XWAYLAND1", [2560, 0, 1920, 1080])];
+        xrandr[0].edid = Some(other.clone());
+        let found = with_drm_connectors(xrandr, &root);
+        assert_eq!(found[0].connector.as_deref(), Some("card0-HDMI-A-1"), "found by EDID, not by name");
+        assert_eq!(found[1].connector, None, "no EDID, no connector");
+
+        let twins = drm_root("twins", &[("card0-DP-1", &edid(), "connected"), ("card1-DP-3", &edid(), "connected")]);
+        let mut same = vec![monitor("DP-3", [0, 0, 2560, 1440]), monitor("HDMI-1", [2560, 0, 2560, 1440])];
+        same[0].edid = Some(edid());
+        same[1].edid = Some(edid());
+        let found = with_drm_connectors(same, &twins);
+        assert_eq!(found[0].connector.as_deref(), Some("card1-DP-3"), "equal EDIDs: the one of the same name");
+        assert_eq!(found[1].connector, None, "equal EDIDs and no name match: unknown");
+        for root in [root, twins] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

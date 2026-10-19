@@ -7,7 +7,8 @@
 //! needs GTK. What the screens show over time (the alignment step, the positioning and
 //! calibration timelines, the keys) is plain state in [`alignment`], [`positioning_view`],
 //! [`particles`] and [`keys`], tested without a display. [`simulated::SimulatedTracker`]
-//! stands in for the tracker to try the pages without hardware.
+//! stands in for the tracker to try the pages without hardware. When `tobii-linux serve`
+//! runs, [`handover`] asks it to release the tracker for the length of the flow.
 
 pub mod alignment;
 pub mod artwork;
@@ -15,6 +16,7 @@ pub mod channel;
 pub mod cli;
 pub mod device;
 pub mod flow;
+pub mod handover;
 pub mod keys;
 pub mod motion;
 pub mod particles;

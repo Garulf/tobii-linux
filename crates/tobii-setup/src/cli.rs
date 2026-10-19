@@ -1,18 +1,32 @@
 //! The command line of `tobii-linux-setup`, and what it chooses before the window opens.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
+use tobii_device::DeviceError;
 use tobii_gaze::display as ds;
 use tobii_gaze::monitors::{self, Monitor};
 
-use crate::flow::{self, Desktop, DisplayMode, SetupOptions, load_display_record};
+use crate::device::{self, Session, WouldSend};
+use crate::flow::{self, Desktop, DisplayMode, FlowError, FlowKind, OpenSession, SetupOptions, load_display_record};
+use crate::handover::{self, ServiceChoice};
+use crate::simulated::{SimulatedTracker, Simulation};
 
 pub const USAGE: &str = "\
 usage: tobii-linux-setup [options]
 
 Set up the Eye Tracker 5 on this display the way Tobii's setup does: line up the
 display (when needed), check where you sit, calibrate, and save the result as a profile.
+When tobii-linux serve runs, it lends the tracker to the setup until the setup ends.
+
+Tobii's configuration arguments (at most one):
+  -C                           Improve the calibration of the current profile
+  -N                           Create a new profile: calibrate, then name it
+  -S                           Set up the display only
+  -R                           Resolve the configuration: the display setup when the tracker
+                               has none, then a calibration when the current profile has none
+  -G, --guest                  Calibrate the temporary Guest profile and make it current
 
 options:
   --display auto|always|never  Run the display setup: auto when the tracker has none yet
@@ -31,6 +45,9 @@ options:
                                one of the last display setup, else the primary
   --index N                    Device index from probe (default 0)
   --channel N                  USB channel carrying TTP (default 0)
+  --service ADDR               Control address of tobii-linux serve, asked to release the
+                               tracker first (default 127.0.0.1:7760)
+  --no-service                 Open the tracker without asking tobii-linux serve
   --simulate mapped|unmapped   Use a scripted tracker and user instead of the device
   --simulate-monitors          With --simulate, pretend to run on a desktop with a portrait
                                monitor left of a 27 inch primary one
@@ -38,10 +55,13 @@ options:
                                failed, to show the failure screen
   --windowed                   Do not ask for fullscreen (the window must still fill the screen)
   --log FILE                   Write the steps as JSON lines to this file
-  -h, --help                   Show this help";
+  -h, --help                   Show this help
+
+exit codes: 0 done, 1 argument error, 2 cancelled, 3 failed";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Args {
+    pub flow: FlowKind,
     pub display: DisplayMode,
     pub calibrate: bool,
     pub save_display: bool,
@@ -54,6 +74,8 @@ pub struct Args {
     pub monitor: Option<String>,
     pub index: usize,
     pub channel: u32,
+    pub service: Option<SocketAddr>,
+    pub no_service: bool,
     pub simulate: Option<bool>,
     pub simulate_monitors: bool,
     pub simulate_compute_failure: Option<usize>,
@@ -71,9 +93,33 @@ fn number<T: std::str::FromStr>(option: &str, value: &str) -> Result<T, String> 
     value.parse().map_err(|_| format!("{option}: invalid number '{value}'"))
 }
 
+/// Tobii's `-C`, `-N`, `-S`, `-R` and `-G` (`--guest`), as the flow they start.
+fn tobii_flow(argument: &str) -> Option<FlowKind> {
+    Some(match argument {
+        "-C" => FlowKind::Recalibrate,
+        "-N" => FlowKind::NewProfile,
+        "-S" => FlowKind::DisplaySetup,
+        "-R" => FlowKind::ResolveConfiguration,
+        "-G" | "--guest" => FlowKind::Guest,
+        _ => return None,
+    })
+}
+
+/// The display and calibration steps of a Tobii flow.
+fn apply_flow(args: &mut Args, flow: FlowKind) {
+    args.flow = flow;
+    (args.display, args.calibrate) = match flow {
+        FlowKind::Setup | FlowKind::ResolveConfiguration => (DisplayMode::Auto, true),
+        FlowKind::Recalibrate | FlowKind::NewProfile | FlowKind::Guest => (DisplayMode::Never, true),
+        FlowKind::DisplaySetup => (DisplayMode::Always, false),
+    };
+}
+
 /// Parses the arguments after the program name.
 pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, String> {
     let mut args = Args { calibrate: true, ..Args::default() };
+    let mut tobii: Option<(String, FlowKind)> = None;
+    let mut steps_chosen = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         let (option, inline) = match argument.split_once('=') {
@@ -82,6 +128,16 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
         };
         let mut value =
             || inline.clone().or_else(|| arguments.next()).ok_or_else(|| format!("{option}: expected a value"));
+        if let Some(flow) = tobii_flow(&option) {
+            if let Some((first, _)) = &tobii {
+                return Err(format!("{option}: only one of -C, -N, -S, -R, -G (--guest), not also {first}"));
+            }
+            tobii = Some((option.clone(), flow));
+            continue;
+        }
+        if matches!(option.as_str(), "--display" | "--no-calibration" | "--profile") {
+            steps_chosen.get_or_insert_with(|| option.clone());
+        }
         match option.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "--display" => {
@@ -103,6 +159,11 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
             "--monitor" => args.monitor = Some(value()?),
             "--index" => args.index = number(&option, &value()?)?,
             "--channel" => args.channel = number(&option, &value()?)?,
+            "--service" => {
+                let text = value()?;
+                args.service = Some(text.parse().map_err(|_| format!("--service: invalid address '{text}'"))?);
+            }
+            "--no-service" => args.no_service = true,
             "--simulate" => {
                 args.simulate = match value()?.as_str() {
                     "mapped" => Some(true),
@@ -116,6 +177,15 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
             "--log" => args.log = Some(value()?.into()),
             other => return Err(format!("unrecognized argument: {other}")),
         }
+    }
+    if let Some((flow_argument, flow)) = tobii {
+        if let Some(option) = steps_chosen {
+            return Err(format!("{flow_argument} cannot be combined with {option}"));
+        }
+        apply_flow(&mut args, flow);
+    }
+    if args.service.is_some() && args.no_service {
+        return Err("--service and --no-service cannot be combined".into());
     }
     if args.edid.is_some() && args.connector.is_some() {
         return Err("--edid and --connector cannot be combined".into());
@@ -164,6 +234,7 @@ pub fn options_from(args: &Args, scratch: Option<PathBuf>) -> Result<SetupOption
     {
         options.display_record = parent.join(flow::DISPLAY_RECORD);
     }
+    options.flow = args.flow;
     options.display = args.display;
     options.calibrate = args.calibrate;
     options.save_display_without_asking = args.save_display;
@@ -171,6 +242,40 @@ pub fn options_from(args: &Args, scratch: Option<PathBuf>) -> Result<SetupOption
     options.profile = args.profile.clone();
     options.size_hint_mm = size_hint(args)?;
     Ok(options)
+}
+
+/// Whether the run asks a running `tobii-linux serve` for the tracker: never in a simulation
+/// or with --no-service.
+pub fn service_choice(args: &Args) -> ServiceChoice {
+    if args.simulate.is_some() || args.no_service {
+        return ServiceChoice::Skip;
+    }
+    ServiceChoice::Ask(args.service.unwrap_or(tobii_control::DEFAULT_ADDR))
+}
+
+/// Makes the dry-run report of a session, when the run is a dry run.
+pub type DryRunReport = Box<dyn Fn() -> Option<WouldSend> + Send>;
+
+/// Opens the run's tracker: the simulated one, or USB through `open_usb` (normally
+/// [`device::open_usb`]) after a running service released it.
+pub fn session_opener<U>(args: &Args, dry_run_report: DryRunReport, open_usb: U) -> OpenSession
+where
+    U: FnOnce(usize, u32, Option<WouldSend>) -> Result<Session, DeviceError> + Send + 'static,
+{
+    let fail_compute_at: Vec<usize> = args.simulate_compute_failure.into_iter().collect();
+    let service = service_choice(args);
+    match args.simulate {
+        Some(mapped) => Box::new(move || {
+            let tracker = SimulatedTracker::new(Simulation { mapped, fail_compute_at, ..Simulation::default() });
+            Ok((device::session_on(tracker, dry_run_report()), None))
+        }),
+        None => {
+            let (index, channel) = (args.index, args.channel);
+            Box::new(move || {
+                handover::open_borrowed(service, || open_usb(index, channel, dry_run_report()).map_err(FlowError::from))
+            })
+        }
+    }
 }
 
 /// albedo's EDIDs (LG 27GL850, base blocks), for the simulated two-monitor desktop.
@@ -212,7 +317,12 @@ pub fn desktop(args: &Args, options: &SetupOptions) -> Desktop {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::simulated::{SimulatedTracker, Simulation};
 
     fn run(arguments: &[&str]) -> Args {
         match parse(arguments.iter().map(|a| a.to_string())).unwrap() {
@@ -233,6 +343,96 @@ mod tests {
         for bad in [&["--display", "sometimes"][..], &["--index"], &["--bogus"], &["--simulate-monitors"]] {
             assert!(parse(bad.iter().map(|a| a.to_string())).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn tobii_arguments_choose_the_flow() {
+        let flow = |arguments: &[&str]| {
+            let args = run(arguments);
+            (args.flow, args.display, args.calibrate)
+        };
+        assert_eq!(flow(&[]), (FlowKind::Setup, DisplayMode::Auto, true));
+        assert_eq!(flow(&["-C"]), (FlowKind::Recalibrate, DisplayMode::Never, true));
+        assert_eq!(flow(&["-N"]), (FlowKind::NewProfile, DisplayMode::Never, true));
+        assert_eq!(flow(&["-S"]), (FlowKind::DisplaySetup, DisplayMode::Always, false));
+        assert_eq!(flow(&["-R"]), (FlowKind::ResolveConfiguration, DisplayMode::Auto, true));
+        assert_eq!(flow(&["-G"]), (FlowKind::Guest, DisplayMode::Never, true));
+        assert_eq!(flow(&["--guest"]), flow(&["-G"]));
+        assert_eq!(run(&["-S", "--simulate", "unmapped", "--windowed"]).simulate, Some(false));
+        let options = options_from(&run(&["--guest"]), Some(PathBuf::from("/scratch"))).unwrap();
+        assert_eq!(options.flow, FlowKind::Guest);
+        for bad in [&["-C", "-N"][..], &["-G", "--guest"], &["-S", "--display", "never"], &["-N", "--profile", "Anna"]]
+        {
+            assert!(parse(bad.iter().map(|a| a.to_string())).is_err(), "{bad:?}");
+        }
+        for unsupported in ["-P", "-Q", "-X"] {
+            assert!(parse([unsupported.to_string()]).is_err(), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn service_options() {
+        assert_eq!(service_choice(&run(&[])), ServiceChoice::Ask(tobii_control::DEFAULT_ADDR));
+        assert_eq!(tobii_control::DEFAULT_ADDR.to_string(), "127.0.0.1:7760");
+        let other: SocketAddr = "127.0.0.1:7761".parse().unwrap();
+        assert_eq!(service_choice(&run(&["--service", "127.0.0.1:7761"])), ServiceChoice::Ask(other));
+        assert_eq!(service_choice(&run(&["--no-service"])), ServiceChoice::Skip);
+        assert_eq!(service_choice(&run(&["--simulate", "mapped"])), ServiceChoice::Skip);
+        for bad in [&["--service", "nowhere"][..], &["--service", "127.0.0.1:1", "--no-service"]] {
+            assert!(parse(bad.iter().map(|a| a.to_string())).is_err(), "{bad:?}");
+        }
+    }
+
+    fn simulated_usb(
+        opened: Arc<AtomicBool>,
+    ) -> impl FnOnce(usize, u32, Option<WouldSend>) -> Result<Session, DeviceError> + Send + 'static {
+        move |_, _, would_send| {
+            opened.store(true, Ordering::SeqCst);
+            Ok(crate::device::session_on(SimulatedTracker::new(Simulation::default()), would_send))
+        }
+    }
+
+    fn listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    fn contacted(listener: &TcpListener) -> bool {
+        match listener.accept() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn simulate_never_contacts_service() {
+        let (listener, addr) = listener();
+        let args = run(&["--simulate", "mapped", "--service", &addr.to_string()]);
+        let usb = |_, _, _| -> Result<Session, DeviceError> { panic!("a simulation opens no USB") };
+        let (_session, handover) = session_opener(&args, Box::new(|| None), usb)().unwrap();
+        assert!(handover.is_none());
+        assert!(!contacted(&listener));
+    }
+
+    #[test]
+    fn no_service_opens_usb_directly() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let open = session_opener(&run(&["--no-service"]), Box::new(|| None), simulated_usb(Arc::clone(&opened)));
+        let (_session, handover) = open().unwrap();
+        assert!(handover.is_none() && opened.load(Ordering::SeqCst));
+
+        let (listener, addr) = listener();
+        drop(listener);
+        let opened = Arc::new(AtomicBool::new(false));
+        let args = run(&["--service", &addr.to_string()]);
+        let started = std::time::Instant::now();
+        let (_session, handover) =
+            session_opener(&args, Box::new(|| None), simulated_usb(Arc::clone(&opened)))().unwrap();
+        assert!(handover.is_none() && opened.load(Ordering::SeqCst), "nothing listens: USB as before");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
     }
 
     #[test]

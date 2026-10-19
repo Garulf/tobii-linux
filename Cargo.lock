@@ -1661,6 +1661,7 @@ dependencies = [
  "tobii-models",
  "tobii-protocol",
  "tobii-service",
+ "tobii-setup",
  "tobii-usb",
  "tokio",
 ]
@@ -1717,6 +1718,7 @@ dependencies = [
  "log",
  "serde_json",
  "thiserror",
+ "tobii-control",
  "tobii-device",
  "tobii-gaze",
  "tobii-protocol",

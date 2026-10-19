@@ -204,7 +204,7 @@ impl Harness {
         let open: OpenSession = Box::new(move || {
             let report: Option<crate::device::WouldSend> =
                 dry_run.then(|| Box::new(move |m: &tobii_protocol::Message| held.lock().unwrap().push(m.command)) as _);
-            Ok(session_on(tracker, report))
+            Ok((session_on(tracker, report), None))
         });
         let outcome = flow.run(open);
         let last = self.channel.current().seq;
@@ -487,6 +487,7 @@ fn albedo() -> (Monitor, Monitor) {
         rotation: 0,
         edid: Some(hex(PRIMARY_EDID)),
         instance_id: Some(r"DISPLAY\GSM5B7F\5&5028A6B&0&UID41221".into()),
+        connector: Some("card0-DP-1".into()),
     };
     let portrait = Monitor {
         key: r"DISPLAY\GSM5B7F\5&5028A6B&0&UID41219".into(),
@@ -496,6 +497,7 @@ fn albedo() -> (Monitor, Monitor) {
         rotation: 90,
         edid: Some(hex(PORTRAIT_EDID)),
         instance_id: Some(r"DISPLAY\GSM5B7F\5&5028A6B&0&UID41219".into()),
+        connector: None,
     };
     (primary, portrait)
 }
@@ -634,5 +636,119 @@ fn summaries_and_record_times() {
     assert_eq!(civil_time(0), [1970, 1, 1, 0, 0, 0]);
     assert_eq!(civil_time(1_792_150_200), [2026, 10, 16, 11, 30, 0]);
     assert!(valid_lines(0.02, 0.07) && !valid_lines(0.01, 0.5) && !valid_lines(0.5, 0.54));
-    assert_eq!(Status::Cancelled.exit_code(), 2);
+    let codes = [Status::Finished, Status::Cancelled, Status::Failed, Status::Running].map(Status::exit_code);
+    assert_eq!(codes, [0, 2, 3, 3], "Tobii's ConfigurationResult: success, aborted, configuration error");
+}
+
+/// The tracker's current calibration, as a profile would hold it.
+fn tracker_calibration(harness: &Harness) -> LocalCalibration {
+    let state = harness.state.lock().unwrap();
+    LocalCalibration { calibration_id: state.calibration_id, blob: state.blob.clone() }
+}
+
+fn with_current_profile(harness: &Harness, name: &str, calibration_id: u32) {
+    let store = harness.store();
+    let calibration = LocalCalibration { calibration_id, ..tracker_calibration(harness) };
+    store.save(name, &calibration, false).unwrap();
+    store.set_current(name).unwrap();
+}
+
+#[test]
+fn display_record_has_connector_and_edid() {
+    let mut harness =
+        Harness::new(Simulation::default(), vec![("display", done_with(0.0))]).with_desktop(albedo_desktop(true));
+    harness.options.display = DisplayMode::Always;
+    harness.options.calibrate = false;
+    harness.run();
+    let record = load_display_record(&harness.options.display_record);
+    let monitor = &record["monitor"];
+    assert_eq!(monitor["connector"], "card0-DP-1");
+    assert_eq!(monitor["edid"], PRIMARY_EDID);
+    assert_eq!(monitor["key"], r"DISPLAY\GSM5B7F\5&5028A6B&0&UID41221");
+    assert_eq!(recorded_monitor_key(&record).as_deref(), Some(r"DISPLAY\GSM5B7F\5&5028A6B&0&UID41221"));
+    let service_key = profiles::recorded_monitor_key(&harness.options.display_record);
+    assert_eq!(service_key.as_deref(), Some("1E6D7F5B0B220100061E"));
+
+    let bare = monitor_record(&Monitor { key: "HDMI-1".into(), name: "HDMI-1".into(), ..Monitor::default() });
+    assert!(bare.get("connector").is_none() && bare.get("edid").is_none(), "{bare}");
+}
+
+#[test]
+fn calibration_is_saved_for_the_recorded_monitor() {
+    let mut harness = Harness::new(Simulation::default(), Vec::new());
+    with_current_profile(&harness, "Garulf", 0x1234);
+    let record = r#"{"monitor": {"key": "DP-1", "edid_id": "1E6D7F5B0B220100061E"}}"#;
+    std::fs::write(&harness.options.display_record, record).unwrap();
+    let outcome = harness.run();
+    assert_eq!((outcome.status, outcome.profile.as_deref()), (Status::Finished, Some("Garulf")));
+    let store = harness.store();
+    let tracker_id = harness.state.lock().unwrap().calibration_id;
+    assert_eq!(store.calibration_for("Garulf", Some("1E6D7F5B0B220100061E")).unwrap().calibration_id, tracker_id);
+    assert_eq!(store.load("Garulf").unwrap().calibration.calibration_id, 0x1234, "the legacy file is kept");
+}
+
+#[test]
+fn guest_saves_and_selects_guest_profile() {
+    let mut harness = Harness::new(Simulation::default(), Vec::new());
+    with_current_profile(&harness, "Garulf", 0x1234);
+    harness.options.flow = FlowKind::Guest;
+    let outcome = harness.run();
+    assert_eq!(
+        (outcome.status, outcome.profile.as_deref()),
+        (Status::Finished, Some(profiles::GUEST)),
+        "{}",
+        outcome.message
+    );
+    assert!(!harness.names().contains(&"profile"), "no name page");
+    assert!(!harness.commands().contains(&gc::CALIBRATION_APPLY), "a fresh calibration, not an improved one");
+    let store = harness.store();
+    let tracker_id = harness.state.lock().unwrap().calibration_id;
+    assert_eq!(store.current().unwrap().as_deref(), Some(profiles::GUEST));
+    assert_eq!(store.load(profiles::GUEST).unwrap().calibration.calibration_id, tracker_id);
+    assert_eq!(store.tracked_eyes(profiles::GUEST).unwrap(), 0, "Tobii's guest tracks both eyes");
+    assert_eq!(store.load("Garulf").unwrap().calibration.calibration_id, 0x1234);
+    let pops = harness.calibration_phases().iter().filter(|p| matches!(p, CalibrationPhase::Pop { .. })).count();
+    assert_eq!(pops, 7, "the 7-index three-stage sequence");
+
+    let mut again = Harness::new(Simulation { calibration_id: 0x4321, ..Simulation::default() }, Vec::new());
+    again.options = harness.options.clone();
+    store.set_current("Garulf").unwrap();
+    let outcome = again.run();
+    assert_eq!(outcome.status, Status::Finished, "{}", outcome.message);
+    let tracker_id = again.state.lock().unwrap().calibration_id;
+    assert_eq!(store.load(profiles::GUEST).unwrap().calibration.calibration_id, tracker_id, "overwritten");
+    assert_eq!(store.current().unwrap().as_deref(), Some(profiles::GUEST));
+}
+
+#[test]
+fn new_profile_asks_for_a_name_even_with_a_current_profile() {
+    let mut harness = Harness::new(Simulation::default(), vec![("profile", save_profile("Anna"))]);
+    with_current_profile(&harness, "Garulf", 0x1234);
+    harness.options.flow = FlowKind::NewProfile;
+    let outcome = harness.run();
+    assert_eq!((outcome.status, outcome.profile.as_deref()), (Status::Finished, Some("Anna")), "{}", outcome.message);
+    assert!(harness.names().contains(&"profile"));
+    let store = harness.store();
+    assert_eq!(store.current().unwrap().as_deref(), Some("Anna"));
+    assert_eq!(store.load("Garulf").unwrap().calibration.calibration_id, 0x1234);
+}
+
+#[test]
+fn resolve_configuration_calibrates_only_without_a_profile() {
+    let answers = || vec![("display", done_with(0.0)), ("display-save", always(Action::Save))];
+    let mut complete = Harness::new(unmapped(), answers());
+    with_current_profile(&complete, "Garulf", 0x1234);
+    complete.options.flow = FlowKind::ResolveConfiguration;
+    let outcome = complete.run();
+    assert_eq!(outcome.status, Status::Finished, "{}", outcome.message);
+    assert!(complete.names().contains(&"display") && !complete.names().contains(&"calibration"));
+
+    let mut answers = answers();
+    answers.push(("profile", save_profile("Anna")));
+    let mut empty = Harness::new(unmapped(), answers);
+    empty.options.flow = FlowKind::ResolveConfiguration;
+    let outcome = empty.run();
+    assert_eq!(outcome.profile.as_deref(), Some("Anna"), "{}", outcome.message);
+    let names = empty.names();
+    assert!(names.contains(&"display") && names.contains(&"calibration") && names.contains(&"profile"));
 }

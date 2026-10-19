@@ -668,7 +668,7 @@ starts it with no other argument (`PROC:ConfigurationAppLauncher.cs:129-165`).
 | `Set up display` | `SetupDisplay` when the state is not `InvalidMonitorSetup` | `-S` | `CanSetupDisplay` | busy marker | close the sidebar | `-S` |
 | `Set up display` | `ResolveConfiguration` when the state is `InvalidMonitorSetup` | `-R` | `CanSetupDisplay` | busy marker | close the sidebar | `-R` |
 | `Create new profile` | `CreateNewProfile` | `-N` | `CanCreateNewProfile` | busy marker, delete marked profiles | close the sidebar | `-N` |
-| none on the page (`GuestCalibrationCommand` exists and is bound nowhere) | `GuestCalibration` | `-G` | the global shortcut, section 6 | delete marked profiles (command only) | close the sidebar (command only) | `tobii-linux-experience --guest` runs `-G` (decision) |
+| none on the page (`GuestCalibrationCommand` exists and is bound nowhere) | `GuestCalibration` | `-G` | the global shortcut, section 6 | delete marked profiles (command only) | close the sidebar (command only) | `tobii-linux-experience --guest` runs `tobii-linux-setup --guest`, which setup takes as `-G` (decision) |
 
 Source lines: Improve `VM:SettingsPageViewModel.cs:428-437`, Create
 `:481-491`, Set up display `:493-512`, Guest command `:469-479`; XAML bindings
@@ -681,7 +681,9 @@ match in the order `-C`, `-N`, `-P`, `-G`, `-Q`, `-R`, `-S`; with no match it
 exits with code 0 (printing usage when `--help` is given and a console is
 attached); an optional `-eyeTrackerUrl URL` is parsed too
 (`CCONT:FlowTypeResolver.cs:45-61`, `CONF:ApplicationConfiguration.cs:17-34,63-84`).
-The argument parsing for `tobii-linux-setup` is added in a later task.
+`tobii-linux-setup` takes `-C`, `-N`, `-S`, `-R` and `-G` (also as `--guest`), at
+most one, and exits with Tobii's codes: 0 success, 1 argument error, 2 aborted, 3
+configuration error ([setup flow](setup-flow.md#tobii-linux-setup-arguments)).
 
 How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
 
@@ -933,7 +935,8 @@ The page has no Guest button. A guest profile is started from the keyboard.
 
 Linux: `Ctrl+Shift+F10` becomes `tobii-linux-experience --guest`, which the user
 binds in Hyprland (decision, spec 8; Wayland apps cannot grab global keys). The
-command starts `-G` (decision). Apply the same status gate: only when the
+command starts `tobii-linux-setup --guest`, setup's spelling of `-G`; setup takes
+either (decision). Apply the same status gate: only when the
 status is `InvalidConfiguration` or `Tracking` (proposal), and the same
 re-entrancy rule (an active setup run makes it do nothing). The page keeps the
 resource text, including the key name and the "Shft" spelling (proposal, for
@@ -947,9 +950,8 @@ resource text, including the key name and the "Shft" spelling (proposal, for
   key binding.
 - Windows Hello and the virtual camera, battery messages and RGB device text
   are omitted; so are the Close Interaction menu item and statistics.
-- Setup is launched with Tobii's own arguments (`-C`, `-N`, `-S`, `-R`, `-G`)
-  by the binary `tobii-linux-setup`; its argument parsing is added in a later
-  task.
+- Setup is launched with Tobii's own arguments (`-C`, `-N`, `-S`, `-R`, and
+  `--guest` for `-G`) by the binary `tobii-linux-setup`, which takes all of them.
 - The page is a 550 px wide window titled "Tobii Experience" with the
   sidebar's content; Tobii's ribbon, dimmer, slide animation and 1330 x 810
   host window are not reproduced (4.1).

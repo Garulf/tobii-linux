@@ -140,6 +140,13 @@ service to let go first:
 Only the client holding the release can reacquire; a second `release` or a
 `reacquire` from another client gets an error reply (service).
 
+`tobii-linux-setup` connects with a 1 s timeout (a refused connection fails at
+once, and then it opens USB directly as without a service), waits up to 15 s for
+the release reply, and keeps the connection open until its flow ends, after its
+own USB session closed. An error reply, such as another client holding the
+release, ends the setup with that error instead of opening USB.
+`--no-service` skips the request and `--simulate` never connects.
+
 ## What remains
 
 - Not run against a real tracker or the GTK apps yet.

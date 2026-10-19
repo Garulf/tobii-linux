@@ -4,7 +4,7 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::fake_tracker::{FakeTracker, GAZE_POINT};
@@ -18,6 +18,11 @@ use tobii_linux::service::clock::{Clocks, wine_clock};
 use tobii_linux::service::{Options, PrpService};
 use tobii_protocol::commands::command;
 use tobii_protocol::fields::{Value, values};
+use tobii_setup::cli::{self, Command};
+use tobii_setup::device::{Session, session_on};
+use tobii_setup::flow::FlowError;
+use tobii_setup::handover::Handover;
+use tobii_setup::simulated::{SimulatedTracker, Simulation};
 
 async fn service(options: Options) -> (PrpService, u16, tokio::task::JoinHandle<()>) {
     common::service(options, wine_clock("auto", Clocks::Host).unwrap()).await
@@ -227,6 +232,84 @@ fn release_closes_usb_and_blocks_reopen() {
         assert!(!reacquired.released);
         app.status("attached again", |status| status.attached && !status.released).await;
         assert_eq!(link.sessions_and_failures(), (2, 0));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+/// Runs setup's session opener for `tobii-linux-setup --service 127.0.0.1:PORT` on a blocking
+/// thread, with a fake USB opener that records the tracker handles left besides its own.
+async fn open_setup_session(
+    port: u16,
+    device: &FakeTracker,
+) -> (Result<(Session, Option<Handover>), FlowError>, Option<usize>) {
+    let device = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(Command::Run(args)) = cli::parse(["--service".to_string(), format!("127.0.0.1:{port}")]) else {
+            panic!("the arguments parse")
+        };
+        let handles_at_open = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&handles_at_open);
+        let opened = cli::session_opener(&args, Box::new(|| None), move |_, _, _| {
+            *seen.lock().unwrap() = Some(device.handles() - 1);
+            Ok(session_on(SimulatedTracker::new(Simulation::default()), None))
+        })();
+        let handles = *handles_at_open.lock().unwrap();
+        (opened, handles)
+    })
+    .await
+    .unwrap()
+}
+
+#[test]
+fn setup_releases_and_service_reacquires() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        let mut app = Client::connect(port, "experience").await;
+        app.status("attached", |status| status.attached).await;
+        let idle_handles = 2;
+
+        let (opened, handles_at_open) = open_setup_session(port, &device).await;
+        let (session, handover) = opened.unwrap();
+        assert!(handover.is_some(), "setup holds the release while its session is open");
+        assert_eq!(handles_at_open, Some(idle_handles), "USB was opened before the service let go");
+        assert!(!service.release_gate().usb_open());
+        let status = app.request(Request::Status).await.unwrap();
+        assert!(status.released && !status.attached, "{status:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(link.sessions_and_failures(), (1, 0));
+
+        drop(session);
+        drop(handover);
+        app.status("attached again", |status| status.attached && !status.released).await;
+        assert_eq!(link.sessions_and_failures(), (2, 0));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn setup_does_not_take_a_tracker_held_by_another_client() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        let mut other = Client::connect(port, "setup").await;
+        other.status("attached", |status| status.attached).await;
+        other.request(Request::Release).await.unwrap();
+
+        let (opened, handles_at_open) = open_setup_session(port, &device).await;
+        let error = opened.expect_err("a held release refuses the setup");
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert_eq!(handles_at_open, None, "no USB grab");
+        assert!(service.released());
+        drop(other);
         assert!(link.stop().await);
         service.close();
         accept.abort();

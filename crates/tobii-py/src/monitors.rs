@@ -33,6 +33,7 @@ fn monitor_arg(monitor: &Bound<'_, PyAny>) -> PyResult<Monitor> {
         rotation: monitor.getattr("rotation")?.extract()?,
         edid: if edid.is_none() { None } else { Some(bytes_like(&edid)?) },
         instance_id: monitor.getattr("instance_id")?.extract()?,
+        connector: None,
     })
 }
 

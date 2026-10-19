@@ -10,7 +10,10 @@
 //! 3. Calibration: 1 target, then 3, then 3, each stage's targets shown at once and taken
 //!    in the order the user looks at them.
 //! 4. The result: a new profile is named and saved; a recalibration is saved to the current
-//!    profile.
+//!    profile; a guest calibration is saved as `Guest`. Calibrations are kept per monitor,
+//!    under the monitor of the last display setup.
+//!
+//! Tobii's configuration arguments pick one part of this ([`FlowKind`]).
 //!
 //! Writes stay behind the user: a changed display area is sent (1440) only after the user
 //! pressed Done and, unless the options allow it, confirmed saving it; the calibration is
@@ -29,6 +32,7 @@ use std::time::Duration;
 use serde_json::{Value as Json, json};
 use thiserror::Error;
 
+use tobii_control::ControlError;
 use tobii_device::DeviceError;
 use tobii_gaze::GazeError;
 use tobii_gaze::calibration::{self as cal, Calibrator, FocusCheck, UiEvent};
@@ -45,6 +49,7 @@ use tobii_protocol::gaze::gaze_message;
 
 use crate::channel::{ChannelError, UiChannel, Waited};
 use crate::device::Session;
+use crate::handover::Handover;
 use crate::screen::{Action, CalibrationPhase, DisplayLines, EyesLive, ScreenKind};
 
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -53,7 +58,6 @@ pub const WINDOW_FIRST_SEEN_TIMEOUT: Duration = Duration::from_secs(180);
 pub const DISPLAY_RECORD: &str = "display-setup.json";
 pub const READ_SLICE_MS: u32 = 100;
 pub const PROFILE_NAME_LENGTH: usize = 15;
-pub const RESERVED_PROFILE: &str = "Guest";
 pub const DEFAULT_SCREEN_PX: [f64; 2] = [1920.0, 1080.0];
 
 /// When the display setup runs: only for a tracker without one, always, or never.
@@ -65,8 +69,30 @@ pub enum DisplayMode {
     Never,
 }
 
+/// Which of Tobii's configuration flows runs (`Tobii.Configuration.exe` arguments,
+/// docs/setup-flow.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowKind {
+    /// No argument: the display setup when needed, then calibrate the current profile or a
+    /// new one.
+    #[default]
+    Setup,
+    /// `-C`: improve the current profile's calibration.
+    Recalibrate,
+    /// `-N`: calibrate and name a new profile.
+    NewProfile,
+    /// `-S`: the display setup only.
+    DisplaySetup,
+    /// `-R`: the display setup when needed, then a calibration only without a calibrated
+    /// current profile.
+    ResolveConfiguration,
+    /// `-G`: calibrate the `Guest` profile and make it current.
+    Guest,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetupOptions {
+    pub flow: FlowKind,
     pub display: DisplayMode,
     pub calibrate: bool,
     pub save_display_without_asking: bool,
@@ -83,6 +109,7 @@ impl SetupOptions {
     /// $XDG_DATA_HOME/tobii-linux).
     pub fn in_directory(data: &Path) -> Self {
         Self {
+            flow: FlowKind::Setup,
             display: DisplayMode::Auto,
             calibrate: true,
             save_display_without_asking: false,
@@ -162,12 +189,13 @@ impl Status {
         }
     }
 
-    /// The process exit code: 0 finished, 2 cancelled, 1 failed.
+    /// The process exit code, Tobii's `ConfigurationResult`: 0 finished, 2 cancelled, 3
+    /// failed (1 is an argument error).
     pub fn exit_code(self) -> i32 {
         match self {
             Status::Finished => 0,
             Status::Cancelled => 2,
-            Status::Running | Status::Failed => 1,
+            Status::Running | Status::Failed => 3,
         }
     }
 }
@@ -194,6 +222,9 @@ pub enum FlowError {
     Device(#[from] DeviceError),
     #[error(transparent)]
     Gaze(#[from] GazeError),
+    /// A running `tobii-linux serve` did not release the tracker.
+    #[error("The eye tracker service did not release the eye tracker: {0}")]
+    Handover(ControlError),
     #[error("{0}")]
     Other(String),
 }
@@ -233,7 +264,7 @@ pub fn profile_name_problem(name: &str, existing: &[String]) -> Option<&'static 
     if profiles::check_name(name).is_err() {
         return Some("Use only letters, digits, spaces, brackets and dashes.");
     }
-    if name.to_lowercase() == RESERVED_PROFILE.to_lowercase() {
+    if name.to_lowercase() == profiles::GUEST.to_lowercase() {
         return Some("Guest is a reserved name.");
     }
     if existing.iter().any(|other| other.to_lowercase() == name.to_lowercase()) {
@@ -283,8 +314,9 @@ fn recorded_monitor_key(record: &Json) -> Option<String> {
     record.get("monitor")?.get("key")?.as_str().map(str::to_string)
 }
 
+/// The monitor as the display record keeps it; `connector` and `edid` (hex) only when known.
 pub fn monitor_record(monitor: &Monitor) -> Json {
-    json!({
+    let mut record = json!({
         "key": monitor.key,
         "name": monitor.name,
         "bounds": monitor.bounds,
@@ -294,7 +326,14 @@ pub fn monitor_record(monitor: &Monitor) -> Json {
         "edid_id": monitor.edid_id(),
         "size_mm": monitor.size_mm(),
         "display_id": monitor.display_id(),
-    })
+    });
+    if let Some(connector) = &monitor.connector {
+        record["connector"] = json!(connector);
+    }
+    if let Some(edid) = &monitor.edid {
+        record["edid"] = json!(edid.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
+    record
 }
 
 /// UTC seconds since the epoch as (year, month, day, hour, minute, second).
@@ -341,8 +380,9 @@ pub fn save_display_record(path: &Path, monitor: Option<&Monitor>, area: &Displa
 
 /// Progress records as JSON lines: a kind and its values.
 pub type Report = Box<dyn FnMut(&str, Json) + Send>;
-/// Opens the tracker session the flow runs on.
-pub type OpenSession = Box<dyn FnOnce() -> Result<Session, FlowError> + Send>;
+/// Opens the tracker session the flow runs on, with the service's handover when it lent the
+/// tracker.
+pub type OpenSession = Box<dyn FnOnce() -> Result<(Session, Option<Handover>), FlowError> + Send>;
 
 fn log_value(value: &LogValue) -> Json {
     match value {
@@ -405,6 +445,7 @@ pub struct SetupFlow {
     outcome: SetupOutcome,
     store: ProfileStore,
     session: Option<Session>,
+    handover: Option<Handover>,
     calibration_before: Option<LocalCalibration>,
     move_timeout: Duration,
 }
@@ -428,6 +469,7 @@ impl SetupFlow {
             outcome: SetupOutcome::default(),
             store,
             session: None,
+            handover: None,
             calibration_before: None,
             move_timeout: MOVE_TIMEOUT,
         }
@@ -440,8 +482,9 @@ impl SetupFlow {
     }
 
     pub fn run(mut self, open_session: OpenSession) -> SetupOutcome {
-        let result = open_session().and_then(|session| {
+        let result = open_session().and_then(|(session, handover)| {
             self.session = Some(session);
+            self.handover = handover;
             self.steps()
         });
         match result {
@@ -461,6 +504,7 @@ impl SetupFlow {
             }
         }
         drop(self.session.take());
+        drop(self.handover.take());
         self.outcome
     }
 
@@ -489,7 +533,7 @@ impl SetupFlow {
         } else {
             area
         };
-        if !self.options.calibrate {
+        if !self.options.calibrate || self.configuration_complete()? {
             self.finish("Display setup done", &display_summary(&area));
             return Ok(());
         }
@@ -499,6 +543,15 @@ impl SetupFlow {
         self.positioning_step(self.outcome.display_written)?;
         let (outcome, profile) = self.calibration_step(&area)?;
         self.result_step(outcome.calibration, profile)
+    }
+
+    /// `-R` after the display: the current profile has a calibration, so nothing is left.
+    fn configuration_complete(&self) -> FlowResult<bool> {
+        if self.options.flow != FlowKind::ResolveConfiguration {
+            return Ok(false);
+        }
+        let current = self.store.current()?;
+        Ok(current.is_some_and(|name| self.store.names().is_ok_and(|names| names.contains(&name))))
     }
 
     fn wait_for_window(&mut self) -> FlowResult<()> {
@@ -751,11 +804,14 @@ impl SetupFlow {
     // Calibration -------------------------------------------------------------------------
 
     fn calibration_step(&mut self, area: &DisplayArea) -> FlowResult<(cal::CalibrationOutcome, Option<String>)> {
-        let profile = match &self.options.profile {
-            Some(name) => Some(name.clone()),
-            None => self.store.current()?,
+        let profile = match (self.options.flow, &self.options.profile) {
+            (FlowKind::Guest, _) => Some(profiles::GUEST.to_string()),
+            (FlowKind::NewProfile, _) => None,
+            (_, Some(name)) => Some(name.clone()),
+            (_, None) => self.store.current()?,
         };
-        let recalibration = profile.as_ref().is_some_and(|name| self.store.names().is_ok_and(|n| n.contains(name)));
+        let recalibration = self.options.flow != FlowKind::Guest
+            && profile.as_ref().is_some_and(|name| self.store.names().is_ok_and(|n| n.contains(name)));
         let before = self.calls(Operation::new(|io| async move { cal::backup_calibration(&io).await }))?;
         let path = cal::save_backup(&self.backup_path("calibration")?, &before, false)?;
         self.outcome.backups.push(path);
@@ -778,7 +834,10 @@ impl SetupFlow {
             let session = self.session.as_mut().expect("the flow runs on an open session");
             let result = run(operation, session, &mut ui, &mut log, &mut Vec::new());
             let error = match result {
-                Ok(outcome) => return Ok((outcome, profile.filter(|_| recalibration))),
+                Ok(outcome) => {
+                    let keep = recalibration || self.options.flow == FlowKind::Guest;
+                    return Ok((outcome, profile.filter(|_| keep)));
+                }
                 Err(error) => error,
             };
             if let Some(cause) = window_cause(&error) {
@@ -802,8 +861,12 @@ impl SetupFlow {
             Some(profile) => profile,
             None => self.name_profile()?,
         };
+        let monitor_key = profiles::recorded_monitor_key(&self.options.display_record);
         if !self.options.dry_run {
-            self.store.save(&profile, &calibration, true)?;
+            self.store.save_for(&profile, monitor_key.as_deref(), &calibration, true)?;
+            if self.options.flow == FlowKind::Guest {
+                self.store.set_tracked_eyes(&profile, 0)?;
+            }
             self.store.set_current(&profile)?;
         }
         self.outcome.calibration_id = Some(calibration.calibration_id);
@@ -812,6 +875,7 @@ impl SetupFlow {
         let values = json!({
             "profile": profile,
             "calibration_id": format!("{:#x}", calibration.calibration_id),
+            "monitor_key": monitor_key,
             "dry_run": self.options.dry_run,
         });
         self.report("saved", values);

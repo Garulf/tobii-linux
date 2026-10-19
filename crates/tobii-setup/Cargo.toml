@@ -14,6 +14,7 @@ gtk4 = { version = "0.11", features = ["v4_14"], optional = true }
 log.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tobii-control.workspace = true
 tobii-device.workspace = true
 tobii-gaze.workspace = true
 tobii-protocol.workspace = true

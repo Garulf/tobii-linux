@@ -22,13 +22,12 @@ use crate::alignment::{self, Alignment, KeyOutcome, Rect};
 use crate::channel::{UiChannel, WindowEvent};
 use crate::cli::{self, Args, Command};
 use crate::device::{self, WouldSend};
-use crate::flow::{Desktop, FlowError, OpenSession, Report, SetupFlow, SetupOutcome};
+use crate::flow::{Desktop, OpenSession, Report, SetupFlow, SetupOutcome, Status};
 use crate::keys::{Key, KeyResponse, respond};
 use crate::motion::fade_in;
 use crate::particles::{CalibrationView, ack_delay_s};
 use crate::positioning_view::{self as pv, CURSOR_HIDE_S};
 use crate::screen::{Action, EyesLive, Screen, ScreenKind, View, fills_screen};
-use crate::simulated::{SimulatedTracker, Simulation};
 use crate::style;
 use pages::{
     AspectPage, BusyPage, CalibrationPage, DisplayPage, EndPage, FailedPage, PositioningPage, ProfilePage, SavePage,
@@ -38,6 +37,8 @@ const POLL: Duration = Duration::from_millis(16);
 const VIEW_REPORT_S: f64 = 1.0;
 const MOVE_SETTLE: Duration = Duration::from_millis(300);
 const CLOSE_SIZE: i32 = 55;
+/// Tobii's `ConfigurationResult` for arguments it cannot use.
+const ARGUMENT_ERROR: u8 = 1;
 
 type SharedLog = Arc<Mutex<Option<std::fs::File>>>;
 
@@ -62,28 +63,15 @@ struct Launch {
 
 fn open_session(args: &Args, log: &SharedLog) -> OpenSession {
     let dry_run = args.dry_run;
-    let would_send = {
-        let log = Arc::clone(log);
-        move || -> Option<WouldSend> {
-            dry_run.then(|| {
-                let log = Arc::clone(&log);
-                Box::new(move |message: &tobii_protocol::Message| {
-                    write_log(&log, "would_send", device::describe(message))
-                }) as WouldSend
-            })
-        }
-    };
-    let fail_compute_at: Vec<usize> = args.simulate_compute_failure.into_iter().collect();
-    match args.simulate {
-        Some(mapped) => Box::new(move || {
-            let tracker = SimulatedTracker::new(Simulation { mapped, fail_compute_at, ..Simulation::default() });
-            Ok(device::session_on(tracker, would_send()))
-        }),
-        None => {
-            let (index, channel) = (args.index, args.channel);
-            Box::new(move || device::open_usb(index, channel, would_send()).map_err(FlowError::from))
-        }
-    }
+    let log = Arc::clone(log);
+    let dry_run_report = Box::new(move || -> Option<WouldSend> {
+        dry_run.then(|| {
+            let log = Arc::clone(&log);
+            Box::new(move |message: &tobii_protocol::Message| write_log(&log, "would_send", device::describe(message)))
+                as WouldSend
+        })
+    });
+    cli::session_opener(args, dry_run_report, device::open_usb)
 }
 
 /// The command line entry point of `tobii-linux-setup`.
@@ -96,21 +84,21 @@ pub fn main() -> std::process::ExitCode {
         }
         Err(error) => {
             eprintln!("{}\nerror: {error}", cli::USAGE.lines().next().unwrap_or_default());
-            return std::process::ExitCode::from(2);
+            return std::process::ExitCode::from(ARGUMENT_ERROR);
         }
     };
     let scratch = match args.simulate.map(|_| cli::scratch_directory()).transpose() {
         Ok(scratch) => scratch,
         Err(error) => {
             eprintln!("error: {error}");
-            return std::process::ExitCode::FAILURE;
+            return std::process::ExitCode::from(Status::Failed.exit_code() as u8);
         }
     };
     let options = match cli::options_from(&args, scratch) {
         Ok(options) => options,
         Err(error) => {
             eprintln!("error: {error}");
-            return std::process::ExitCode::FAILURE;
+            return std::process::ExitCode::from(ARGUMENT_ERROR);
         }
     };
     let log = match &args.log {
@@ -118,14 +106,14 @@ pub fn main() -> std::process::ExitCode {
             Ok(file) => Some(file),
             Err(error) => {
                 eprintln!("error: {}: {error}", path.display());
-                return std::process::ExitCode::FAILURE;
+                return std::process::ExitCode::from(ARGUMENT_ERROR);
             }
         },
         None => None,
     };
     let desktop = cli::desktop(&args, &options);
     let launch = Rc::new(RefCell::new(Some(Launch { args, options, desktop, log: Arc::new(Mutex::new(log)) })));
-    let exit = Rc::new(Cell::new(1u8));
+    let exit = Rc::new(Cell::new(Status::Running.exit_code() as u8));
     let app = gtk::Application::builder().flags(gio::ApplicationFlags::NON_UNIQUE).build();
     let keep: RefCell<Option<Rc<Ui>>> = RefCell::new(None);
     let exit_code = Rc::clone(&exit);

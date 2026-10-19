@@ -28,5 +28,8 @@ tobii-service.workspace = true
 tobii-usb.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+tobii-setup.workspace = true
+
 [lints]
 workspace = true

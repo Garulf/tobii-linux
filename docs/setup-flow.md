@@ -269,6 +269,40 @@ session, and a move to another monitor done by the window itself
 (`fullscreen_on_monitor`) instead of a second browser. `tobii-linux setup` still opens the
 page until the binary phase switches the CLI.
 
+### tobii-linux-setup arguments
+
+`tobii-linux-setup` keeps every option above and also takes Tobii's
+configuration arguments, at most one, for the Tobii Experience page
+([experience app](experience-app.md#47-what-the-buttons-launch-and-exit-codes)):
+
+| Argument | Flow | Steps |
+| --- | --- | --- |
+| none | as above | display when the tracker has none, then calibrate the current profile or a new one |
+| `-C` | Calibrate | calibrate the current profile (`--display never`) |
+| `-N` | CreateNewProfile | calibrate, then name a new profile even when one is current |
+| `-S` | SetupDisplay | the display setup only (`--display always --no-calibration`) |
+| `-R` | ResolveConfiguration | the display when the tracker has none, then calibrate only when the current profile has no calibration |
+| `-G`, `--guest` | GuestCalibration | calibrate without a name page, save as `Guest` (overwriting it) with both eyes tracked, make it current |
+
+Like Tobii's `-G`, the guest calibration is the same 7-target, three-stage
+sequence as the others (Tobii asks for 5 points but shows indices 0 to 6, see
+[gaze calibration](gaze-calibration.md#the-procedure-static-live-log)). They
+cannot be combined with `--display`, `--no-calibration` or `--profile`; `-P`
+and `-Q` are not taken. Exit codes are Tobii's: 0 done, 1 argument error, 2
+cancelled, 3 failed.
+
+Calibrations are saved per monitor: under the monitor key of the display
+record (`edid_id`, else `key`), the key the service applies them by, or as the
+profile's own calibration when there is no record. The record's `monitor` also
+keeps the DRM `connector` (such as `card0-DP-1`, found by EDID for xrandr
+outputs) and the full `edid` in hex when they are known, for the gaze preview.
+
+When `tobii-linux serve` runs it holds the tracker, so the setup first asks it
+over the [control channel](control-channel.md#release-lifecycle) to release the
+tracker (`--service ADDR`, default `127.0.0.1:7760`) and gives it back when the
+flow ends. With nothing listening it opens USB directly; `--no-service` skips the
+request and `--simulate` never makes it.
+
 ## Checks
 
 - Unit tests: `tests/test_eye_positioning.py` (sizes, mirror, status order,
