@@ -43,15 +43,16 @@ use tobii_service::prp_service::{
     self as decisions, FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
     GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS, LICENSED_SUBSCRIPTIONS,
     PROPERTY_DEVICE_PAUSED, PropertySource, STATUS_CONNECTION_FAILED, STATUS_INSUFFICIENT_LICENSE,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence, encode_names, paused_notification,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence, display_area_notification, encode_names,
+    paused_notification,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
     COMMAND_TIMESYNC, CommandRequest, CommandResponse, ConnectResponse, HandshakeInfo, OPERATION_PROPERTY_GET,
-    PropertyResponse, ResponseBody, SERVER_PIPE_PREFIX, STATUS_NOT_SUPPORTED, STATUS_OK, SUBSCRIPTION_CHANNEL,
-    TIMESYNC_CHANNEL, decode_client_hello, decode_client_pid, decode_command_request, decode_property_request,
-    decode_property_subscribe_request, encode_command_response, encode_handshake_ack, encode_handshake_info,
-    encode_property_response, encode_property_subscribe_response, split_packets,
+    PROPERTY_DISPLAY_AREA, PropertyResponse, ResponseBody, SERVER_PIPE_PREFIX, STATUS_NOT_SUPPORTED, STATUS_OK,
+    SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL, decode_client_hello, decode_client_pid, decode_command_request,
+    decode_property_request, decode_property_subscribe_request, encode_command_response, encode_handshake_ack,
+    encode_handshake_info, encode_property_response, encode_property_subscribe_response, split_packets,
 };
 use tobii_service::prp_streams::{
     PRP_GAZE_ORIGIN, PRP_GAZE_POINT, PRP_RESPONSIVE_GAZE_POINT, PlatmodRecord, prp_record, stream_packet,
@@ -82,6 +83,7 @@ pub type Corners = [[f64; 3]; 3];
 pub struct Options {
     pub name: String,
     pub serial: Option<String>,
+    /// Overrides the display area the tracker holds.
     pub display_area: Option<Corners>,
     pub display_id: Option<String>,
     pub gaze: bool,
@@ -113,7 +115,8 @@ impl Default for Options {
 /// What a tracker session delivers to the service, in order, from its own threads.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Attach(Option<u32>),
+    /// A session started, with the device's calibration id and the display area it uses.
+    Attach(Option<u32>, Option<Corners>),
     Detach,
     Sample(HeadPoseSample),
     Gaze(Box<GazeFrame>),
@@ -232,7 +235,8 @@ pub struct Counters {
 struct Inner {
     name: String,
     serial: String,
-    display_area: Option<Corners>,
+    display_override: bool,
+    display_area: Cell<Option<Corners>>,
     display_id: Option<String>,
     reported_display_id: RefCell<Option<String>>,
     clock: Arc<Clock>,
@@ -310,6 +314,10 @@ pub fn gaze_package(frame: &GazeFrame, stream: u32) -> Option<Vec<u8>> {
     stream_packet(&prp_record(&record), 0, true).ok().flatten()
 }
 
+fn flat(area: &Corners) -> Vec<f64> {
+    area.iter().flatten().copied().collect()
+}
+
 fn word_response(tag: u32, command: u32, status: i32, value: i32) -> CommandResponse {
     CommandResponse { tag, command, status, body: ResponseBody::Word(value) }
 }
@@ -336,7 +344,8 @@ impl PrpService {
         Self(Rc::new(Inner {
             serial: options.serial.clone().unwrap_or_else(|| options.name.clone()),
             name: options.name,
-            display_area: options.display_area,
+            display_override: options.display_area.is_some(),
+            display_area: Cell::new(options.display_area),
             display_id: options.display_id,
             reported_display_id: RefCell::new(None),
             follower: RefCell::new(QpcClockFollower::default()),
@@ -378,6 +387,11 @@ impl PrpService {
 
     pub fn counters(&self) -> &Counters {
         &self.0.counters
+    }
+
+    /// The configured display area, else the one the tracker holds; `None` when neither exists.
+    pub fn display_area(&self) -> Option<Corners> {
+        self.0.display_area.get()
     }
 
     pub fn presence(&self) -> UserPresence {
@@ -457,7 +471,7 @@ impl PrpService {
     /// Applies one event of the tracker session.
     pub fn apply(&self, event: Event) {
         match event {
-            Event::Attach(calibration_id) => self.attach_tracker(calibration_id),
+            Event::Attach(calibration_id, display_area) => self.attach_tracker(calibration_id, display_area),
             Event::Detach => self.detach_tracker(),
             Event::Sample(sample) => self.0.hub.publish(&sample),
             Event::Gaze(frame) => {
@@ -562,14 +576,34 @@ impl PrpService {
     }
 
     /// A tracker session is running: accept clients, as the real server starts listening.
-    pub fn attach_tracker(&self, calibration_id: Option<u32>) {
+    /// Without a configured display area the service takes the session's.
+    pub fn attach_tracker(&self, calibration_id: Option<u32>, display_area: Option<Corners>) {
         if let Some(id) = calibration_id {
             self.0.calibration_id.set(id);
+        }
+        if !self.0.display_override {
+            self.set_tracker_display_area(display_area);
         }
         if !self.0.tracker_attached.get() {
             log::info!("tracker attached; accepting game clients (calibration id {:#x})", self.0.calibration_id.get());
         }
         self.0.tracker_attached.set(true);
+    }
+
+    /// Stores the tracker's display area and notifies property 1 subscribers when it changed.
+    fn set_tracker_display_area(&self, display_area: Option<Corners>) {
+        if self.0.display_area.replace(display_area) == display_area {
+            return;
+        }
+        let Some(area) = display_area else {
+            log::info!("the tracker holds no display area");
+            return;
+        };
+        log::info!("display area from the tracker: {area:?}");
+        match display_area_notification(&flat(&area)) {
+            Ok(notification) => self.notify(PROPERTY_DISPLAY_AREA, &notification),
+            Err(error) => log::warn!("no display area notification: {error}"),
+        }
     }
 
     /// The tracker is gone: close every client connection and refuse new ones.
@@ -629,9 +663,9 @@ impl PrpService {
         }
     }
 
-    /// The display area the game's legacy module got from the device, else the configured one.
+    /// The display area the game's legacy module got from the device, else the service's.
     pub fn legacy_display_area(&self) -> Option<Corners> {
-        self.0.tet_tcp.as_ref().and_then(|tet_tcp| tet_tcp.device_display_area()).or(self.0.display_area)
+        self.0.tet_tcp.as_ref().and_then(|tet_tcp| tet_tcp.device_display_area()).or(self.display_area())
     }
 
     fn stop_stream(&self, subscription: &Subscription, stream: u32) {
@@ -815,7 +849,7 @@ impl PrpService {
         subscribe: bool,
         subscription: Option<&Subscription>,
     ) -> Outcome<PropertyResponse> {
-        let corners: Option<Vec<f64>> = self.0.display_area.map(|area| area.iter().flatten().copied().collect());
+        let corners: Option<Vec<f64>> = self.display_area().as_ref().map(flat);
         let reported = self.0.reported_display_id.borrow().clone();
         let display_id = self.0.display_id.clone().filter(|id| !id.is_empty()).or(reported);
         let presence = self.0.presence.get();

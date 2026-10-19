@@ -415,6 +415,13 @@ pub fn paused_notification(paused: bool) -> Vec<u8> {
     encode_property_notification(NOTIFICATION_TAG, PROPERTY_DEVICE_PAUSED, &block, &region)
 }
 
+/// Operation 2 for property 1 subscribers once the display area changes: the same value a
+/// get answers.
+pub fn display_area_notification(corners: &[f64]) -> Result<Vec<u8>> {
+    let (block, region) = display_area_value(corners)?;
+    Ok(encode_property_notification(NOTIFICATION_TAG, PROPERTY_DISPLAY_AREA, &block, &region))
+}
+
 /// Value of a property for a get, or for a subscribe (command 5), or a refusal.
 ///
 /// Served: display area and display id when configured, the model name, properties 2

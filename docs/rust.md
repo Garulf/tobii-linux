@@ -144,6 +144,12 @@ it unchanged:
 - `probe`, `headpose`: the descriptor probe and the head-pose JSON lines;
 - `serve` (with `--tet-tcp`, `--wine-clock`, `--no-gaze`, `--sesp-positions`): the
   game service;
+  Unlike the Python command, `serve` does not require `--display`: as Tobii's runtime
+  does, each tracker session reads the display area the tracker holds (1430) and the
+  service answers property 1 with it, notifying subscribers when it changes. `--display`
+  (the NixOS module's `displayArea`) overrides it and then no 1430 read is sent. With
+  neither, the session serves gaze and presence without head pose and property 1 stays
+  refused. `headpose` still requires `--display`;
 - `demo`: the browser demo, serving `src/tobii_linux/demo/static` compiled in;
 - `setup`: runs `tobii-linux-setup` (the GTK app, `crates/tobii-setup`) with the same
   arguments, found beside the executable or on `PATH`.

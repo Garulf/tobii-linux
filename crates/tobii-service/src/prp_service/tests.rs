@@ -334,6 +334,15 @@ fn property_4_follows_the_paused_state() {
 }
 
 #[test]
+fn display_area_notification_carries_the_get_value() {
+    let area = real_display_area();
+    let (block, region) = display_area_value(&area).unwrap();
+    let expected = encode_property_notification(NOTIFICATION_TAG, PROPERTY_DISPLAY_AREA, &block, &region);
+    assert_eq!(display_area_notification(&area).unwrap(), expected);
+    assert!(display_area_notification(&area[..8]).is_err());
+}
+
+#[test]
 fn unconfigured_display_is_refused() {
     let presence = UserPresence::default();
     for property_id in [PROPERTY_DISPLAY_AREA, PROPERTY_DISPLAY_ID] {

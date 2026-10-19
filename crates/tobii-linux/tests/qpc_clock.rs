@@ -100,7 +100,7 @@ impl Fixture {
     async fn start(clock_name: &str, host: SyntheticHost) -> Self {
         let clock = wine_clock(clock_name, host.clocks()).unwrap();
         let (service, port, _) = service(options("ET5-TEST"), Arc::clone(&clock)).await;
-        service.attach_tracker(None);
+        service.attach_tracker(None, None);
         Self { host, clock, service, port }
     }
 

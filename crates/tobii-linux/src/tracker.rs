@@ -28,6 +28,7 @@ use tobii_service::prp_service::presence_subscribe_time;
 use tobii_service::tet_tcp::CAPTURED_GETTERS;
 
 use crate::error::{Error, Result};
+use crate::service::Corners;
 
 const READ_SLICE_MS: u32 = tobii_device::streams::READ_SLICE_MS;
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -58,8 +59,10 @@ impl HostClock for HostTime {
     }
 }
 
-/// Image frame to head-pose sample; `start` begins a tracker session with its camera.
+/// Image frame to head-pose sample; `start` begins a tracker session with its camera, in
+/// the display area last set.
 pub trait FrameProcessor: Send {
+    fn set_display_area(&mut self, area: &Corners);
     fn start(&mut self, calibration: &CameraCalibration);
     fn process(&mut self, frame: &ImageFrame) -> Result<HeadPoseSample>;
 }
@@ -80,6 +83,10 @@ pub fn vec3(values: [f64; 3]) -> [f32; 3] {
 }
 
 impl FrameProcessor for ModelProcessor {
+    fn set_display_area(&mut self, area: &Corners) {
+        self.0.display_area = crate::cli::display_area(area);
+    }
+
     fn start(&mut self, calibration: &CameraCalibration) {
         self.0.start(vec3(calibration.translation), vec3(calibration.angles));
     }
@@ -123,15 +130,25 @@ impl DeviceReplies {
     }
 
     /// Top-left, top-right and bottom-left corners of the device's display area reply.
-    pub fn display_area(&self) -> Option<[[f64; 3]; 3]> {
-        let reply = self.replies.get(&command::GET_DISPLAY_AREA)?;
-        if reply.word4 != 0 {
-            return None;
-        }
-        let values: Vec<Value> = tobii_protocol::fields::values(&reply.payload).ok()?;
-        let area = tobii_gaze::display::display_area_from_reply(&values).ok()?;
-        Some([area.top_left, area.top_right, area.bottom_left])
+    pub fn display_area(&self) -> Option<Corners> {
+        self.replies.get(&command::GET_DISPLAY_AREA).and_then(display_area_of)
     }
+}
+
+/// The corners of a 1430 reply; `None` for a refusal or a reply without three corners.
+fn display_area_of(reply: &Message) -> Option<Corners> {
+    if reply.word4 != 0 {
+        return None;
+    }
+    let values: Vec<Value> = tobii_protocol::fields::values(&reply.payload).ok()?;
+    let area = tobii_gaze::display::display_area_from_reply(&values).ok()?;
+    Some([area.top_left, area.top_right, area.bottom_left])
+}
+
+/// The display area the tracker holds (1430), as the runtime reads it at session start.
+fn read_display_area<C: Channel>(session: &mut TrackerSession<C>) -> Result<Option<Corners>> {
+    let getter = |id| request(id, command::GET_DISPLAY_AREA, &[]).expect("a header-only getter");
+    Ok(session.exchange(getter, CAPTURE_TIMEOUT)?.as_ref().and_then(display_area_of))
 }
 
 /// Stop requests of the caller and of the session itself.
@@ -537,18 +554,19 @@ impl Reading<'_, '_> {
 
 /// Where one service session delivers its output; every callback must be thread safe.
 ///
-/// `started(calibration_id)` runs once the streams are subscribed, before the first item,
-/// with the device's calibration id (`None` when it reports none). With `device` the
-/// session first reads the device replies tet-tcp clients get, passed with the subscribed
-/// streams before `started`; `device_stream` then receives every raw gaze and presence
-/// message.
+/// `started(calibration_id, display_area)` runs once the streams are subscribed, before the
+/// first item, with the device's calibration id (`None` when it reports none) and the
+/// display area the session uses (`None` when there is none, and then no head pose is
+/// produced). With `device` the session first reads the device replies tet-tcp clients
+/// get, passed with the subscribed streams before `started`; `device_stream` then receives
+/// every raw gaze and presence message.
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct ServiceFeed {
     pub sample: Option<Box<dyn Fn(HeadPoseSample) + Send + Sync>>,
     pub gaze: Option<Box<dyn Fn(GazeFrame) + Send + Sync>>,
     pub presence: Option<Box<dyn Fn(i64, i64) + Send + Sync>>,
-    pub started: Option<Box<dyn Fn(Option<u32>) + Send + Sync>>,
+    pub started: Option<Box<dyn Fn(Option<u32>, Option<Corners>) + Send + Sync>>,
     pub device: Option<Box<dyn Fn(DeviceReplies) + Send + Sync>>,
     pub device_stream: Option<Box<dyn Fn(&Message, i64) + Send + Sync>>,
 }
@@ -573,7 +591,9 @@ fn pause_connected<C: Channel>(session: &mut TrackerSession<C>) -> Result<()> {
 ///
 /// While `paused` is set the tracker is paused first; the session then pauses or resumes it
 /// whenever `paused` changes, and does not take its silence for a lost tracker. `requests`
-/// wait until the streams run and are then answered between reads.
+/// wait until the streams run and are then answered between reads. Head pose is computed
+/// in `display_area`, or without it in the display area the tracker holds (1430); with
+/// neither the session produces no head pose and still serves gaze and presence.
 /// Returns when `stop` is set; fails when the tracker fails or goes silent.
 #[allow(clippy::too_many_arguments, reason = "the session, its consumers and each way the service steers it")]
 pub fn serve_tracker<C: Channel>(
@@ -585,14 +605,27 @@ pub fn serve_tracker<C: Channel>(
     suspend: Option<Box<dyn SuspendWatch>>,
     requests: Option<DeviceRequests>,
     paused: Arc<AtomicBool>,
+    display_area: Option<Corners>,
 ) -> Result<()> {
     let device_paused = paused.load(Ordering::SeqCst);
     if device_paused {
         pause_connected(session)?;
     }
-    processor.start(&session.camera_calibration(0)?);
+    let calibration = session.camera_calibration(0)?;
     let calibration_id = device_calibration_id(session)?;
     let replies = if feed.device.is_some() { Some(DeviceReplies::capture_getters(session)?) } else { None };
+    let display_area = match (display_area, &replies) {
+        (Some(area), _) => Some(area),
+        (None, Some(replies)) => replies.display_area(),
+        (None, None) => read_display_area(session)?,
+    };
+    match &display_area {
+        Some(area) => {
+            processor.set_display_area(area);
+            processor.start(&calibration);
+        }
+        None => log::warn!("the tracker holds no display area; serving gaze and presence without head pose"),
+    }
     let ignore = |_: GazeFrame| {};
     let gaze: GazeCallback = match &feed.gaze {
         Some(gaze) => gaze.as_ref(),
@@ -614,10 +647,13 @@ pub fn serve_tracker<C: Channel>(
                 device(replies);
             }
             if let Some(started) = &feed.started {
-                started(calibration_id);
+                started(calibration_id, display_area);
             }
         },
         |frame, to_host| {
+            if display_area.is_none() {
+                return Ok(());
+            }
             let sample = processor.process(&frame)?;
             if let Some(publish) = &feed.sample {
                 publish(HeadPoseSample { timestamp_us: to_host(sample.timestamp_us), ..sample });

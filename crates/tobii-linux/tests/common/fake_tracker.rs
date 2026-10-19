@@ -14,7 +14,7 @@ use tobii_linux::tracker::HostTime;
 use tobii_protocol::Message;
 use tobii_protocol::camera_info::{CameraRecord, HardwareInfo, hardware_info_response};
 use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device};
-use tobii_protocol::fields::{encode_payload, int32_field, uint32_field};
+use tobii_protocol::fields::{array_fields, encode_payload, int32_field, triple_fixed42_fields, uint32_field};
 use tobii_protocol::gaze::PLATMOD_PRESENT;
 use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column};
 use tobii_protocol::ttp::{Decoder, Field};
@@ -24,6 +24,9 @@ const REFUSED_STATUS: u32 = 3;
 pub const STREAMING_START_US: i64 = 900_000_000_000;
 pub const STREAMING_PERIOD_US: i64 = 30_207;
 const UNPLUGGED: &str = "LIBUSB_ERROR_NO_DEVICE";
+/// The display area every fake tracker holds unless told otherwise; exact in fixed42.
+pub const DEVICE_AREA: [[f64; 3]; 3] =
+    [[-296.625, 326.0, 111.8125], [300.375, 326.0, 111.8125], [-296.625, 10.25, -3.125]];
 
 /// The gaze stream payloads tools/linux_stream_capture.py recorded from a live tracker.
 pub fn payload(name: &str) -> Vec<u8> {
@@ -93,6 +96,13 @@ fn reply(request: &Message, status: u32, items: &[Field]) -> Message {
     Message::new(RESPONSE_KIND, request.request_id, 0, request.command, status, payload)
 }
 
+/// A 1430 reply body: the three corners as fixed42 triples, then the empty trailing array.
+fn display_area_fields(area: [[f64; 3]; 3]) -> Vec<Field> {
+    let mut fields: Vec<Field> = area.into_iter().flat_map(|corner| triple_fixed42_fields(corner).unwrap()).collect();
+    fields.extend(array_fields(0, tobii_gaze::device::DISPLAY_AREA_TRAILER).unwrap());
+    fields
+}
+
 /// The wire id a subscribe or unsubscribe request names.
 pub fn requested_stream(request: &Message) -> u32 {
     u32::from_be_bytes(request.payload[7..11].try_into().unwrap())
@@ -131,6 +141,7 @@ struct Device {
     pausable: bool,
     paused: bool,
     pause_status: u32,
+    display_area: Option<[[f64; 3]; 3]>,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -159,6 +170,7 @@ impl FakeTracker {
             pausable: false,
             paused: false,
             pause_status: 0,
+            display_area: Some(DEVICE_AREA),
         })))
     }
 
@@ -210,6 +222,12 @@ impl FakeTracker {
         self
     }
 
+    /// Refuses the display area getter (1430), as a tracker that holds none.
+    pub fn without_display_area(self) -> Self {
+        self.device().display_area = None;
+        self
+    }
+
     /// Holds every reply to `command` back for `delay`.
     pub fn slow_reply(self, command: u32, delay: Duration) -> Self {
         self.device().slow = Some((command, delay));
@@ -248,6 +266,10 @@ impl Device {
                 reply(&request, status(self.refuse.contains(&requested_stream(&request))), &[])
             }
             command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
+            command::GET_DISPLAY_AREA => match self.display_area {
+                Some(area) => reply(&request, 0, &display_area_fields(area)),
+                None => reply(&request, REFUSED_STATUS, &[]),
+            },
             command::PAUSE_DEVICE if self.pause_status != 0 => reply(&request, self.pause_status, &[]),
             command::PAUSE_DEVICE if self.pausable => {
                 self.paused = request.payload == pause_device(0).payload;

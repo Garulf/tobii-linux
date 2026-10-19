@@ -1,4 +1,4 @@
-usage: tobii-linux serve [-h] --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+usage: tobii-linux serve [-h] [--display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ]
                          [--models MODELS] [--channel CHANNEL] [--index INDEX]
                          [--host HOST] [--port PORT] [--name NAME]
                          [--display-id DISPLAY_ID]
@@ -9,7 +9,8 @@ options:
   -h, --help            show this help message and exit
   --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
                         Display area corners in millimetres: top-left, top-
-                        right, bottom-left
+                        right, bottom-left; overrides the display area the
+                        tracker holds
   --models MODELS
   --channel CHANNEL     USB channel carrying TTP
   --index INDEX         Device index from probe

@@ -82,18 +82,14 @@
     overlays.wine = import ./nix/wine.nix;
     checks = forAllSystems (system: let
       pkgs = import nixpkgs { inherit system; };
-      machine = nixpkgs.lib.nixosSystem {
+      machineWith = headPoseService: nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
           self.nixosModules.default
           {
             hardware.tobii-eye-tracker-5 = {
               enable = true;
-              headPoseService = {
-                enable = true;
-                displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
-                models = "/srv/tobii-et5";
-              };
+              headPoseService = { enable = true; } // headPoseService;
             };
             boot.loader.grub.enable = false;
             fileSystems."/" = { device = "/dev/null"; fsType = "ext4"; };
@@ -101,15 +97,21 @@
           }
         ];
       };
+      machine = machineWith {
+        models = "/srv/tobii-et5";
+        displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
+      };
+      execStart = machine: machine.config.systemd.user.services.tobii-head-pose.serviceConfig.ExecStart;
       names = map (p: p.name or "") ;
       installed = builtins.elem self.packages.${system}.default.name (names machine.config.environment.systemPackages);
       ruled = builtins.elem "tobii-eye-tracker-5-udev" (names machine.config.services.udev.packages);
       service = machine.config.systemd.user.services.tobii-head-pose;
-      served = service.serviceConfig.ExecStart != "";
+      served = nixpkgs.lib.hasInfix "serve --display -296.62" (execStart machine);
+      deviceArea = !(nixpkgs.lib.hasInfix "--display" (execStart (machineWith { })));
       modelled = service.environment.TOBII_LINUX_MODELS == "/srv/tobii-et5";
     in {
       package = self.packages.${system}.default;
-      nixos-module = assert installed && ruled && served && modelled; pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
+      nixos-module = assert installed && ruled && served && deviceArea && modelled; pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
     } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
       wine-run = self.packages.${system}.wine-run;
     });

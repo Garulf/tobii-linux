@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use common::fake_tracker::FakeTracker;
+use common::fake_tracker::{DEVICE_AREA, FakeTracker};
 use common::*;
 use tobii_device::streams::SILENCE_TIMEOUT;
 use tobii_device::supervisor::{Backoff, LinkCounters, TrackerLink};
@@ -22,7 +22,7 @@ use tobii_linux::cli::{ServiceLink, service_feed};
 use tobii_linux::error::Result;
 use tobii_linux::service::clock::{Clocks, ServiceTime, wine_clock};
 use tobii_linux::service::enabled::EnabledState;
-use tobii_linux::service::{DeviceCallError, Options, PrpService};
+use tobii_linux::service::{Corners, DeviceCallError, Options, PrpService};
 use tobii_linux::tracker::{FrameProcessor, HostTime};
 use tobii_protocol::commands::{Stream, command, header_only_request, unsubscribe_stream};
 use tobii_protocol::fields::{Value, values};
@@ -32,20 +32,26 @@ use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope};
 use tobii_service::prp_service::{PROPERTY_DEVICE_PAUSED, paused_notification, word_value};
 use tobii_service::prp_session::{
-    COMMAND_CHANNEL, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_STREAM_START, ConnectRequest, PropertyResponse,
-    SUBSCRIPTION_CHANNEL, decode_command_response, decode_property_subscribe_response, encode_connect_request,
+    COMMAND_CHANNEL, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_STREAM_START, ConnectRequest, PROPERTY_DISPLAY_AREA,
+    PropertyResponse, STATUS_NOT_SUPPORTED, SUBSCRIPTION_CHANNEL, decode_command_response, decode_display_area,
+    decode_property_response, decode_property_subscribe_response, encode_connect_request, encode_property_request,
     encode_property_subscribe_request, encode_stream_request,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(5);
 
-/// Counts calibrations; every sample is invalid.
+/// Counts calibrations and keeps the display areas it is given; every sample is invalid.
 struct FakeProcessor {
     starts: Arc<AtomicUsize>,
+    areas: Arc<Mutex<Vec<Corners>>>,
 }
 
 impl FrameProcessor for FakeProcessor {
+    fn set_display_area(&mut self, area: &Corners) {
+        self.areas.lock().unwrap().push(*area);
+    }
+
     fn start(&mut self, _: &CameraCalibration) {
         self.starts.fetch_add(1, Ordering::SeqCst);
     }
@@ -80,12 +86,18 @@ struct Link {
     stop: StopFlag,
     counters: Arc<LinkCounters>,
     starts: Arc<AtomicUsize>,
+    areas: Arc<Mutex<Vec<Corners>>>,
     streams: Arc<Mutex<Option<BTreeSet<u32>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Link {
     fn start(service: &PrpService, tet_tcp: bool, slot: &Plugged) -> Self {
+        Self::with_display(service, tet_tcp, slot, None)
+    }
+
+    /// A link whose sessions use `display_area` instead of the tracker's.
+    fn with_display(service: &PrpService, tet_tcp: bool, slot: &Plugged, display_area: Option<Corners>) -> Self {
         let (events, received) = tokio::sync::mpsc::unbounded_channel();
         {
             let service = service.clone();
@@ -104,17 +116,26 @@ impl Link {
         let paused = service.pause_flag();
         let mut link = TrackerLink::new(Backoff::new(0.02, 0.05, 10.0));
         let (stop, counters, starts) = (StopFlag::new(), Arc::clone(&link.counters), Arc::new(AtomicUsize::new(0)));
+        let areas: Arc<Mutex<Vec<Corners>>> = Arc::default();
         let thread = {
             let (stop, starts, slot) = (stop.clone(), Arc::clone(&starts), Arc::clone(slot));
+            let areas = Arc::clone(&areas);
             std::thread::spawn(move || {
-                let mut processor = FakeProcessor { starts };
+                let mut processor = FakeProcessor { starts, areas };
                 let mut open = || open(&slot);
-                let mut host =
-                    ServiceLink { open: &mut open, processor: &mut processor, clock, feed: &feed, events, paused };
+                let mut host = ServiceLink {
+                    open: &mut open,
+                    processor: &mut processor,
+                    clock,
+                    feed: &feed,
+                    events,
+                    paused,
+                    display_area,
+                };
                 link.run(&mut host, &stop);
             })
         };
-        Self { stop, counters, starts, streams, thread: Some(thread) }
+        Self { stop, counters, starts, areas, streams, thread: Some(thread) }
     }
 
     fn sessions_and_failures(&self) -> (u64, u64) {
@@ -640,6 +661,85 @@ fn a_refused_pause_ends_the_session() {
         service.set_enabled(false).await.unwrap();
         until("session ended", || link.sessions_and_failures().1 >= 1).await;
         assert!(!service.enabled());
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+const ALBEDO_AREA: Corners = [[-296.62, 326.0, 111.82], [300.38, 326.0, 111.82], [-296.62, 10.27, -3.1]];
+
+/// Property 1 as a connected client gets it.
+async fn display_area_property(command: &mut RelayedChannel) -> PropertyResponse {
+    command.send_packet(&encode_property_request(9, PROPERTY_DISPLAY_AREA)).await;
+    decode_property_response(&command.packet().await).unwrap()
+}
+
+/// Corners as they travel in PRP: float32, flattened.
+fn float32_corners(area: &Corners) -> Vec<f64> {
+    area.iter().flatten().map(|&value| f64::from(value as f32)).collect()
+}
+
+#[test]
+fn display_area_comes_from_the_device() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        assert_eq!(service.display_area(), Some(DEVICE_AREA));
+        assert_eq!(*link.areas.lock().unwrap(), [DEVICE_AREA]);
+        let (mut command, mut subscription, _) = streaming_client(port).await;
+        let response = display_area_property(&mut command).await;
+        assert_eq!(response.status, 0);
+        assert_eq!(decode_display_area(&response).unwrap().to_vec(), float32_corners(&DEVICE_AREA));
+        let package = subscription.packet().await;
+        assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn display_override_wins_over_device() {
+    run(async {
+        let options = Options { display_area: Some(ALBEDO_AREA), ..options("ET5-TEST") };
+        let (service, port, accept) = service(options).await;
+        let device = FakeTracker::streaming();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::with_display(&service, false, &slot, Some(ALBEDO_AREA));
+        streaming(&service).await;
+        assert_eq!(service.display_area(), Some(ALBEDO_AREA));
+        assert_eq!(*link.areas.lock().unwrap(), [ALBEDO_AREA]);
+        assert!(!device.commands().contains(&command::GET_DISPLAY_AREA), "the override needs no device read");
+        let (mut command, _subscription, _) = streaming_client(port).await;
+        let response = display_area_property(&mut command).await;
+        assert_eq!(decode_display_area(&response).unwrap().to_vec(), float32_corners(&ALBEDO_AREA));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn a_tracker_without_a_display_area_serves_presence_but_no_head_pose() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::streaming().without_display_area();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        assert_eq!(service.display_area(), None);
+        assert!(link.areas.lock().unwrap().is_empty());
+        assert_eq!(link.starts.load(Ordering::SeqCst), 0);
+        let (mut command, mut subscription, presence) = streaming_client(port).await;
+        assert_eq!(presence_value(&presence), PRESENCE_PRESENT);
+        assert_eq!(display_area_property(&mut command).await.status, STATUS_NOT_SUPPORTED);
+        assert!(packages_within(&mut subscription, Duration::from_millis(500)).await.is_empty());
+        assert!(service.tracker_attached());
+        assert_eq!(link.sessions_and_failures(), (1, 0));
         assert!(link.stop().await);
         service.close();
         accept.abort();

@@ -19,7 +19,7 @@ use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
     FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, PROPERTY_DEVICE_PAUSED, decode_names,
-    encode_frame, error_response, paused_notification, word_value,
+    display_area_notification, encode_frame, error_response, paused_notification, word_value,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
@@ -80,7 +80,7 @@ impl Fixture {
     }
 
     fn attach(&self) {
-        self.service.attach_tracker(None);
+        self.service.attach_tracker(None, None);
         self.service.publish_presence(REAL_PRESENCE_SINCE_US, i64::from(PLATMOD_AWAY));
     }
 
@@ -404,6 +404,44 @@ fn property_get_and_subscribe_keep_the_session() {
     });
 }
 
+const MOVED_AREA: [[f64; 3]; 3] = [[-300.0, 330.0, 100.0], [300.0, 330.0, 100.0], [-300.0, 10.0, -5.0]];
+
+async fn subscribe_display_area(session: &mut Session) -> tobii_service::prp_session::PropertyResponse {
+    let tag = session.next_tag();
+    let request = encode_property_subscribe_request(tag, PROPERTY_DISPLAY_AREA, COMMAND_PROPERTY_SUBSCRIBE).unwrap();
+    session.command.send_packet(&request).await;
+    decode_property_subscribe_response(&session.command.packet().await).unwrap()
+}
+
+#[test]
+fn a_new_display_area_from_the_tracker_notifies_property_1_subscribers() {
+    run(async {
+        let fixture = Fixture::default().await;
+        assert_eq!(fixture.service.display_area(), None);
+        fixture.service.attach_tracker(None, Some(ALBEDO_AREA));
+        let mut session = fixture.session().await;
+        assert_eq!(subscribe_display_area(&mut session).await.status, 0);
+        fixture.service.attach_tracker(None, Some(ALBEDO_AREA));
+        fixture.service.attach_tracker(None, Some(MOVED_AREA));
+        let moved: Vec<f64> = MOVED_AREA.iter().flatten().copied().collect();
+        assert_eq!(session.subscription.packet().await, display_area_notification(&moved).unwrap());
+        assert_eq!(fixture.service.display_area(), Some(MOVED_AREA));
+    });
+}
+
+#[test]
+fn a_configured_display_area_ignores_the_tracker() {
+    run(async {
+        let fixture = Fixture::new(Options { display_area: Some(ALBEDO_AREA), ..common::options("ET5-TEST") }).await;
+        let mut session = fixture.session().await;
+        assert_eq!(subscribe_display_area(&mut session).await.status, 0);
+        fixture.service.attach_tracker(None, Some(MOVED_AREA));
+        fixture.service.attach_tracker(None, None);
+        assert_eq!(fixture.service.display_area(), Some(ALBEDO_AREA));
+        assert_eq!(session.subscription.receive_within(Duration::from_millis(100)).await, Received::Timeout);
+    });
+}
+
 #[test]
 fn unsupported_property_subscribe_carries_a_value_block() {
     run(async {
@@ -431,9 +469,9 @@ fn every_property_subscription_matches_the_real_service() {
             ..common::options("ET5-TEST")
         };
         let fixture = Fixture::new(options).await;
-        fixture.service.attach_tracker(Some(0xBC38_1A37));
+        fixture.service.attach_tracker(Some(0xBC38_1A37), None);
         fixture.service.detach_tracker();
-        fixture.service.attach_tracker(None);
+        fixture.service.attach_tracker(None, None);
         fixture.service.publish_presence(0xD4_41C5_AAA6, i64::from(PLATMOD_AWAY));
         let mut session = fixture.session_with(Vec::new(), 2).await;
         for (command, key) in [(5, "subscribe"), (6, "unsubscribe")] {

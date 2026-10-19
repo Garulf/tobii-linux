@@ -5,8 +5,9 @@ let
   wineRun = (import ./bridge.nix { inherit pkgs; }).wineRun;
   serveArguments = [
     "serve"
+  ] ++ lib.optionals (cfg.headPoseService.displayArea != null) ([
     "--display"
-  ] ++ map toString cfg.headPoseService.displayArea ++ [
+  ] ++ map toString cfg.headPoseService.displayArea) ++ [
     "--wine-clock" cfg.headPoseService.wineClock
     "--port" (toString cfg.headPoseService.port)
     "--name" cfg.headPoseService.deviceName
@@ -21,11 +22,15 @@ in {
       enable = lib.mkEnableOption
         "a systemd user service that serves head pose to Windows games through the Wine pipe bridge";
       displayArea = lib.mkOption {
-        type = lib.types.addCheck (lib.types.listOf lib.types.number) (corners: builtins.length corners == 9);
+        type = lib.types.nullOr
+          (lib.types.addCheck (lib.types.listOf lib.types.number) (corners: builtins.length corners == 9));
+        default = null;
         example = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
         description = ''
           Display corners in millimetres relative to the tracker, in Stream
           Engine order: top-left, top-right, bottom-left, three coordinates each.
+          null uses the display area stored on the tracker (set it with
+          tobii-linux setup); a list overrides it.
         '';
       };
       wineClock = lib.mkOption {

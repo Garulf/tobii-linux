@@ -130,7 +130,7 @@ impl Fixture {
         let clock = wine_clock("raw", Clocks::Scripted(Arc::new(|_| 0))).unwrap();
         let options = Options { display_area: Some(ALBEDO_AREA), tet_tcp: true, tet_tcp_port: 0, ..Options::default() };
         let (service, port, _) = service(options, clock).await;
-        service.attach_tracker(None);
+        service.attach_tracker(None, None);
         Self { service, port }
     }
 

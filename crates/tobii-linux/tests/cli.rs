@@ -3,13 +3,20 @@
 
 use std::process::Command;
 
+use tobii_linux::cli::{Command as Parsed, parse};
+
 const SERVE_USAGE: &str = "\
-usage: tobii-linux serve [-h] --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+usage: tobii-linux serve [-h] [--display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ]
                          [--models MODELS] [--channel CHANNEL] [--index INDEX]
                          [--host HOST] [--port PORT] [--name NAME]
                          [--display-id DISPLAY_ID]
                          [--wine-clock {auto,boottime,raw}] [--no-gaze]
                          [--tet-tcp] [--sesp-positions {prp,windows}]
+";
+const HEADPOSE_USAGE: &str = "\
+usage: tobii-linux headpose [-h] --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
+                            [--models MODELS] [--channel CHANNEL]
+                            [--index INDEX]
 ";
 const MAIN_USAGE: &str = "usage: tobii-linux [-h] {probe,demo,setup,headpose,serve} ...\n";
 
@@ -47,12 +54,30 @@ fn a_command_is_required_and_must_be_known() {
 #[test]
 fn serve_checks_its_options_before_starting() {
     let error = |message: &str| format!("{SERVE_USAGE}tobii-linux serve: error: {message}\n");
-    assert_eq!(usage_error(&["serve"]), error("the following arguments are required: --display"));
     assert_eq!(usage_error(&["serve", "--display", "1", "2", "3"]), error("argument --display: expected 9 arguments"));
     let display = ["serve", "--display", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
     assert_eq!(
         usage_error(&[&display[..], &["--wine-clock", "x"]].concat()),
         error("argument --wine-clock: invalid choice: 'x' (choose from 'auto', 'boottime', 'raw')")
+    );
+}
+
+#[test]
+fn serve_parses_without_display() {
+    let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let Ok(Parsed::Serve(serve)) = parse("tobii-linux", &args(&["serve"])) else { panic!("serve did not parse") };
+    assert_eq!((serve.session.corners, serve.options.display_area), (None, None));
+    let display = ["serve", "--display", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    let Ok(Parsed::Serve(serve)) = parse("tobii-linux", &args(&display)) else { panic!("serve did not parse") };
+    let corners = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+    assert_eq!((serve.session.corners, serve.options.display_area), (Some(corners), Some(corners)));
+}
+
+#[test]
+fn headpose_still_requires_display() {
+    assert_eq!(
+        usage_error(&["headpose"]),
+        format!("{HEADPOSE_USAGE}tobii-linux headpose: error: the following arguments are required: --display\n")
     );
 }
 

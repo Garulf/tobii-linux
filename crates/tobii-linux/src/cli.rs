@@ -29,17 +29,16 @@ pub const COMMANDS: [&str; 5] = ["probe", "demo", "setup", "headpose", "serve"];
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const DISPLAY_VALUES: usize = 9;
 
-fn session_options() -> Vec<OptionSpec> {
-    vec![
-        OptionSpec::floats("--display", DISPLAY_VALUES).required(),
-        OptionSpec::text("--models"),
-        OptionSpec::int("--channel"),
-        OptionSpec::int("--index"),
-    ]
+fn display_option() -> OptionSpec {
+    OptionSpec::floats("--display", DISPLAY_VALUES)
+}
+
+fn session_options(display: OptionSpec) -> Vec<OptionSpec> {
+    vec![display, OptionSpec::text("--models"), OptionSpec::int("--channel"), OptionSpec::int("--index")]
 }
 
 fn serve_options() -> Vec<OptionSpec> {
-    let mut options = session_options();
+    let mut options = session_options(display_option());
     options.extend([
         OptionSpec::text("--host"),
         OptionSpec::int("--port"),
@@ -63,10 +62,10 @@ pub fn display_area(corners: &Corners) -> DisplayArea {
     DisplayArea { top_left: corner(corners[0]), top_right: corner(corners[1]), bottom_left: corner(corners[2]) }
 }
 
-/// Options shared by the head-pose session and the service.
+/// Options shared by the head-pose session and the service; only `serve` may omit `--display`.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub corners: Corners,
+    pub corners: Option<Corners>,
     pub models: PathBuf,
     pub channel: i64,
     pub index: i64,
@@ -75,7 +74,7 @@ pub struct Session {
 impl Session {
     fn from(values: &crate::args::Values) -> Self {
         Self {
-            corners: corners(&values.floats("--display").expect("required")),
+            corners: values.floats("--display").map(|values| corners(&values)),
             models: values.text("--models").map_or_else(crate::paths::default_models, PathBuf::from),
             channel: values.int("--channel").unwrap_or(0),
             index: values.int("--index").unwrap_or(0),
@@ -159,7 +158,8 @@ pub fn sample_json(sample: &tobii_headpose::pipeline::HeadPoseSample) -> Json {
 fn headpose(session: &Session) -> Result<ExitCode> {
     use std::io::Write;
     let (_, mut tracker) = session.open()?;
-    let mut processor = ModelProcessor::load(&session.models, display_area(&session.corners))?;
+    let corners = session.corners.expect("headpose requires --display");
+    let mut processor = ModelProcessor::load(&session.models, display_area(&corners))?;
     let mut stdout = std::io::stdout();
     crate::tracker::head_pose_samples(&mut tracker, &mut processor, |sample| {
         writeln!(stdout, "{}", pyjson::dumps(&sample_json(&sample)))?;
@@ -184,7 +184,7 @@ impl Serve {
         let session = Session::from(values);
         let options = Options {
             name: values.text("--name").unwrap_or(DEFAULT_NAME).into(),
-            display_area: Some(session.corners),
+            display_area: session.corners,
             display_id: values.text("--display-id").map(String::from),
             gaze: !values.flag("--no-gaze"),
             tet_tcp: values.flag("--tet-tcp"),
@@ -217,6 +217,8 @@ pub struct ServiceLink<'a, C> {
     pub events: mpsc::UnboundedSender<Event>,
     /// The service's pause flag, set while eye tracking is off.
     pub paused: Arc<AtomicBool>,
+    /// The configured display area; each session reads the tracker's when `None`.
+    pub display_area: Option<Corners>,
 }
 
 impl<C> std::fmt::Debug for ServiceLink<'_, C> {
@@ -250,6 +252,7 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
             Some(suspend),
             Some(inbox),
             paused,
+            self.display_area,
         )
     }
 
@@ -278,7 +281,9 @@ pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: 
         sample: Some(Box::new(move |s| sample(Event::Sample(s)))),
         gaze: gaze.then(|| Box::new(move |frame| gaze_post(Event::Gaze(Box::new(frame)))) as Box<_>),
         presence: Some(Box::new(move |time_us, value| presence(Event::Presence(time_us, value)))),
-        started: Some(Box::new(move |calibration_id| started(Event::Attach(calibration_id)))),
+        started: Some(Box::new(move |calibration_id, display_area| {
+            started(Event::Attach(calibration_id, display_area))
+        })),
         device: tet_tcp.then(|| Box::new(move |replies| device(Event::Device(Box::new(replies)))) as Box<_>),
         device_stream: tet_tcp.then(|| {
             Box::new(move |message: &tobii_protocol::Message, time_us| {
@@ -296,7 +301,8 @@ pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: 
 fn serve(arguments: &Serve) -> Result<ExitCode> {
     crate::logger::install(log::Level::Info, crate::logger::TimeFormat::Milliseconds);
     let clock = wine_clock(&arguments.wine_clock, Clocks::Host).expect("checked by the parser");
-    let processor = ModelProcessor::load(&arguments.session.models, display_area(&arguments.session.corners))?;
+    let replaced_per_session = arguments.session.corners.unwrap_or_default();
+    let processor = ModelProcessor::load(&arguments.session.models, display_area(&replaced_per_session))?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, run_service(arguments, clock, Box::new(processor)))
@@ -338,7 +344,15 @@ async fn run_service(
             let mut link = TrackerLink::new(Backoff::default());
             let processor = processor.as_mut();
             let mut open = || session.open().map(|(_, tracker)| tracker);
-            let mut host = ServiceLink { open: &mut open, processor, clock: host_clock, feed: &feed, events, paused };
+            let mut host = ServiceLink {
+                open: &mut open,
+                processor,
+                clock: host_clock,
+                feed: &feed,
+                events,
+                paused,
+                display_area: session.corners,
+            };
             link.run(&mut host, &stop);
             let _ = finished.send((link.sessions(), link.failures()));
         })?
@@ -428,7 +442,9 @@ pub fn parse(prog: &str, args: &[String]) -> std::result::Result<Command, Exit> 
             (Command::Probe, unknown)
         }
         "headpose" => {
-            let (values, unknown) = subparser(prog, "headpose", HEADPOSE_HELP, session_options()).parse_known(rest)?;
+            let (values, unknown) =
+                subparser(prog, "headpose", HEADPOSE_HELP, session_options(display_option().required()))
+                    .parse_known(rest)?;
             (Command::Headpose(Session::from(&values)), unknown)
         }
         "serve" => {

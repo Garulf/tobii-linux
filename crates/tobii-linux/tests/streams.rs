@@ -206,6 +206,8 @@ fn live_streams_keep_reading_under_slow_processing() {
 struct SlowProcessor;
 
 impl FrameProcessor for SlowProcessor {
+    fn set_display_area(&mut self, _: &[[f64; 3]; 3]) {}
+
     fn start(&mut self, _: &CameraCalibration) {}
 
     fn process(&mut self, frame: &ImageFrame) -> Result<HeadPoseSample> {
