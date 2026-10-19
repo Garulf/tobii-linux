@@ -401,6 +401,23 @@ in the stop: Quit stops the service unit and exits the app, and the persisted
 on/off value is untouched. The body text says "start menu" (proposal: keep the
 text verbatim as the design asks for the same wording, and tell the user).
 
+Further Linux differences (why), as built in `crates/tobii-experience`:
+
+- The dialog has no Tobii logo in its title strip: the repository has no logo asset.
+  The strip keeps its 30 px height and the close button.
+- The dialog is neither topmost nor hidden from the taskbar: a GTK 4 window cannot ask
+  for either. It is centred, Tobii's fallback position, since no taskbar rectangle exists.
+- The failure box is a GTK window titled `Tobii Experience` with an error icon, the body
+  and Yes/No buttons, not a modal `MessageBox`; closing it counts as No (a Windows YesNo
+  box cannot be closed).
+- Step 1 also ignores Quit while the stop runs or the failure box is up (proposal):
+  Tobii only checks for its open dialog, and its stop is a synchronous write; with the
+  stop on a worker thread and a non-modal box, the extra check keeps two stops or two
+  boxes from overlapping.
+- The stop is `systemctl --user stop <unit>` (default `tobii-head-pose.service`), and
+  launching the app runs `systemctl --user start <unit>` in place of clearing `SystemQuit`;
+  a failed start is only logged.
+
 ## 4. The Eye tracking page
 
 The Store app's `SettingsPage` (`VIEW:SettingsPage.xaml`) with

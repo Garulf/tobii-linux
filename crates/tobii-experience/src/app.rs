@@ -1,11 +1,12 @@
 //! The GTK 4 app shell: one instance per session, the tray and the service link on the GTK
 //! main loop, on/off from the tray, Tobii's quit and `--guest`.
 //!
-//! The link and the tray report on their own threads. Both feed one unbounded
-//! `async_channel` that a future on the GTK main context drains, so every state change
-//! happens on the GTK thread without polling (glib 0.22 has no `MainContext::channel`).
+//! The link and the tray report on their own threads. Both feed one bounded `async_channel`
+//! that a future on the GTK main context drains, so every state change happens on the GTK
+//! thread without polling (glib 0.22 has no `MainContext::channel`). Gaze samples are dropped
+//! while the queue is full; status, failures and tray actions wait for room.
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -30,6 +31,8 @@ pub const PAGE_TITLE: &str = "Tobii Experience";
 pub const PAGE_WIDTH: i32 = 550;
 /// The height of Tobii's host window, which the 550 px sidebar fills.
 pub const PAGE_HEIGHT: i32 = 810;
+/// Events queued for the GTK thread: a few seconds of gaze samples.
+const EVENT_QUEUE: usize = 256;
 
 /// What the app needs from the system; tests replace the parts that act on it.
 #[derive(Debug)]
@@ -55,23 +58,25 @@ impl Deps {
     }
 }
 
-/// The `gtk::Application` and, once its first command line arrived, the [`Controller`].
+/// The `gtk::Application` and, from its first command line until shutdown, the
+/// [`Controller`].
 #[derive(Debug, Clone)]
 pub struct Shell {
     app: gtk::Application,
-    controller: Rc<OnceCell<Controller>>,
+    controller: Rc<RefCell<Option<Controller>>>,
 }
 
 impl Shell {
     /// A unique application with id [`APP_ID`]. The instance that owns the id builds the
     /// controller from its own command line and then acts on every forwarded one; any other
-    /// instance forwards its command line and exits with the primary's answer.
+    /// instance forwards its command line and exits with the primary's answer. Shutdown
+    /// releases the controller, which stops the link and the tray.
     pub fn new(deps: Deps) -> Shell {
         let app = gtk::Application::builder()
             .application_id(APP_ID)
             .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
             .build();
-        let controller = Rc::new(OnceCell::new());
+        let controller: Rc<RefCell<Option<Controller>>> = Rc::new(RefCell::new(None));
         let deps = RefCell::new(Some(deps));
         let cell = controller.clone();
         app.connect_command_line(move |app, command_line| {
@@ -84,12 +89,26 @@ impl Shell {
                     return glib::ExitCode::from(2);
                 }
             };
-            let controller = cell.get_or_init(|| {
-                let deps = deps.borrow_mut().take().expect("the controller is built once");
-                Controller::new(app, &options, deps)
-            });
+            let existing = cell.borrow().clone();
+            let controller = match existing {
+                Some(controller) => controller,
+                None => {
+                    let Some(deps) = deps.borrow_mut().take() else {
+                        log::warn!("ignored a command line after shutdown");
+                        return glib::ExitCode::FAILURE;
+                    };
+                    let controller = Controller::new(app, &options, deps);
+                    *cell.borrow_mut() = Some(controller.clone());
+                    controller
+                }
+            };
             controller.handle(&options);
             glib::ExitCode::SUCCESS
+        });
+        let cell = controller.clone();
+        app.connect_shutdown(move |_| {
+            let released = cell.borrow_mut().take();
+            drop(released);
         });
         Shell { app, controller }
     }
@@ -100,7 +119,7 @@ impl Shell {
 
     /// The controller, once this instance became the primary one.
     pub fn controller(&self) -> Option<Controller> {
-        self.controller.get().cloned()
+        self.controller.borrow().clone()
     }
 
     /// Runs the application with `argv` (program name first).
@@ -132,6 +151,7 @@ pub struct Controller(Rc<Inner>);
 
 struct Inner {
     app: gtk::Application,
+    events: async_channel::Sender<AppEvent>,
     _hold: gio::ApplicationHoldGuard,
     link: Link,
     tray: Option<Handle<Tray>>,
@@ -162,16 +182,25 @@ impl fmt::Debug for Controller {
     }
 }
 
+impl Drop for Inner {
+    /// Closes the queue first so that a link or tray thread waiting for room gives up, then
+    /// stops the tray; the link thread is joined when `link` drops.
+    fn drop(&mut self) {
+        self.events.close();
+        if let Some(tray) = &self.tray {
+            tray.shutdown().wait();
+        }
+    }
+}
+
 impl Controller {
     /// Starts the service unit, the link and the tray for `app`, which this controller keeps
     /// running without windows.
     pub fn new(app: &gtk::Application, options: &Options, deps: Deps) -> Controller {
-        let (events, received) = async_channel::unbounded();
+        let (events, received) = async_channel::bounded(EVENT_QUEUE);
         let link_events = events.clone();
-        let link = Link::start(options.service, move |update| {
-            let _ = link_events.send_blocking(AppEvent::Link(update));
-        });
-        let tray = if deps.tray { spawn_tray(events) } else { None };
+        let link = Link::start(options.service, move |update| queue_link_update(&link_events, update));
+        let tray = if deps.tray { spawn_tray(events.clone()) } else { None };
         let settings = match &deps.settings_path {
             Some(path) => Settings::load(path).unwrap_or_else(|error| {
                 log::warn!("{}: {error}; using the default settings", path.display());
@@ -181,6 +210,7 @@ impl Controller {
         };
         let controller = Controller(Rc::new(Inner {
             app: app.clone(),
+            events,
             _hold: app.hold(),
             link,
             tray,
@@ -259,6 +289,8 @@ impl Controller {
     }
 
     /// Calls `hook` on the GTK thread for every link update, after the controller took it in.
+    /// The hook gets the controller as an argument; capturing a clone of it would keep the
+    /// controller, its link and its tray alive after shutdown.
     pub fn connect_update(&self, hook: impl Fn(&Controller, &LinkUpdate) + 'static) {
         self.0.update_hooks.borrow_mut().push(Rc::new(hook));
     }
@@ -438,6 +470,16 @@ impl Controller {
     }
 }
 
+/// Queues a link update for the GTK thread: a gaze sample is dropped when the queue is full,
+/// anything else waits for room (or for the queue to close at shutdown).
+fn queue_link_update(events: &async_channel::Sender<AppEvent>, update: LinkUpdate) {
+    let event = AppEvent::Link(update);
+    let _ = match event {
+        AppEvent::Link(LinkUpdate::Gaze(_)) => events.try_send(event).map_err(drop),
+        _ => events.send_blocking(event).map_err(drop),
+    };
+}
+
 /// Publishes the tray; its actions reach the GTK thread through `events`. Without a session
 /// bus the app runs without a tray. The tray waits for a StatusNotifierWatcher that appears
 /// later (a bar started after the app).
@@ -460,5 +502,53 @@ fn spawn_tray(events: async_channel::Sender<AppEvent>) -> Option<Handle<Tray>> {
             log::warn!("no tray: {error}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tobii_control::GazeSample;
+
+    use super::*;
+
+    fn gaze() -> LinkUpdate {
+        LinkUpdate::Gaze(GazeSample { timestamp_us: 1, x: 0.5, y: 0.5, valid: true })
+    }
+
+    fn received(events: &async_channel::Receiver<AppEvent>) -> Option<LinkUpdate> {
+        match events.try_recv().ok()? {
+            AppEvent::Link(update) => Some(update),
+            AppEvent::Tray(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_full_queue_drops_gaze_but_keeps_status() {
+        let (events, queue) = async_channel::bounded(1);
+        queue_link_update(&events, gaze());
+        queue_link_update(&events, gaze());
+        assert_eq!(queue.len(), 1, "the second sample is dropped, not queued or waited for");
+
+        let sender = events.clone();
+        let status = std::thread::spawn(move || queue_link_update(&sender, LinkUpdate::Status(None)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!status.is_finished(), "a status waits for room");
+        assert_eq!(received(&queue), Some(gaze()));
+        status.join().unwrap();
+        assert_eq!(received(&queue), Some(LinkUpdate::Status(None)));
+    }
+
+    #[test]
+    fn closing_the_queue_releases_a_waiting_status() {
+        let (events, queue) = async_channel::bounded(1);
+        queue_link_update(&events, LinkUpdate::Failed("full".into()));
+        let sender = events.clone();
+        let waiting = std::thread::spawn(move || queue_link_update(&sender, LinkUpdate::Status(None)));
+        std::thread::sleep(Duration::from_millis(100));
+        events.close();
+        waiting.join().unwrap();
+        drop(queue);
     }
 }

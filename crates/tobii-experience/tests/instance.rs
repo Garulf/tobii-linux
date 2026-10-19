@@ -44,16 +44,31 @@ fn tracking() -> Status {
 }
 
 /// A control service that greets every connection with a tracking status and answers every
-/// request with it.
-fn stub_service() -> SocketAddr {
+/// request with it, counting the connections it accepted and the ones still open.
+struct StubService {
+    addr: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    open: Arc<AtomicUsize>,
+}
+
+fn stub_service() -> StubService {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(AtomicUsize::new(0));
+    let (counted, still_open) = (accepted.clone(), open.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || serve(stream));
+            counted.fetch_add(1, Ordering::AcqRel);
+            still_open.fetch_add(1, Ordering::AcqRel);
+            let closed = still_open.clone();
+            std::thread::spawn(move || {
+                serve(stream);
+                closed.fetch_sub(1, Ordering::AcqRel);
+            });
         }
     });
-    addr
+    StubService { addr, accepted, open }
 }
 
 fn serve(mut stream: TcpStream) {
@@ -168,6 +183,7 @@ fn checkbox(window: &gtk::Window) -> Option<gtk::CheckButton> {
 struct Outcome {
     forwarding: Result<(), String>,
     quit: Result<(), String>,
+    shutdown: Result<(), String>,
 }
 
 fn run_primary() -> Outcome {
@@ -185,7 +201,9 @@ fn run_primary() -> Outcome {
     });
 
     let not_reached = || Err::<(), String>("not reached".into());
-    let outcome = Rc::new(RefCell::new(Outcome { forwarding: not_reached(), quit: not_reached() }));
+    let outcome =
+        Rc::new(RefCell::new(Outcome { forwarding: not_reached(), quit: not_reached(), shutdown: not_reached() }));
+    let service = stub_service();
     let step = RefCell::new(Step::WaitForTracking);
     let started = Instant::now();
     let shell_step = shell.clone();
@@ -297,7 +315,7 @@ fn run_primary() -> Outcome {
     let exit = shell.run([
         "tobii-linux-experience".to_string(),
         "--service".into(),
-        stub_service().to_string(),
+        service.addr.to_string(),
         "--service-unit".into(),
         UNIT.into(),
     ]);
@@ -314,7 +332,27 @@ fn run_primary() -> Outcome {
     if outcome.quit.is_ok() && exit != glib::ExitCode::SUCCESS {
         outcome.quit = Err(format!("the primary exited with {exit:?}"));
     }
+    outcome.shutdown = shutdown_released(&shell, &service);
     outcome
+}
+
+/// After the app ran, the shell no longer holds the controller and the link's connection to
+/// the service is closed, which only happens when the `Link` is dropped and its thread ends.
+fn shutdown_released(shell: &Shell, service: &StubService) -> Result<(), String> {
+    if shell.controller().is_some() {
+        return Err("the shell still holds the controller after shutdown".into());
+    }
+    if service.accepted.load(Ordering::Acquire) == 0 {
+        return Err("the link never connected".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while service.open.load(Ordering::Acquire) != 0 {
+        if Instant::now() > deadline {
+            return Err("the link's connection stayed open after shutdown".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn report(name: &str, result: &Result<(), String>) -> bool {
@@ -325,20 +363,32 @@ fn report(name: &str, result: &Result<(), String>) -> bool {
     result.is_ok()
 }
 
+/// Set by `make experience-test`: a missing display or session bus fails instead of skipping.
+const REQUIRE_DISPLAY: &str = "TOBII_EXPERIENCE_REQUIRE_DISPLAY";
+
 fn main() {
-    const TESTS: &str = "second_instance_forwards_guest, quit_confirms_persists_and_retries";
-    if std::env::var_os("GDK_BACKEND").is_none() || gtk::init().is_err() {
-        println!("test {TESTS} ... skipped (no display; run make experience-test)");
-        return;
-    }
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        println!("test {TESTS} ... skipped (no session bus; run make experience-test)");
+    const TESTS: &str =
+        "second_instance_forwards_guest, quit_confirms_persists_and_retries, shutdown_releases_the_link";
+    let missing = if std::env::var_os("GDK_BACKEND").is_none() || gtk::init().is_err() {
+        Some("no display")
+    } else if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        Some("no session bus")
+    } else {
+        None
+    };
+    if let Some(missing) = missing {
+        if std::env::var_os(REQUIRE_DISPLAY).is_some() {
+            println!("test {TESTS} ... FAILED: {missing}, and {REQUIRE_DISPLAY} is set");
+            std::process::exit(1);
+        }
+        println!("test {TESTS} ... skipped ({missing}; run make experience-test)");
         return;
     }
     let outcome = run_primary();
     let forwarding = report("second_instance_forwards_guest", &outcome.forwarding);
     let quit = report("quit_confirms_persists_and_retries", &outcome.quit);
-    if !(forwarding && quit) {
+    let shutdown = report("shutdown_releases_the_link", &outcome.shutdown);
+    if !(forwarding && quit && shutdown) {
         std::process::exit(1);
     }
 }
