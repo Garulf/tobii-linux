@@ -420,7 +420,7 @@ fn attach_applies_current_profile() {
         let matching = FakeTracker::streaming().calibrated(0x22);
         plug(&slot, Some(matching.clone()));
         client.status("attached again", |status| status.attached && status.calibration_matches_profile).await;
-        assert_eq!(profile_writes(&matching), []);
+        assert_eq!(profile_writes(&matching), [(EYE, LEFT)], "matching ids: the eye but no 1110");
         assert_eq!(store.current().unwrap().as_deref(), Some("Garulf"));
         assert!(link.stop().await);
         service.close();
@@ -444,11 +444,11 @@ fn switch_profile_over_control() {
         let slot = Plugged::new(Mutex::new(Some(device.clone())));
         let mut link = Link::start(&service, false, &slot);
         client.status("attached", |status| status.attached && status.calibration_matches_profile).await;
-        assert_eq!(profile_writes(&device), []);
+        assert_eq!(profile_writes(&device), [(EYE, BOTH)]);
 
         let switched = client.request(Request::SwitchProfile { name: "Other".into() }).await.unwrap();
         assert_eq!((switched.profile.as_deref(), switched.calibration_matches_profile), (Some("Other"), true));
-        assert_eq!(profile_writes(&device), [(EYE, BOTH), (APPLY, 0x22)]);
+        assert_eq!(profile_writes(&device)[1..], [(EYE, BOTH), (APPLY, 0x22)]);
         assert_eq!(store.current().unwrap().as_deref(), Some("Other"));
         client.status("switched", |status| status.profile.as_deref() == Some("Other")).await;
 
@@ -457,7 +457,7 @@ fn switch_profile_over_control() {
             assert!(matches!(refusal, Err(ControlError::Refused(_))), "{name}: {refusal:?}");
         }
         assert_eq!(store.current().unwrap().as_deref(), Some("Other"));
-        assert_eq!(profile_writes(&device).len(), 2);
+        assert_eq!(profile_writes(&device).len(), 3);
 
         let mut setup = Client::connect(port, "setup").await;
         setup.request(Request::Release).await.unwrap();
@@ -481,20 +481,97 @@ fn set_tracked_eyes_over_control() {
         let slot = Plugged::new(Mutex::new(Some(device.clone())));
         let mut link = Link::start(&service, false, &slot);
         client.status("attached", |status| status.attached && status.calibration_matches_profile).await;
-        assert_eq!(profile_writes(&device), []);
+        assert_eq!(profile_writes(&device), [(EYE, BOTH)]);
 
         let right = client.request(Request::SetTrackedEyes(TrackedEyes::Right)).await.unwrap();
         assert!(right.calibration_matches_profile);
-        assert_eq!(profile_writes(&device), [(EYE, RIGHT), (APPLY, 0x11)]);
+        assert_eq!(profile_writes(&device)[1..], [(EYE, RIGHT), (APPLY, 0x11)]);
         assert_eq!(store.tracked_eyes("Garulf").unwrap(), 2);
         client.request(Request::SetTrackedEyes(TrackedEyes::Right)).await.unwrap();
-        assert_eq!(profile_writes(&device).len(), 2, "an unchanged eye is not sent again");
+        assert_eq!(profile_writes(&device)[3..], [(EYE, RIGHT), (APPLY, 0x11)], "an unchanged eye is applied again");
         client.request(Request::SetTrackedEyes(TrackedEyes::Both)).await.unwrap();
-        assert_eq!(profile_writes(&device)[2..], [(EYE, BOTH), (APPLY, 0x11)]);
+        assert_eq!(profile_writes(&device)[5..], [(EYE, BOTH), (APPLY, 0x11)]);
         assert_eq!(store.tracked_eyes("Garulf").unwrap(), 0);
         assert!(link.stop().await);
         service.close();
         accept.abort();
         let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn reacquire_puts_the_new_profiles_eye_on_the_device() {
+    run(async {
+        let (options, store, directory) = profile_options("reconcile", &[("Garulf", 0x11)], "Garulf");
+        store.set_tracked_eyes("Garulf", 1).unwrap();
+        let (service, port, accept) = service(options).await;
+        let device = FakeTracker::streaming().calibrated(0x11);
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        let mut app = Client::connect(port, "experience").await;
+        app.status("attached", |status| status.attached && status.calibration_matches_profile).await;
+        assert_eq!(profile_writes(&device), [(EYE, LEFT)]);
+
+        let mut setup = Client::connect(port, "setup").await;
+        setup.request(Request::Release).await.unwrap();
+        app.status("released", |status| status.released).await;
+        store.save(GUEST, &calibration(0x11), false).unwrap();
+        store.set_current(GUEST).unwrap();
+        setup.request(Request::Reacquire).await.unwrap();
+        app.status("attached as guest", |status| {
+            status.attached && status.calibration_matches_profile && status.profile.as_deref() == Some(GUEST)
+        })
+        .await;
+        assert_eq!(profile_writes(&device)[1..], [(EYE, BOTH)], "same id: the guest's eyes, no 1110");
+
+        app.request(Request::SetTrackedEyes(TrackedEyes::Both)).await.unwrap();
+        assert_eq!(profile_writes(&device)[2..], [(EYE, BOTH), (APPLY, 0x11)], "the stored value is applied");
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+/// This host's address on its default route, when it has one besides loopback.
+fn non_loopback_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+#[test]
+fn control_refuses_non_loopback_peers() {
+    use tobii_service::prp_service::{FRAME_BRIDGE_HELLO, FRAME_CONTROL_HELLO, FRAME_PIPES, encode_frame};
+    use tokio::io::AsyncWriteExt;
+
+    let Some(address) = non_loopback_address() else {
+        eprintln!("skipped: no non-loopback address to connect from");
+        return;
+    };
+    run(async {
+        let service = PrpService::new(options("ET5-TEST"), wine_clock("auto", Clocks::Host).unwrap());
+        let listener = tobii_linux::service::listen("0.0.0.0", 0).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = service.serve(listener);
+        let hello = br#"{"version":1,"client":"experience"}"#;
+
+        let mut remote = tokio::net::TcpStream::connect((address, port)).await.unwrap();
+        remote.write_all(&encode_frame(FRAME_CONTROL_HELLO, hello).unwrap()).await.unwrap();
+        let answer = tokio::time::timeout(WAIT, read_frame(&mut remote)).await.unwrap();
+        assert_eq!(answer, None, "a remote control HELLO is closed without a status");
+        assert_eq!(service.control_connections(), 0);
+
+        let mut bridge = tokio::net::TcpStream::connect((address, port)).await.unwrap();
+        bridge.write_all(&encode_frame(FRAME_BRIDGE_HELLO, &1u32.to_le_bytes()).unwrap()).await.unwrap();
+        let pipes = tokio::time::timeout(WAIT, read_frame(&mut bridge)).await.unwrap();
+        assert_eq!(pipes.map(|(kind, _)| kind), Some(FRAME_PIPES), "the game relay still serves remote peers");
+
+        let mut local = Client::connect(port, "experience").await;
+        local.status("loopback is served", |_| true).await;
+        assert_eq!(service.control_connections(), 1);
+        service.close();
+        accept.abort();
     });
 }

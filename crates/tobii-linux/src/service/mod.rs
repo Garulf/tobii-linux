@@ -1019,7 +1019,8 @@ impl PrpService {
 
     /// One relay connection from the bridge: its control connection or one relayed pipe.
     pub async fn handle(&self, stream: TcpStream) {
-        let peer = peer_repr(stream.peer_addr().ok());
+        let address = stream.peer_addr().ok();
+        let peer = peer_repr(address);
         let (reader, writer) = stream.into_split();
         let link = Link::spawn(writer);
         let mut frames = Frames::new(reader, link.clone());
@@ -1030,7 +1031,7 @@ impl PrpService {
                     link.frame(FRAME_PIPES, &encode_names(&self.pipe_names())?);
                     self.serve_bridge(&peer, &link, &mut frames).await
                 }
-                FRAME_CONTROL_HELLO => control::serve(self, link.clone(), &mut frames, &payload).await,
+                FRAME_CONTROL_HELLO => control::serve(self, link.clone(), &mut frames, &payload, address).await,
                 FRAME_PIPE_OPEN => {
                     let (client_pid, pipe) = decisions::decode_pipe_open(&payload)?;
                     if !self.0.tracker_attached.get() {

@@ -3,6 +3,7 @@
 //! tracker. It is tobii-linux's own protocol, not Tobii's; the messages are tobii_control's.
 
 use std::cell::{Cell, RefCell};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -45,8 +46,23 @@ impl ControlConnection {
     }
 }
 
+/// Whether a control connection from `peer` is served: only loopback peers may control the
+/// tracker, so `serve --host 0.0.0.0` exposes the game relay without it.
+pub fn control_peer_allowed(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|peer| peer.ip().to_canonical().is_loopback())
+}
+
 /// Serves one control connection from its HELLO until it closes.
-pub async fn serve(service: &PrpService, link: Link, frames: &mut Frames, hello: &[u8]) -> Outcome {
+pub async fn serve(
+    service: &PrpService,
+    link: Link,
+    frames: &mut Frames,
+    hello: &[u8],
+    peer: Option<SocketAddr>,
+) -> Outcome {
+    if !control_peer_allowed(peer) {
+        return refused("control connections are only accepted from loopback");
+    }
     let hello = decode_hello(hello).map_err(|error| Ended::Refused(error.to_string()))?;
     if hello.version != PROTOCOL_VERSION {
         return refused(format!("control protocol version {}; this service speaks {PROTOCOL_VERSION}", hello.version));
@@ -162,8 +178,9 @@ impl PrpService {
     }
 
     /// Sends 3160 with the profile's tracked eyes and 1110 with its calibration for the
-    /// recorded monitor, then makes it current; `force` sends both even when the device
-    /// already reports the calibration's id.
+    /// recorded monitor, then makes it current. 1110 is skipped when the device already
+    /// reports the calibration's id, unless `force`; 3160 is always sent, so the device
+    /// follows a profile that setup or the Python CLI made current with other eyes.
     async fn apply_profile(&self, name: String, force: bool) -> Result<(), String> {
         let _applying = self.0.profile_lock.lock().await;
         self.profile_target()?;
@@ -171,7 +188,7 @@ impl PrpService {
         let store = self.0.profiles.clone();
         let eye = tracked_eye(store.tracked_eyes(&name).map_err(|error| error.to_string())?);
         let monitor_key = recorded_monitor_key(&self.0.display_record);
-        let options = SwitchOptions { eye, monitor_key, force, dry_run: false };
+        let options = SwitchOptions { eye, monitor_key, force, always_set_eye: true, dry_run: false };
         let switching = Operation::new(move |io| profiles::switch_with(io, store, name, options));
         let outcome = self.run_operation(switching).await;
         if let Ok(result) = &outcome {
@@ -200,17 +217,17 @@ impl PrpService {
         self.apply_profile(name, false).await
     }
 
-    /// Stores the current profile's tracked eyes and applies the profile again when they
-    /// changed, as Tobii's tracked-eyes radios do.
+    /// Stores the current profile's tracked eyes and applies the profile again, as Tobii's
+    /// tracked-eyes radios do; an unchanged value is applied too, since the device may not
+    /// hold it.
     async fn set_tracked_eyes(&self, eyes: TrackedEyes) -> Result<(), String> {
         self.profile_target()?;
         let store = &self.0.profiles;
         let name = store.current().map_err(|error| error.to_string())?.ok_or("No profile is current")?;
         let value = eyes.registry_value();
-        if store.tracked_eyes(&name).map_err(|error| error.to_string())? == value {
-            return Ok(());
+        if store.tracked_eyes(&name).map_err(|error| error.to_string())? != value {
+            store.set_tracked_eyes(&name, value).map_err(|error| error.to_string())?;
         }
-        store.set_tracked_eyes(&name, value).map_err(|error| error.to_string())?;
         self.apply_profile(name, true).await
     }
 
@@ -279,5 +296,22 @@ impl PrpService {
         self.0.release_gate.open();
         log::info!("reacquiring the tracker");
         self.broadcast_status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_loopback_peers_control() {
+        let allowed = |peer: &str| control_peer_allowed(Some(peer.parse().unwrap()));
+        for peer in ["127.0.0.1:5000", "127.1.2.3:5000", "[::1]:5000", "[::ffff:127.0.0.1]:5000"] {
+            assert!(allowed(peer), "{peer}");
+        }
+        for peer in ["192.168.1.20:5000", "0.0.0.0:5000", "[fe80::1]:5000", "[::ffff:10.0.0.2]:5000"] {
+            assert!(!allowed(peer), "{peer}");
+        }
+        assert!(!control_peer_allowed(None));
     }
 }

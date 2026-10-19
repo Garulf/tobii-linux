@@ -407,6 +407,9 @@ pub struct SwitchOptions {
     pub monitor_key: Option<String>,
     /// Sends 3160 and 1110 even when the device already reports the profile's id.
     pub force: bool,
+    /// Sends 3160 even when the device already reports the profile's id, so the tracked
+    /// eyes follow the profile after another program changed the device or the file.
+    pub always_set_eye: bool,
     pub dry_run: bool,
 }
 
@@ -423,7 +426,8 @@ pub async fn switch<E: External>(
     eye: Eye,
     dry_run: bool,
 ) -> OperationResult<SwitchResult, E> {
-    switch_with(io, store, name, SwitchOptions { eye, monitor_key: None, force: false, dry_run }).await
+    let options = SwitchOptions { eye, monitor_key: None, force: false, always_set_eye: false, dry_run };
+    switch_with(io, store, name, options).await
 }
 
 /// [`switch`] with the calibration of a monitor, optionally forcing the apply.
@@ -437,8 +441,10 @@ pub async fn switch_with<E: External>(
     let wanted = calibration.calibration_id;
     let before = calibration::read_device_calibration_id(&io).await?;
     let applied = options.force || before != wanted;
-    if applied {
+    if applied || options.always_set_eye {
         io.call(device::set_enabled_eye(0, options.eye), None).await.map_err(OperationError::External)?;
+    }
+    if applied {
         let apply = device::calibration_apply(0, &calibration.blob)?;
         io.call(apply, Some(TRANSFER_TIMEOUT_S)).await.map_err(OperationError::External)?;
     }
