@@ -27,14 +27,37 @@ fn status() -> Status {
 }
 
 /// A control service that greets every connection with a status event and answers each
-/// request with the same status. Dropping it closes the listener and the connection.
+/// request with the same status, unless it is silent. It records the requests it receives.
+/// Dropping it closes the listener and the connection.
 struct Stub {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl Stub {
     fn bind(addr: SocketAddr) -> Stub {
+        Stub::start(addr, true)
+    }
+
+    /// Accepts the hello and the requests but never replies to them.
+    fn bind_silent(addr: SocketAddr) -> Stub {
+        Stub::start(addr, false)
+    }
+
+    fn received(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn wait_for_request(&self, wanted: &Request) {
+        let deadline = Instant::now() + WAIT;
+        while !self.received().contains(wanted) {
+            assert!(Instant::now() < deadline, "the stub never received {wanted:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn start(addr: SocketAddr, answer: bool) -> Stub {
         let deadline = Instant::now() + WAIT;
         let listener = loop {
             match TcpListener::bind(addr) {
@@ -48,15 +71,17 @@ impl Stub {
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => return serve(stream, &flag),
+                    Ok((stream, _)) => return serve(stream, &flag, &log, answer),
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
         });
-        Stub { stop, thread: Some(thread) }
+        Stub { stop, thread: Some(thread), requests }
     }
 }
 
@@ -69,7 +94,7 @@ impl Drop for Stub {
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool) {
+fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool, log: &Mutex<Vec<Request>>, answer: bool) {
     stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
     let mut received = Vec::new();
@@ -86,9 +111,12 @@ fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool) {
             if kind == FRAME_CONTROL_HELLO {
                 stream.write_all(&encode(FRAME_CONTROL_EVENT, &Event::Status(status())).unwrap()).unwrap();
             } else if kind == FRAME_CONTROL_REQUEST {
-                let (id, _) = decode_request(&payload).unwrap();
-                let reply = Reply { id, result: Ok(status()) };
-                stream.write_all(&encode(FRAME_CONTROL_REPLY, &reply).unwrap()).unwrap();
+                let (id, request) = decode_request(&payload).unwrap();
+                log.lock().unwrap().push(request);
+                if answer {
+                    let reply = Reply { id, result: Ok(status()) };
+                    stream.write_all(&encode(FRAME_CONTROL_REPLY, &reply).unwrap()).unwrap();
+                }
             }
         }
     }
@@ -166,4 +194,65 @@ fn dropping_the_link_stops_its_thread() {
     let started = Instant::now();
     drop(link);
     assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn dropping_the_link_does_not_wait_for_every_queued_request() {
+    let addr = free_port_addr();
+    let stub = Stub::bind_silent(addr);
+    let (on_incoming, updates) = collect();
+    let link = Link::start(addr, on_incoming);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
+    for _ in 0..5 {
+        link.send(Request::SetEnabled(false));
+    }
+    stub.wait_for_request(&Request::SetEnabled(false));
+    let started = Instant::now();
+    drop(link);
+    assert!(started.elapsed() < Duration::from_millis(3500), "drop took {:?}", started.elapsed());
+}
+
+#[test]
+fn gaze_subscription_requested_while_the_service_is_down_is_sent_on_connect() {
+    let addr = free_port_addr();
+    let (on_incoming, updates) = collect();
+    let link = Link::start(addr, on_incoming);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(None)));
+    link.send(Request::SubscribeGaze(true));
+
+    let stub = Stub::bind(addr);
+    stub.wait_for_request(&Request::SubscribeGaze(true));
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
+    assert!(updates.try_iter().all(|update| !matches!(update, LinkUpdate::Failed(_))));
+}
+
+#[test]
+fn gaze_subscription_survives_a_service_restart() {
+    let addr = free_port_addr();
+    let stub = Stub::bind(addr);
+    let (on_incoming, updates) = collect();
+    let link = Link::start(addr, on_incoming);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
+    link.send(Request::SubscribeGaze(true));
+    stub.wait_for_request(&Request::SubscribeGaze(true));
+    drop(stub);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(None)));
+
+    let restarted = Stub::bind(addr);
+    restarted.wait_for_request(&Request::SubscribeGaze(true));
+}
+
+#[test]
+fn gaze_subscription_switched_off_is_not_replayed() {
+    let addr = free_port_addr();
+    let (on_incoming, updates) = collect();
+    let link = Link::start(addr, on_incoming);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(None)));
+    link.send(Request::SubscribeGaze(true));
+    link.send(Request::SubscribeGaze(false));
+
+    let stub = Stub::bind(addr);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!stub.received().contains(&Request::SubscribeGaze(true)));
 }

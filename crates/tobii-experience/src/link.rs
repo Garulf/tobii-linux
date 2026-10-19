@@ -27,9 +27,14 @@ pub enum LinkUpdate {
 }
 
 /// A thread that keeps a control connection open; dropping it stops the thread.
+///
+/// The service ends a gaze subscription with its connection, so the link remembers the last
+/// `SubscribeGaze` value it was given and sends `SubscribeGaze(true)` again right after every
+/// reconnect when that value is true.
 #[derive(Debug)]
 pub struct Link {
     requests: Sender<Request>,
+    gaze: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -41,18 +46,23 @@ impl Link {
     pub fn start(addr: SocketAddr, on_incoming: impl Fn(LinkUpdate) + Send + 'static) -> Link {
         let (requests, queue) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = Worker { addr, on_incoming: Box::new(on_incoming), queue, stop: stop.clone() };
+        let gaze = Arc::new(AtomicBool::new(false));
+        let worker = Worker { addr, on_incoming: Box::new(on_incoming), queue, stop: stop.clone(), gaze: gaze.clone() };
         let thread = std::thread::Builder::new()
             .name("tobii-experience-link".into())
             .spawn(move || worker.run())
             .expect("the OS refused to start the link thread");
-        Link { requests, stop, thread: Some(thread) }
+        Link { requests, gaze, stop, thread: Some(thread) }
     }
 
     /// Queues `request` for the link thread. Requests that are queued while the link is not
-    /// connected are dropped and reported as [`LinkUpdate::Failed`]. The reply status
-    /// arrives as [`LinkUpdate::Status`].
+    /// connected are dropped and reported as [`LinkUpdate::Failed`], except `SubscribeGaze`:
+    /// its value is remembered and replayed after the next connect when it is true. The
+    /// reply status arrives as [`LinkUpdate::Status`].
     pub fn send(&self, request: Request) {
+        if let Request::SubscribeGaze(on) = request {
+            self.gaze.store(on, Ordering::Relaxed);
+        }
         let _ = self.requests.send(request);
     }
 }
@@ -71,6 +81,7 @@ struct Worker {
     on_incoming: Box<dyn Fn(LinkUpdate) + Send>,
     queue: Receiver<Request>,
     stop: Arc<AtomicBool>,
+    gaze: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -94,15 +105,13 @@ impl Worker {
     }
 
     fn serve(&self, mut client: ControlClient) {
+        if self.gaze.load(Ordering::Relaxed) && !self.dispatch(&mut client, Request::SubscribeGaze(true)) {
+            return;
+        }
         while !self.stopped() {
             while let Ok(request) = self.queue.try_recv() {
-                match client.request(request, REQUEST_TIMEOUT) {
-                    Ok(status) => (self.on_incoming)(LinkUpdate::Status(Some(status))),
-                    Err(ControlError::Refused(reason)) => (self.on_incoming)(LinkUpdate::Failed(reason)),
-                    Err(error) => {
-                        (self.on_incoming)(LinkUpdate::Failed(error.to_string()));
-                        return;
-                    }
+                if self.stopped() || !self.dispatch(&mut client, request) {
+                    return;
                 }
             }
             match client.next(POLL_INTERVAL) {
@@ -114,6 +123,19 @@ impl Worker {
                 Err(_) => return,
             }
         }
+    }
+
+    /// Sends one request; false when the connection is no longer usable.
+    fn dispatch(&self, client: &mut ControlClient, request: Request) -> bool {
+        match client.request(request, REQUEST_TIMEOUT) {
+            Ok(status) => (self.on_incoming)(LinkUpdate::Status(Some(status))),
+            Err(ControlError::Refused(reason)) => (self.on_incoming)(LinkUpdate::Failed(reason)),
+            Err(error) => {
+                (self.on_incoming)(LinkUpdate::Failed(error.to_string()));
+                return false;
+            }
+        }
+        true
     }
 
     fn wait_to_reconnect(&self) {
@@ -130,6 +152,9 @@ impl Worker {
 
     fn fail_queued_requests(&self) {
         while let Ok(request) = self.queue.try_recv() {
+            if matches!(request, Request::SubscribeGaze(_)) {
+                continue;
+            }
             (self.on_incoming)(LinkUpdate::Failed(format!("The service is not connected: {request:?} was dropped")));
         }
     }
