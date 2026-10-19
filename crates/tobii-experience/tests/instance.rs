@@ -27,6 +27,7 @@ use tobii_experience::app::{Deps, PAGE_TITLE, PAGE_WIDTH, Shell};
 use tobii_experience::guest::{LaunchError, OnExit, SetupLauncher};
 use tobii_experience::quit::{CANCEL_TEXT, CHECKBOX_TEXT, CONFIRM_TEXT, FAILURE_CAPTION, ServiceUnit};
 use tobii_experience::status::DeviceStatus;
+use tobii_gaze::profiles::ProfileStore;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tobii-linux-experience");
 const UNIT: &str = "tobii-instance-test.service";
@@ -198,6 +199,7 @@ fn run_primary() -> Outcome {
         setup: setup.clone(),
         settings_path: Some(settings_path.clone()),
         tray: true,
+        profiles: ProfileStore::new(directory.join("profiles")),
     });
 
     let not_reached = || Err::<(), String>("not reached".into());
@@ -282,7 +284,7 @@ fn run_primary() -> Outcome {
                 if !controller.quitting() {
                     return fail("the failure box is up but the app is not quitting".into());
                 }
-                if Settings::load(&settings_path).ok() != Some(Settings { skip_quit_confirmation: true }) {
+                if !Settings::load(&settings_path).is_ok_and(|settings| settings.skip_quit_confirmation) {
                     return fail("the checkbox was not persisted before the stop".into());
                 }
                 let Some(no) = button(&failure, "_No") else { return fail("the failure box has no No".into()) };

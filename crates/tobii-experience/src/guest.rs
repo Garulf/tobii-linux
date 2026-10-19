@@ -18,6 +18,27 @@ pub fn guest_allowed(status: DeviceStatus) -> bool {
     matches!(status, DeviceStatus::Tracking | DeviceStatus::InvalidConfiguration)
 }
 
+/// Tobii's `ConfigurationAppLauncher` result of a configuration run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupResult {
+    Success,
+    ArgumentError,
+    Aborted,
+    ConfigurationError,
+}
+
+/// Exit code 0 is a success, 1 an argument error, 2 aborted, any other a configuration
+/// error; an exit without a readable code (a signal, a failed wait) counts as a success, as
+/// in Tobii's launcher.
+pub fn setup_result(exit: &io::Result<ExitStatus>) -> SetupResult {
+    match exit.as_ref().ok().and_then(ExitStatus::code) {
+        None | Some(0) => SetupResult::Success,
+        Some(1) => SetupResult::ArgumentError,
+        Some(2) => SetupResult::Aborted,
+        Some(_) => SetupResult::ConfigurationError,
+    }
+}
+
 /// Called with the setup run's exit once it ends.
 pub type OnExit = Box<dyn FnOnce(io::Result<ExitStatus>) + Send>;
 
@@ -123,6 +144,19 @@ mod tests {
         ] {
             assert_eq!(guest_allowed(status), allowed.contains(&status), "{status:?}");
         }
+    }
+
+    #[test]
+    fn exit_codes_map_like_tobiis_launcher() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32| Ok(ExitStatus::from_raw(code << 8));
+        assert_eq!(setup_result(&exited(0)), SetupResult::Success);
+        assert_eq!(setup_result(&exited(1)), SetupResult::ArgumentError);
+        assert_eq!(setup_result(&exited(2)), SetupResult::Aborted);
+        assert_eq!(setup_result(&exited(3)), SetupResult::ConfigurationError);
+        assert_eq!(setup_result(&exited(101)), SetupResult::ConfigurationError);
+        assert_eq!(setup_result(&Ok(ExitStatus::from_raw(9))), SetupResult::Success, "killed: no code");
+        assert_eq!(setup_result(&Err(io::Error::other("wait failed"))), SetupResult::Success);
     }
 
     #[test]

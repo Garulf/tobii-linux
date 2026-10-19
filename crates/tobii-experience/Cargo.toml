@@ -18,6 +18,7 @@ png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tobii-control.workspace = true
+tobii-gaze.workspace = true
 
 [[bin]]
 name = "tobii-linux-experience"
@@ -26,6 +27,11 @@ required-features = ["gtk"]
 
 [[test]]
 name = "instance"
+harness = false
+required-features = ["gtk"]
+
+[[test]]
+name = "page"
 harness = false
 required-features = ["gtk"]
 

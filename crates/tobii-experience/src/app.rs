@@ -17,10 +17,12 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 use ksni::blocking::{Handle, TrayMethods};
 use tobii_control::{Request, Status};
+use tobii_gaze::profiles::ProfileStore;
 
 use crate::cli::{self, APP_ID, Command, Options};
-use crate::guest::{GUEST_ARGUMENTS, SetupLauncher, SetupProcess, guest_allowed, setup_binary};
+use crate::guest::{GUEST_ARGUMENTS, SetupLauncher, SetupProcess, guest_allowed, setup_binary, setup_result};
 use crate::link::{Link, LinkUpdate};
+use crate::page::{self, PageEvent, PageModel};
 use crate::quit::{self, QuitStep, ServiceUnit, Systemctl, quit_step};
 use crate::settings::Settings;
 use crate::status::{DeviceStatus, IconState, device_status, icon_state};
@@ -43,6 +45,8 @@ pub struct Deps {
     pub settings_path: Option<PathBuf>,
     /// Whether to publish the tray icon on the session bus.
     pub tray: bool,
+    /// The calibration profiles the page lists, switches and deletes.
+    pub profiles: ProfileStore,
 }
 
 impl Deps {
@@ -54,6 +58,7 @@ impl Deps {
             setup: Rc::new(SetupProcess::new(setup_binary(exe.as_deref()))),
             settings_path: Settings::default_path(),
             tray: true,
+            profiles: ProfileStore::default_location(),
         }
     }
 }
@@ -129,9 +134,10 @@ impl Shell {
     }
 }
 
-enum AppEvent {
+pub(crate) enum AppEvent {
     Link(LinkUpdate),
     Tray(TrayAction),
+    Page(PageEvent),
 }
 
 /// What the app knows of the service.
@@ -148,6 +154,16 @@ type UpdateHook = Rc<dyn Fn(&Controller, &LinkUpdate)>;
 /// The primary instance's state, owned by the GTK thread; cheap to clone.
 #[derive(Clone)]
 pub struct Controller(Rc<Inner>);
+
+/// A [`Controller`] that does not keep the app alive, for callbacks that outlive a call.
+#[derive(Debug, Clone)]
+pub(crate) struct WeakController(Weak<Inner>);
+
+impl WeakController {
+    pub(crate) fn upgrade(&self) -> Option<Controller> {
+        self.0.upgrade().map(Controller)
+    }
+}
 
 struct Inner {
     app: gtk::Application,
@@ -166,6 +182,8 @@ struct Inner {
     quit_busy: Cell<bool>,
     page: RefCell<Option<gtk::Window>>,
     update_hooks: RefCell<Vec<UpdateHook>>,
+    profiles: ProfileStore,
+    page_model: PageModel,
 }
 
 impl fmt::Debug for Controller {
@@ -224,6 +242,8 @@ impl Controller {
             quit_busy: Cell::new(false),
             page: RefCell::new(None),
             update_hooks: RefCell::new(Vec::new()),
+            profiles: deps.profiles,
+            page_model: PageModel::default(),
         }));
         controller.start_service();
         let weak = Rc::downgrade(&controller.0);
@@ -238,6 +258,32 @@ impl Controller {
 
     fn weak(&self) -> Weak<Inner> {
         Rc::downgrade(&self.0)
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakController {
+        WeakController(self.weak())
+    }
+
+    /// The queue to the GTK thread, for work that ends on another thread.
+    pub(crate) fn events(&self) -> async_channel::Sender<AppEvent> {
+        self.0.events.clone()
+    }
+
+    pub(crate) fn page_model(&self) -> &PageModel {
+        &self.0.page_model
+    }
+
+    pub(crate) fn setup(&self) -> &dyn SetupLauncher {
+        &*self.0.setup
+    }
+
+    pub(crate) fn set_page_window(&self, window: Option<gtk::Window>) {
+        self.0.page.replace(window);
+    }
+
+    /// The calibration profiles the page works on.
+    pub fn profiles(&self) -> &ProfileStore {
+        &self.0.profiles
     }
 
     pub fn application(&self) -> &gtk::Application {
@@ -288,6 +334,11 @@ impl Controller {
         self.0.link.send(request);
     }
 
+    /// [`Controller::send`], then `done` on the link thread once the reply was reported.
+    pub(crate) fn send_then(&self, request: Request, done: impl FnOnce() + Send + 'static) {
+        self.0.link.send_then(request, done);
+    }
+
     /// Calls `hook` on the GTK thread for every link update, after the controller took it in.
     /// The hook gets the controller as an argument; capturing a clone of it would keep the
     /// controller, its link and its tray alive after shutdown.
@@ -305,27 +356,13 @@ impl Controller {
         self.0.page.borrow().clone()
     }
 
-    /// Opens the page window, or raises it when it is open.
+    /// Opens the Eye tracking page window, or raises it when it is open.
     pub fn open_page(&self) -> gtk::Window {
         if let Some(window) = self.page_window() {
             window.present();
             return window;
         }
-        let window: gtk::Window = gtk::ApplicationWindow::builder()
-            .application(&self.0.app)
-            .title(PAGE_TITLE)
-            .default_width(PAGE_WIDTH)
-            .default_height(PAGE_HEIGHT)
-            .build()
-            .upcast();
-        let weak = self.weak();
-        window.connect_close_request(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                inner.page.replace(None);
-            }
-            glib::Propagation::Proceed
-        });
-        self.0.page.replace(Some(window.clone()));
+        let window = page::open_window(self);
         window.present();
         window
     }
@@ -338,7 +375,7 @@ impl Controller {
             log::info!("--guest ignored: the device status is {status:?}");
             return false;
         }
-        let on_exit = Box::new(|exit| log::info!("the guest calibration ended: {exit:?}"));
+        let on_exit = Box::new(|exit| log::info!("the guest calibration ended: {:?} ({exit:?})", setup_result(&exit)));
         match self.0.setup.launch(&GUEST_ARGUMENTS, on_exit) {
             Ok(()) => true,
             Err(error) => {
@@ -449,7 +486,11 @@ impl Controller {
                 for hook in hooks {
                     hook(self, &update);
                 }
+                if let LinkUpdate::Status(_) = update {
+                    page::on_service_update(self);
+                }
             }
+            AppEvent::Page(event) => page::on_page_event(self, event),
             AppEvent::Tray(TrayAction::OpenPage) => {
                 self.open_page();
             }
@@ -520,7 +561,7 @@ mod tests {
     fn received(events: &async_channel::Receiver<AppEvent>) -> Option<LinkUpdate> {
         match events.try_recv().ok()? {
             AppEvent::Link(update) => Some(update),
-            AppEvent::Tray(_) => None,
+            AppEvent::Tray(_) | AppEvent::Page(_) => None,
         }
     }
 

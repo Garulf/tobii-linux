@@ -186,6 +186,30 @@ fn requests_reach_the_service_when_connected() {
     wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
 }
 
+/// `send_then` reports its request's update first, then calls `done`, connected or not.
+#[test]
+fn done_follows_the_requests_update() {
+    let addr = free_port_addr();
+    let (events, received) = mpsc::channel::<Option<LinkUpdate>>();
+    let updates = Mutex::new(events.clone());
+    let link = Link::start(addr, move |update| drop(updates.lock().unwrap().send(Some(update))));
+    let next = || received.recv_timeout(WAIT).expect("nothing arrived");
+
+    assert_eq!(next(), Some(LinkUpdate::Status(None)));
+    let done = events.clone();
+    link.send_then(Request::SetEnabled(false), move || drop(done.send(None)));
+    assert!(matches!(next(), Some(LinkUpdate::Failed(_))), "dropped while disconnected");
+    assert_eq!(next(), None);
+
+    let stub = Stub::bind(addr);
+    assert!(matches!(next(), Some(LinkUpdate::Status(Some(_)))), "the greeting");
+    let done = events.clone();
+    link.send_then(Request::SetEnabled(false), move || drop(done.send(None)));
+    assert_eq!(next(), Some(LinkUpdate::Status(Some(status()))), "the reply");
+    assert_eq!(next(), None);
+    assert_eq!(stub.received(), [Request::SetEnabled(false)]);
+}
+
 #[test]
 fn dropping_the_link_stops_its_thread() {
     let (on_incoming, updates) = collect();

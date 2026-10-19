@@ -26,6 +26,9 @@ pub enum LinkUpdate {
     Failed(String),
 }
 
+/// Called on the link thread once a request was answered, refused or dropped.
+pub type Done = Box<dyn FnOnce() + Send>;
+
 /// A thread that keeps a control connection open; dropping it stops the thread.
 ///
 /// The service ends a gaze subscription with its connection, so the link remembers the last
@@ -33,7 +36,7 @@ pub enum LinkUpdate {
 /// reconnect when that value is true.
 #[derive(Debug)]
 pub struct Link {
-    requests: Sender<Request>,
+    requests: Sender<(Request, Option<Done>)>,
     gaze: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -60,10 +63,20 @@ impl Link {
     /// its value is remembered and replayed after the next connect when it is true. The
     /// reply status arrives as [`LinkUpdate::Status`].
     pub fn send(&self, request: Request) {
+        self.queue(request, None);
+    }
+
+    /// [`Link::send`], then `done` once the request's [`LinkUpdate`] was reported (or the
+    /// request was dropped). A link that stops first never calls it.
+    pub fn send_then(&self, request: Request, done: impl FnOnce() + Send + 'static) {
+        self.queue(request, Some(Box::new(done)));
+    }
+
+    fn queue(&self, request: Request, done: Option<Done>) {
         if let Request::SubscribeGaze(on) = request {
             self.gaze.store(on, Ordering::Relaxed);
         }
-        let _ = self.requests.send(request);
+        let _ = self.requests.send((request, done));
     }
 }
 
@@ -79,7 +92,7 @@ impl Drop for Link {
 struct Worker {
     addr: SocketAddr,
     on_incoming: Box<dyn Fn(LinkUpdate) + Send>,
-    queue: Receiver<Request>,
+    queue: Receiver<(Request, Option<Done>)>,
     stop: Arc<AtomicBool>,
     gaze: Arc<AtomicBool>,
 }
@@ -109,8 +122,15 @@ impl Worker {
             return;
         }
         while !self.stopped() {
-            while let Ok(request) = self.queue.try_recv() {
-                if self.stopped() || !self.dispatch(&mut client, request) {
+            while let Ok((request, done)) = self.queue.try_recv() {
+                if self.stopped() {
+                    return;
+                }
+                let usable = self.dispatch(&mut client, request);
+                if let Some(done) = done {
+                    done();
+                }
+                if !usable {
                     return;
                 }
             }
@@ -151,11 +171,14 @@ impl Worker {
     }
 
     fn fail_queued_requests(&self) {
-        while let Ok(request) = self.queue.try_recv() {
-            if matches!(request, Request::SubscribeGaze(_)) {
-                continue;
+        while let Ok((request, done)) = self.queue.try_recv() {
+            if !matches!(request, Request::SubscribeGaze(_)) {
+                let reason = format!("The service is not connected: {request:?} was dropped");
+                (self.on_incoming)(LinkUpdate::Failed(reason));
             }
-            (self.on_incoming)(LinkUpdate::Failed(format!("The service is not connected: {request:?} was dropped")));
+            if let Some(done) = done {
+                done();
+            }
         }
     }
 }

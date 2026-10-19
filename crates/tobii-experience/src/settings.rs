@@ -13,6 +13,9 @@ const FILE_NAME: &str = "experience.json";
 pub struct Settings {
     /// Tobii's `SkipConfirmQuitDialog` (default false: Quit asks first).
     pub skip_quit_confirmation: bool,
+    /// Tobii's `GazeTrackerHasBeenConnected`: a tracker was attached once, so the page keeps
+    /// its gaze sections while it is unplugged or the service is down.
+    pub gaze_tracker_has_been_connected: bool,
 }
 
 impl Settings {
@@ -74,16 +77,18 @@ mod tests {
     #[test]
     fn settings_round_trip_and_defaults() {
         assert!(!Settings::default().skip_quit_confirmation, "Tobii shows the quit dialog by default");
+        assert!(!Settings::default().gaze_tracker_has_been_connected);
 
         let directory = scratch("settings");
         let path = directory.join("tobii-linux").join("experience.json");
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
 
-        let settings = Settings { skip_quit_confirmation: true };
+        let settings = Settings { skip_quit_confirmation: true, gaze_tracker_has_been_connected: true };
         settings.store(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), settings);
         let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(json, serde_json::json!({ "skip_quit_confirmation": true }));
+        let expected = serde_json::json!({ "skip_quit_confirmation": true, "gaze_tracker_has_been_connected": true });
+        assert_eq!(json, expected);
         let leftovers: Vec<_> =
             std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, ["experience.json"], "the partial file is renamed over the old one");

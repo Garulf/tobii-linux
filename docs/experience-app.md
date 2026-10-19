@@ -430,9 +430,9 @@ The Store app's `SettingsPage` (`VIEW:SettingsPage.xaml`) with
 | Container | not a window: the right-hand sidebar of the Home page. `SettingsSidebar` is a Grid of width and max width `SidebarWidth` = 550 (`TH:generic.xaml:14`), background `#151617` (`BR:colorsfonts.xaml:148`), right-aligned, full height of the content area (`VIEW:HomePage.xaml:533-554`) | differs (decision): one window, 550 px wide, titled "Tobii Experience", holding the sidebar content |
 | Dimmer | `SidebarBackground`: black, opacity 0.7, height 800, hit-testable; a mouse press on it closes the sidebar (`VIEW:HomePage.xaml:528`; `VIEW:HomePage.xaml.cs:93-100`) | omitted (why): no surrounding app |
 | Open and close | width 0 to 550 in 500 ms with `CubicEase` whose `EasingMode` value is 1 (EaseIn in WPF's numbering, EaseOut = 0; not checked against the framework assembly); close 550 to 0 in 250 ms, linear (`VIEW:HomePage.xaml.cs:63-91`) | omitted (proposal): no slide |
-| Opener | ribbon toggle "Settings" in the Home page: text is the current profile name (visible when the profiles section is visible, Body style, margin `0 0 10 0`) and a gear image 24 px high, button margin `40 0 0 0` (`VIEW:HomePage.xaml:115-153`; click toggles the sidebar, `VM:HomePageViewModel.cs:406-417`) | omitted (decision); see the open item "current profile name" in 8 |
+| Opener | ribbon toggle "Settings" in the Home page: text is the current profile name (visible when the profiles section is visible, Body style, margin `0 0 10 0`) and a gear image 24 px high, button margin `40 0 0 0` (`VIEW:HomePage.xaml:115-153`; click toggles the sidebar, `VM:HomePageViewModel.cs:406-417`) | differs (decision): a header row above the page content shows the current profile's name in Body style (margin `45 15 25 0`, so it lines up with the content), visible when the profiles section is; no gear, no toggling |
 | Host window | title `Tobii Experience`; no system chrome (`WindowStyle` None, `ResizeMode` CanMinimize, caption height 0), centred; fixed 1330 x 810, scaled down uniformly to fit the work area; title bar row 35 px with the Tobii logo 130 px wide, margin `5 0 0 0`; style `TobiiMainWindowStyle`: background `#000000`, border 0.7 px `#808080`, 1 px `#00ACE9` while active (`WIN:MainWindow.xaml:2-19`; `WIN:MainWindow.xaml.cs:33,35,178-198`; `BR:window.xaml:7-49`) | differs (decision): only the title and the 550 px width are kept |
-| Closing | closing the window hides it and shuts the app down (`WIN:MainWindow.xaml.cs:82-86`); the tray lives in another process | differs (decision): closing the page window leaves the tray running |
+| Closing | closing the window hides it and shuts the app down (`WIN:MainWindow.xaml.cs:82-86`); the tray lives in another process | differs (decision): closing the page window leaves the tray running; closing it or minimizing it (GTK's `suspended`) is the sidebar hiding (navigate-from, 4.6); restoring it rebuilds the list as a page show does |
 | "App active" | `StatusMonitor.IsActive` = window active and not minimized, feeds the gaze preview (`WIN:MainWindow.xaml.cs:95-98`) | same, with "window focused" |
 | Page insets | root Grid margin `40 0 0 15` (`VIEW:SettingsPage.xaml:3`), `ScrollViewer` (vertical scrollbar Auto, 5.7), inner Grid margin `5 0 0 0` (`:15`), content `StackPanel` margin `0 0 10 0` (`:16`): content is 550 - 40 - 5 - 10 = 495 px wide, 480 px when the scrollbar (own column, 15 px) is showing | same |
 
@@ -485,9 +485,14 @@ type changes (`VM:SettingsPageViewModel.cs:343-351,600-606`). The integration
 type defaults to `Internal_base` until the engine reports one
 (`DEV:TrackingDeviceInfoProvider.cs:128,157-168`).
 
-Linux: same (proposal). The service needs a persisted "a gaze tracker has been
-connected" flag so the sections stay visible while the tracker is unplugged or
-off; the `IsProfilesSectionVisible` alternative is omitted (not an ET5 case).
+Linux: same. The persisted "a gaze tracker has been connected" flag is the app
+setting `gaze_tracker_has_been_connected` (`experience.json`), set the first time a
+status reports `attached`, so the sections stay visible while the tracker is
+unplugged or the service is down. The capability is `ReadyToUse` while attached in
+state `Tracking`, `AvailableButNotReadyToUse` while attached in any other state
+(paused included), else `HasBeenAvailable` or `NotAvailable` by that flag. The
+`IsProfilesSectionVisible` alternative is omitted (not an ET5 case). The page
+re-evaluates visibility on every status, not only on show.
 
 `RefreshAvailability` (`VM:SettingsPageViewModel.cs:514-551`) runs when the
 page is shown and on every state or gaze-capability change. With gaze
@@ -587,11 +592,18 @@ ready (`:203-219,486-503`); the 2 s connection wait covers the first connect
 
 Linux: differs (why). Rows 1 to 5 and the reboot, capability and connection
 timers belong to Tobii's multi-process stack. The Linux page state is derived
-from the one service status (proposal): `Tracking` to `Tracking`;
-`TrackingPaused` to `TrackingDisabled`; `DeviceNotConnected` to `Disconnected`;
-`Configuring` to `Configuring`; `InvalidConfiguration` through the
-configuration status as above; an unreachable service to `Error`;
-`Initializing` to `Initializing`.
+from the app's device status (1.2) and the status's `enabled` flag, by the
+table above (implemented): no status yet `Initializing`; an unreachable service
+`Error`; `TrackingPaused` `TrackingDisabled`; with `enabled` false every other
+status `TrackingDisabled`; otherwise `Tracking` to `Tracking`,
+`DeviceNotConnected` to `Disconnected`, `Configuring` (released) to
+`Configuring`, and `InvalidConfiguration` through the configuration status:
+no display area `InvalidMonitorSetup` (checked first), no current profile
+`NoCalibrationProfile`. `InvalidCalibration`,
+`TrackedMonitorNotAvailableForBuiltInTracker`, `ExclusiveMode`,
+`FirmwareUpdateInProgress` and `InvalidMonitorRotation` have no Linux producer
+(`calibration_matches_profile` is false while an apply runs, so it is not read as
+an invalid calibration).
 
 ### 4.5 Busy marker and the 500 ms delay
 
@@ -613,7 +625,10 @@ configuration status as above; an unreachable service to `Error`;
   (`:623-630`, `DEV:TrackingDeviceEnabler.cs:59,122-125`).
 - A configuration run holds the marker until the configuration process has
   exited (4.7), so the page stays disabled for the whole run, then closes.
-- Linux: same.
+- Linux: same, and the marker is also held while a profile switch or a
+  tracked-eyes change waits for the service's reply: Tobii makes those registry
+  writes synchronously on the UI thread, so its page cannot be used meanwhile
+  either. A click's value is shown until the reply arrives.
 
 ### 4.6 Profiles
 
@@ -622,7 +637,7 @@ configuration status as above; an unreachable service to `Error`;
 | Source of the list | every sub-key of `HKLM\Software\Tobii\EyeXConfig\UserProfiles` (32-bit view); the current profile is the value `CurrentUserProfile` of `...\EyeXConfig`. Order: whatever the registry helper's `GetAllSubkeys` returns (not read) | `TDC:ConfigurationManager.cs:352-371,409-422`; `CFG:ConfigurationProvider.cs:114-123` | differs (why): profile files (spec item 4); keep one stable order (proposal: by name) |
 | Which profiles are listed | all profiles except the current one and `Guest` | `VM:SettingsPageViewModel.cs:569-578` | same |
 | Current profile | not in the list; shown only by the ribbon button of the Home page | 4.1 | differs: see 8 |
-| List rebuild | on page show, current profile change, profile list change; each rebuild clears the collection and creates new items (the lookup runs on the cleared collection), so delete marks are discarded | `VM:SettingsPageViewModel.cs:553-598` | same |
+| List rebuild | on page show, current profile change, profile list change; each rebuild clears the collection and creates new items (the lookup runs on the cleared collection), so delete marks are discarded | `VM:SettingsPageViewModel.cs:553-598` | same; the change is noticed on page show and on every service status (the store is re-read then), not by watching the profile directory |
 | `can_delete` | `!IsSelected && !IsGuest && !IsDeleted`; `IsSelected` is never set anywhere in the portal code, so for listed profiles it is `!IsDeleted` | `VM:CalibrationProfileListItemViewModel.cs:32-42,46-60,84` | same |
 | Delete button | marks the item deleted at once, no confirmation, nothing removed yet; the row's profile button is disabled (greyed) and "Undo" replaces the trash icon (`CanUndoDelete = IsDeleted`, `IsEnabled = !IsDeleted`) | `VM:CalibrationProfileListItemViewModel.cs:22,44,62-78,85-94`; `TH:generic.xaml:157-275` | same |
 | Undo | clears the mark | `VM:CalibrationProfileListItemViewModel.cs:90-94` | same |
@@ -712,8 +727,20 @@ How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
 
 Fonts: `TobiiFontFamily` = `Segoe UI Light` (`BR:colorsfonts.xaml:115`),
 replaced only for Chinese locales (`BRU:CultureHelper.cs:51-71`); no font is
-shipped. Linux: differs (why): a substitute is needed (the earlier note
-suggests Selawik Light, Microsoft's open Segoe UI replacement; proposal).
+shipped. Linux: differs (why): a substitute is needed: `Selawik Light`
+(Microsoft's open Segoe UI replacement, packaged with the app), then the setup
+app's fallbacks `Segoe UI Light`, `Segoe UI`, `Selawik`, `Open Sans`,
+`Noto Sans`, `DejaVu Sans`, at weight 300.
+
+Linux page CSS (`crates/tobii-experience/src/page/style.rs`) takes the values
+below as they are, with these adaptations GTK needs: the `GazeEnabledButton`
+pill is the whole button drawn at Tobii's scale (0.95, 0.975, 0.925), so its
+label is set at 12 pt / 0.95 to keep 12 pt on screen (it grows 2.6 % on hover,
+where Tobii's text does not); the toggle knob's margins are taken inside the 1 px
+track border (3 px and 24 px for Tobii's 4 and 25); negative WPF margins on the
+two headings beside a toggle become the same shift as a bottom margin on a
+centred label; the radio bullet is a content-box fill inside a 4 px padding;
+the accent button's 1 px press shift is a `translateY(1px)` of its content.
 
 ### 5.1 Palette (`BR:colorsfonts.xaml`)
 
@@ -940,8 +967,8 @@ Not read (where I looked is in brackets):
 Open points for the tasks that build on this ledger:
 
 - The current profile is not shown on the page itself: Tobii shows it in the
-  Home page ribbon (`VIEW:HomePage.xaml:127-137`) and the list omits it. A page
-  without the ribbon gives the user no indication of which profile is active.
+  Home page ribbon (`VIEW:HomePage.xaml:127-137`) and the list omits it. Linux:
+  a header row above the page shows it (4.1).
 - The page text and the quit dialog mention a key (`Ctrl+Shft+F10`) and a
   "start menu" that Linux does not have.
 - `Segoe UI Light` needs a substitute font.
