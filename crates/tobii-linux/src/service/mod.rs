@@ -14,6 +14,7 @@
 //! tobii_service::prp_service; this module runs them on a single-threaded tokio loop.
 
 pub mod clock;
+pub mod enabled;
 pub mod hub;
 pub mod link;
 pub mod sesp;
@@ -23,8 +24,10 @@ pub mod tet_tcp;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tobii_device::DeviceError;
@@ -33,14 +36,15 @@ use tobii_gaze::operation::{
     Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
 };
 use tobii_headpose::pipeline::HeadPoseSample;
+use tobii_protocol::commands::{pause_device, resume_device};
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
 use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
 use tobii_service::prp_service::{
     self as decisions, FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
-    GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS, LICENSED_SUBSCRIPTIONS, PropertySource,
-    STATUS_CONNECTION_FAILED, STATUS_INSUFFICIENT_LICENSE, STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED,
-    UserPresence, encode_names,
+    GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS, LICENSED_SUBSCRIPTIONS,
+    PROPERTY_DEVICE_PAUSED, PropertySource, STATUS_CONNECTION_FAILED, STATUS_INSUFFICIENT_LICENSE,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence, encode_names, paused_notification,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
@@ -59,6 +63,7 @@ use tokio::sync::mpsc;
 
 use crate::tracker::{DeviceReplies, DeviceRequest};
 use clock::{Clock, now_us, readings};
+use enabled::{EnabledState, not_supported};
 use hub::Hub;
 use link::{Ended, Frames, Link, Outcome, peer_repr, refused};
 
@@ -85,6 +90,8 @@ pub struct Options {
     pub tet_tcp_host: String,
     pub tet_tcp_port: u16,
     pub compensate_sesp_position: bool,
+    /// Where the on/off state is kept; `None` keeps it in memory, enabled at start.
+    pub enabled_state: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -99,6 +106,7 @@ impl Default for Options {
             tet_tcp_host: "127.0.0.1".into(),
             tet_tcp_port: tobii_service::tet_tcp::COMMAND_PORT,
             compensate_sesp_position: true,
+            enabled_state: None,
         }
     }
 }
@@ -246,6 +254,8 @@ struct Inner {
     tracker_attached: Cell<bool>,
     calibration_id: Cell<u32>,
     device: RefCell<Option<std::sync::mpsc::Sender<DeviceRequest>>>,
+    enabled_state: Option<EnabledState>,
+    paused: Arc<AtomicBool>,
 }
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
@@ -320,6 +330,8 @@ impl PrpService {
         } else {
             (None, None)
         };
+        let enabled_state = options.enabled_state.clone().map(EnabledState::new);
+        let enabled = enabled_state.as_ref().is_none_or(EnabledState::load);
         Self(Rc::new(Inner {
             serial: options.serial.clone().unwrap_or_else(|| options.name.clone()),
             name: options.name,
@@ -346,6 +358,8 @@ impl PrpService {
             tracker_attached: Cell::new(false),
             calibration_id: Cell::new(0),
             device: RefCell::new(None),
+            enabled_state,
+            paused: Arc::new(AtomicBool::new(!enabled)),
         }))
     }
 
@@ -367,6 +381,17 @@ impl PrpService {
 
     pub fn presence(&self) -> UserPresence {
         self.0.presence.get()
+    }
+
+    /// Whether eye tracking is on; off pauses the tracker for every client.
+    pub fn enabled(&self) -> bool {
+        !self.0.paused.load(Ordering::SeqCst)
+    }
+
+    /// Set while eye tracking is off; tracker sessions pause the device when they start
+    /// with it set and do not take its silence for a lost tracker.
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0.paused)
     }
 
     pub fn tracker_attached(&self) -> bool {
@@ -471,6 +496,51 @@ impl PrpService {
         }
     }
 
+    /// Turns eye tracking on or off for every client, as Tobii's EyeTrackerToggle does:
+    /// the running session's tracker gets 3100 with 0 (resume) or 1 (pause), the state is
+    /// stored and property 4 subscribers are notified. Without a session only the state
+    /// changes, and the next session starts paused. A not-supported reply counts as done;
+    /// any other failure leaves the state as it was.
+    pub async fn set_enabled(&self, enabled: bool) -> Result<(), DeviceCallError> {
+        let was_paused = self.0.paused.load(Ordering::SeqCst);
+        if !enabled {
+            self.0.paused.store(true, Ordering::SeqCst);
+        }
+        let toggle = move |id| Ok(if enabled { resume_device(id) } else { pause_device(id) });
+        match self.device_call(toggle, tobii_device::session::REQUEST_TIMEOUT).await {
+            Ok(_) | Err(DeviceCallError::NotAttached) => {}
+            Err(DeviceCallError::Device(error)) if not_supported(&error) => {}
+            Err(error) => {
+                self.0.paused.store(was_paused, Ordering::SeqCst);
+                return Err(error);
+            }
+        }
+        self.0.paused.store(!enabled, Ordering::SeqCst);
+        if let Some(state) = &self.0.enabled_state
+            && let Err(error) = state.store(enabled)
+        {
+            log::warn!("could not store the eye tracking state in {}: {error}", state.path().display());
+        }
+        if was_paused == enabled {
+            self.notify(PROPERTY_DEVICE_PAUSED, &paused_notification(!enabled));
+            log::info!(
+                "eye tracking {}",
+                if enabled { "enabled; tracker resumed" } else { "disabled; tracker paused" }
+            );
+        }
+        Ok(())
+    }
+
+    fn notify(&self, property_id: u32, notification: &[u8]) {
+        let subscriptions: Vec<Rc<Subscription>> = self.0.subscriptions.borrow().values().cloned().collect();
+        for subscription in subscriptions {
+            if subscription.properties.borrow().contains(&property_id) {
+                subscription.connection.send(notification);
+                self.0.counters.sent_notifications.set(self.0.counters.sent_notifications.get() + 1);
+            }
+        }
+    }
+
     /// Drives an operation that only sends requests (profile switching) on the running session.
     pub async fn run_operation<T>(
         &self,
@@ -559,13 +629,7 @@ impl PrpService {
             return;
         }
         let Ok(notification) = presence.notification() else { return };
-        let subscriptions: Vec<Rc<Subscription>> = self.0.subscriptions.borrow().values().cloned().collect();
-        for subscription in subscriptions {
-            if subscription.properties.borrow().contains(&PROPERTY_USER_PRESENCE) {
-                subscription.connection.send(&notification);
-                self.0.counters.sent_notifications.set(self.0.counters.sent_notifications.get() + 1);
-            }
-        }
+        self.notify(PROPERTY_USER_PRESENCE, &notification);
         log::info!("user presence {} since {}", presence.value.unwrap_or_default(), presence.since_us);
     }
 
@@ -778,6 +842,7 @@ impl PrpService {
             calibration_id: self.0.calibration_id.get(),
             presence: &presence,
             field_of_use: subscription.map(|s| s.field_of_use.get()),
+            paused: self.0.paused.load(Ordering::SeqCst),
         };
         Ok(decisions::answer_property(&source, tag, property_id, subscribe)?)
     }

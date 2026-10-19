@@ -7,7 +7,7 @@
 //! that falls silent, a restarted tracker or a host resume ends the session.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use tobii_device::streams::{
 };
 use tobii_device::{CameraCalibration, Channel, DeviceError, StopFlag, StopSignal, TrackerSession};
 use tobii_headpose::pipeline::{DisplayArea, HeadPoseSample};
-use tobii_protocol::commands::{Stream, command, header_only_request, request};
+use tobii_protocol::commands::{Stream, command, header_only_request, pause_device, request};
 use tobii_protocol::fields::Value;
 use tobii_protocol::frames::ImageFrame;
 use tobii_protocol::gaze::{GazeFrame, PLATMOD_UNKNOWN, platmod_presence};
@@ -526,10 +526,22 @@ impl std::fmt::Debug for ServiceFeed {
     }
 }
 
+/// Pauses a tracker that connects while eye tracking is off, as Tobii's
+/// `ShouldPauseRecentlyConnectedTracker` does; a not-supported reply counts as paused.
+fn pause_connected<C: Channel>(session: &mut TrackerSession<C>) -> Result<()> {
+    log::info!("eye tracking is disabled; pausing the tracker");
+    match session.call(pause_device) {
+        Err(error) if !crate::service::enabled::not_supported(&error) => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 /// One service session on a started tracker: calibration, streams, then samples until it ends.
 ///
-/// `requests` wait until the streams run and are then answered between reads. Returns when
-/// `stop` is set; fails when the tracker fails or goes silent.
+/// While `paused` is set the tracker is paused first and its silence is not taken for a lost
+/// tracker. `requests` wait until the streams run and are then answered between reads.
+/// Returns when `stop` is set; fails when the tracker fails or goes silent.
+#[allow(clippy::too_many_arguments, reason = "the session, its consumers and each way the service steers it")]
 pub fn serve_tracker<C: Channel>(
     session: &mut TrackerSession<C>,
     processor: &mut dyn FrameProcessor,
@@ -538,7 +550,11 @@ pub fn serve_tracker<C: Channel>(
     stop: &dyn StopSignal,
     suspend: Option<Box<dyn SuspendWatch>>,
     requests: Option<DeviceRequests>,
+    paused: Arc<AtomicBool>,
 ) -> Result<()> {
+    if paused.load(Ordering::SeqCst) {
+        pause_connected(session)?;
+    }
     processor.start(&session.camera_calibration(0)?);
     let calibration_id = device_calibration_id(session)?;
     let replies = if feed.device.is_some() { Some(DeviceReplies::capture_getters(session)?) } else { None };
@@ -552,6 +568,7 @@ pub fn serve_tracker<C: Channel>(
     streams.device_stream = feed.device_stream.as_deref().map(|d| d as DeviceStreamCallback);
     streams.suspend = suspend;
     streams.requests = requests;
+    streams.paused = paused;
     streams.run(
         session,
         stop,

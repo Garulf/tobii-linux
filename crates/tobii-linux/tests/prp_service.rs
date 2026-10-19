@@ -10,11 +10,13 @@ use std::time::Duration;
 use common::*;
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::service::clock::{Clocks, now_us, wine_clock};
+use tobii_linux::service::enabled::EnabledState;
 use tobii_linux::service::{Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame};
 use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
-    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, decode_names, encode_frame, error_response,
+    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, PROPERTY_DEVICE_PAUSED, decode_names,
+    encode_frame, error_response, paused_notification, word_value,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
@@ -498,6 +500,80 @@ fn presence_changes_reach_only_subscribed_clients() {
         fixture.service.publish_presence(FIXED_CLOCK_US + 20, i64::from(PLATMOD_AWAY));
         assert_eq!(watching.subscription.packet_within(Duration::from_millis(200)).await, None);
         assert_eq!(fixture.service.counters().sent_notifications.get(), 1);
+    });
+}
+
+fn state_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("tobii-linux-enabled-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory
+}
+
+#[test]
+fn enabled_state_round_trips() {
+    let directory = state_directory("round-trip");
+    let path = directory.join("nested/eye-tracking-enabled");
+    let state = EnabledState::new(path.clone());
+    assert!(state.load());
+    state.store(false).unwrap();
+    assert!(!state.load());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0\n");
+    state.store(true).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n");
+    assert!(state.load());
+    std::fs::write(&path, "garbage").unwrap();
+    assert!(state.load());
+    let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["eye-tracking-enabled"]);
+    std::fs::remove_dir_all(&directory).unwrap();
+
+    let state_file = std::path::PathBuf::from("tobii-linux/eye-tracking-enabled");
+    assert_eq!(
+        EnabledState::default_path(Some("/state"), Some("/home/u")),
+        std::path::Path::new("/state").join(&state_file)
+    );
+    let home = std::path::Path::new("/home/u/.local/state").join(&state_file);
+    assert_eq!(EnabledState::default_path(None, Some("/home/u")), home);
+    assert_eq!(EnabledState::default_path(Some(""), Some("/home/u")), home);
+}
+
+async fn paused_answer(session: &mut Session) -> Vec<u8> {
+    let tag = session.next_tag();
+    session.command.send_packet(&encode_property_request(tag, PROPERTY_DEVICE_PAUSED)).await;
+    decode_property_response(&session.command.packet().await).unwrap().block
+}
+
+#[test]
+fn disabling_without_a_tracker_session_is_stored_and_read_back() {
+    run(async {
+        let directory = state_directory("detached");
+        let path = directory.join("eye-tracking-enabled");
+        let options = Options { enabled_state: Some(path.clone()), ..common::options("ET5-TEST") };
+        let fixture = Fixture::new(options.clone()).await;
+        assert!(fixture.service.enabled());
+        let mut session = fixture.session().await;
+        assert_eq!(paused_answer(&mut session).await, word_value(0).0);
+        let tag = session.next_tag();
+        session
+            .command
+            .send_packet(
+                &encode_property_subscribe_request(tag, PROPERTY_DEVICE_PAUSED, COMMAND_PROPERTY_SUBSCRIBE).unwrap(),
+            )
+            .await;
+        session.command.packet().await;
+
+        fixture.service.set_enabled(false).await.unwrap();
+        assert!(!fixture.service.enabled());
+        assert_eq!(session.subscription.packet().await, paused_notification(true));
+        assert_eq!(paused_answer(&mut session).await, word_value(1).0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0\n");
+        fixture.service.set_enabled(false).await.unwrap();
+        assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+
+        let restarted = Fixture::new(options).await;
+        assert!(!restarted.service.enabled());
+        assert_eq!(paused_answer(&mut restarted.session().await).await, word_value(1).0);
+        std::fs::remove_dir_all(&directory).unwrap();
     });
 }
 

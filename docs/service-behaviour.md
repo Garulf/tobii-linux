@@ -169,8 +169,10 @@ client sets property 2 or 4 (`0x1400f6e70` from the command dispatcher
 and around diagnostic image snapshots (`0x140269390`, "retrieve_using_snapshot").
 The vtable slots `0x330`, `0x338`, `0x350`, `0x358` have no other callers. The
 runtime does not send them on its own (no display, idle or client-count
-trigger) (static). The game layer only reads and subscribes 2 and 4, so the
-Linux service never sends them.
+trigger) (static). The game layer only reads and subscribes 2 and 4. The Linux
+service sends 3100 only when eye tracking is turned off or on, and to a tracker
+that connects while it is off, as Tobii Experience does
+([Tobii Experience](experience-app.md), section 2); property 4 answers 1 while it is off.
 
 ### Linux
 

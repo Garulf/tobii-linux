@@ -13,7 +13,7 @@ use tobii_device::clock::HostClock;
 use tobii_linux::tracker::HostTime;
 use tobii_protocol::Message;
 use tobii_protocol::camera_info::{CameraRecord, HardwareInfo, hardware_info_response};
-use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command};
+use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device};
 use tobii_protocol::fields::{encode_payload, int32_field, uint32_field};
 use tobii_protocol::gaze::PLATMOD_PRESENT;
 use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column};
@@ -128,6 +128,8 @@ struct Device {
     trailing: Option<(u32, Vec<Message>)>,
     slow: Option<(u32, Duration)>,
     delayed: Option<(Instant, Vec<u8>)>,
+    pausable: bool,
+    paused: bool,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -153,6 +155,8 @@ impl FakeTracker {
             trailing: None,
             slow: None,
             delayed: None,
+            pausable: false,
+            paused: false,
         })))
     }
 
@@ -162,6 +166,13 @@ impl FakeTracker {
 
     pub fn streaming() -> Self {
         Self::new(Behaviour::Streaming)
+    }
+
+    /// Streams like [`Self::streaming`], but sends no stream data while 3100 has paused it.
+    pub fn pausable() -> Self {
+        let tracker = Self::streaming();
+        tracker.device().pausable = true;
+        tracker
     }
 
     pub fn stalling(after: usize) -> Self {
@@ -229,6 +240,10 @@ impl Device {
                 reply(&request, status(self.refuse.contains(&requested_stream(&request))), &[])
             }
             command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
+            command::PAUSE_DEVICE if self.pausable => {
+                self.paused = request.payload == pause_device(0).payload;
+                reply(&request, 0, &[])
+            }
             _ => reply(&request, 0, &[]),
         };
         let mut bytes = answer.encode().unwrap();
@@ -254,7 +269,7 @@ impl Device {
             }
             Behaviour::Streaming => {
                 self.streaming = true;
-                if requested_stream(request) == Stream::Presence.wire_id() {
+                if requested_stream(request) == Stream::Presence.wire_id() && !self.paused {
                     let present = presence_message(self.timestamp, PLATMOD_PRESENT);
                     self.outgoing.push_back(present.encode().unwrap());
                 }
@@ -330,6 +345,7 @@ impl Channel for FakeTracker {
             return Ok(message);
         }
         if device.streaming
+            && !device.paused
             && let Some(message) = device.next_stream_message()
         {
             let pause = device.stream_pause();

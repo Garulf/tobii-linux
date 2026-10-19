@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::fake_tracker::FakeTracker;
 use common::*;
+use tobii_device::streams::SILENCE_TIMEOUT;
 use tobii_device::supervisor::{Backoff, LinkCounters, TrackerLink};
 use tobii_device::{CameraCalibration, DeviceError, StopFlag, TrackerSession};
 use tobii_gaze::operation::{Operation, OperationError};
@@ -23,10 +24,12 @@ use tobii_linux::service::clock::{Clocks, ServiceTime, wine_clock};
 use tobii_linux::service::{DeviceCallError, Options, PrpService};
 use tobii_linux::tracker::{FrameProcessor, HostTime};
 use tobii_protocol::commands::{Stream, command, header_only_request, unsubscribe_stream};
+use tobii_protocol::fields::{Value, values};
 use tobii_protocol::gaze::PRESENCE_PRESENT;
 use tobii_protocol::ttp::Decoder;
 use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope};
+use tobii_service::prp_service::{PROPERTY_DEVICE_PAUSED, paused_notification, word_value};
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_STREAM_START, ConnectRequest, PropertyResponse,
     SUBSCRIPTION_CHANNEL, decode_command_response, decode_property_subscribe_response, encode_connect_request,
@@ -97,6 +100,7 @@ impl Link {
             }));
         }
         let clock = HostTime(Arc::new(ServiceTime(Arc::clone(service.clock()))));
+        let paused = service.pause_flag();
         let mut link = TrackerLink::new(Backoff::new(0.02, 0.05, 10.0));
         let (stop, counters, starts) = (StopFlag::new(), Arc::clone(&link.counters), Arc::new(AtomicUsize::new(0)));
         let thread = {
@@ -104,7 +108,8 @@ impl Link {
             std::thread::spawn(move || {
                 let mut processor = FakeProcessor { starts };
                 let mut open = || open(&slot);
-                let mut host = ServiceLink { open: &mut open, processor: &mut processor, clock, feed: &feed, events };
+                let mut host =
+                    ServiceLink { open: &mut open, processor: &mut processor, clock, feed: &feed, events, paused };
                 link.run(&mut host, &stop);
             })
         };
@@ -405,6 +410,116 @@ fn operations_run_their_calls_through_the_session() {
 
         let reading = Operation::new(|io| async move { io.read().await.map_err(OperationError::External) });
         assert!(matches!(service.run_operation(reading).await, Err(OperationError::Gaze(_))));
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+/// The value of every pause/resume request the tracker got: 1 pause, 0 resume.
+fn pause_values(device: &FakeTracker) -> Vec<i64> {
+    let values = |message: Message| values(&message.payload).unwrap().first().and_then(Value::as_int).unwrap();
+    device.log().into_iter().filter(|m| m.command == command::PAUSE_DEVICE).map(values).collect()
+}
+
+/// Requests a pausable tracker gets from session startup, before the service sends any.
+fn startup_writes() -> usize {
+    let device = FakeTracker::pausable();
+    TrackerSession::new(device.clone()).initialize().unwrap();
+    device.log().len()
+}
+
+/// Skips stream packages until `expected` arrives.
+async fn notified(subscription: &mut RelayedChannel, expected: &[u8]) {
+    let deadline = Instant::now() + WAIT;
+    while subscription.packet().await != expected {
+        assert!(Instant::now() < deadline, "no notification {expected:02x?}");
+    }
+}
+
+/// Stream packages that arrive within `window`; fails if the connection closes.
+async fn packages_within(subscription: &mut RelayedChannel, window: Duration) -> Vec<Instant> {
+    let deadline = Instant::now() + window;
+    let mut arrivals = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match subscription.receive_within(remaining).await {
+            Received::Timeout => return arrivals,
+            Received::Closed => panic!("the service closed the client"),
+            Received::Message(_) => arrivals.push(Instant::now()),
+        }
+    }
+}
+
+#[test]
+fn disabling_pauses_and_keeps_clients() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::pausable();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        let (mut command, mut subscription, _) = streaming_client(port).await;
+        command
+            .send_packet(
+                &encode_property_subscribe_request(4, PROPERTY_DEVICE_PAUSED, COMMAND_PROPERTY_SUBSCRIBE).unwrap(),
+            )
+            .await;
+        let watched = decode_property_subscribe_response(&command.packet().await).unwrap();
+        assert_eq!((watched.status, watched.block), (0, word_value(0).0));
+        subscription.packet().await;
+
+        service.set_enabled(false).await.unwrap();
+        assert!(!service.enabled());
+        assert_eq!(pause_values(&device), [1]);
+        notified(&mut subscription, &paused_notification(true)).await;
+        let paused_at = Instant::now();
+        let late = packages_within(&mut subscription, SILENCE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(late.iter().all(|at| *at - paused_at < Duration::from_millis(500)), "data kept coming while paused");
+        assert_eq!(command.receive_within(Duration::from_millis(50)).await, Received::Timeout);
+        assert!(service.tracker_attached());
+        assert_eq!(link.sessions_and_failures(), (1, 0));
+
+        service.set_enabled(true).await.unwrap();
+        assert!(service.enabled());
+        assert_eq!(pause_values(&device), [1, 0]);
+        notified(&mut subscription, &paused_notification(false)).await;
+        let package = subscription.packet().await;
+        assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn replug_while_disabled_pauses_again() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::pausable();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::start(&service, false, &slot);
+        streaming(&service).await;
+        service.set_enabled(false).await.unwrap();
+
+        device.unplug();
+        plug(&slot, None);
+        until("detached", || !service.tracker_attached()).await;
+        let replugged = FakeTracker::pausable();
+        plug(&slot, Some(replugged.clone()));
+        until("attached again", || service.tracker_attached()).await;
+        let first = replugged.log()[startup_writes()].clone();
+        assert_eq!(first.command, command::PAUSE_DEVICE);
+        assert_eq!(pause_values(&replugged), [1]);
+        let (_command, mut subscription, _) = streaming_client(port).await;
+        assert!(packages_within(&mut subscription, Duration::from_millis(500)).await.is_empty());
+        assert!(!service.enabled());
+
+        service.set_enabled(true).await.unwrap();
+        assert_eq!(pause_values(&replugged), [1, 0]);
+        let package = subscription.packet().await;
+        assert_eq!(decode_envelope(&package, DEFAULT_MAX_PAYLOAD).unwrap()[8], 1);
+        assert_eq!(link.sessions_and_failures(), (2, 1));
         assert!(link.stop().await);
         service.close();
         accept.abort();

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tobii_device::streams::HostSuspendWatch;
@@ -16,6 +17,7 @@ use crate::args::{Exit, OptionSpec, Parser, help_for};
 use crate::error::{Error, Result};
 use crate::pyjson::{self, Json, object};
 use crate::service::clock::{Clocks, ServiceTime, WINE_CLOCKS, wine_clock};
+use crate::service::enabled::EnabledState;
 use crate::service::{Corners, Event, Options, PrpService, list_repr, listen};
 use crate::tracker::{FrameProcessor, HostTime, ModelProcessor, ServiceFeed, serve_tracker};
 
@@ -187,6 +189,10 @@ impl Serve {
             gaze: !values.flag("--no-gaze"),
             tet_tcp: values.flag("--tet-tcp"),
             compensate_sesp_position: values.text("--sesp-positions").unwrap_or("prp") == "prp",
+            enabled_state: Some(EnabledState::default_path(
+                std::env::var("XDG_STATE_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            )),
             ..Options::default()
         };
         Self {
@@ -209,6 +215,8 @@ pub struct ServiceLink<'a, C> {
     pub clock: HostTime,
     pub feed: &'a ServiceFeed,
     pub events: mpsc::UnboundedSender<Event>,
+    /// The service's pause flag, set while eye tracking is off.
+    pub paused: Arc<AtomicBool>,
 }
 
 impl<C> std::fmt::Debug for ServiceLink<'_, C> {
@@ -232,7 +240,17 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
         let (requests, inbox) = std::sync::mpsc::channel();
         let _ = self.events.send(Event::Requests(requests));
         let suspend = Box::new(HostSuspendWatch::default());
-        serve_tracker(&mut session, self.processor, self.clock.clone(), self.feed, stop, Some(suspend), Some(inbox))
+        let paused = Arc::clone(&self.paused);
+        serve_tracker(
+            &mut session,
+            self.processor,
+            self.clock.clone(),
+            self.feed,
+            stop,
+            Some(suspend),
+            Some(inbox),
+            paused,
+        )
     }
 
     fn now_s(&mut self) -> f64 {
@@ -309,6 +327,7 @@ async fn run_service(
         tokio::task::spawn_local(async move { service.follow(received).await })
     };
     let feed = service_feed(&events, arguments.options.gaze, arguments.options.tet_tcp);
+    let paused = service.pause_flag();
     let stop = StopFlag::new();
     let (finished, done) = tokio::sync::oneshot::channel::<(u64, u64)>();
     let link_thread = {
@@ -319,7 +338,7 @@ async fn run_service(
             let mut link = TrackerLink::new(Backoff::default());
             let processor = processor.as_mut();
             let mut open = || session.open().map(|(_, tracker)| tracker);
-            let mut host = ServiceLink { open: &mut open, processor, clock: host_clock, feed: &feed, events };
+            let mut host = ServiceLink { open: &mut open, processor, clock: host_clock, feed: &feed, events, paused };
             link.run(&mut host, &stop);
             let _ = finished.send((link.sessions(), link.failures()));
         })?
