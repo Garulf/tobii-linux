@@ -2,16 +2,20 @@
 # apps in when the host has no GTK 4: nixpkgs' Rust toolchain (proc macros must load
 # against the same glibc as the GTK libraries), GTK 4 and gtk4-layer-shell, DejaVu Sans as
 # the only font (the faces the browser page is drawn with on hosts without Segoe UI),
-# Xvfb and xdotool for headless runs, and dbus for the session bus the experience app's
-# single-instance test runs on (dbus-run-session).
+# Xvfb and xdotool for headless runs, dbus for the session bus the experience app's
+# single-instance test runs on (dbus-run-session), and Mesa's software GL (llvmpipe) for
+# the gaze preview's GLArea, since hosts other than NixOS have no /run/opengl-driver.
 #
 #   nix-shell nix/setup-shell.nix --run 'cargo build -p tobii-setup --features gtk'
 { pkgs ? import <nixpkgs> { } }:
 pkgs.mkShell {
-  packages = with pkgs; [ cargo rustc clippy rustfmt pkg-config gtk4 gtk4-layer-shell xvfb xdotool dbus ];
+  packages = with pkgs; [ cargo rustc clippy rustfmt pkg-config gtk4 gtk4-layer-shell xvfb xdotool dbus mesa ];
   FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts.minimal ]; };
   # dbus-run-session's default config is /etc/dbus-1/session.conf, which hosts without a
   # system D-Bus lack.
   DBUS_SESSION_CONFIG = "${pkgs.dbus}/share/dbus-1/session.conf";
+  # libglvnd finds GL vendors through /run/opengl-driver or these.
+  __EGL_VENDOR_LIBRARY_FILENAMES = "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
+  LIBGL_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
   GSETTINGS_SCHEMA_DIR = "${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}/glib-2.0/schemas";
 }

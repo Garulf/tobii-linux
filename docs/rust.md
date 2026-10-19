@@ -160,6 +160,17 @@ They run like the setup targets. `experience-test` also needs a session bus for 
 single-instance test (`dbus-run-session` from the shell) and starts Xvfb when there is no
 display; the test is skipped without either.
 
+"Preview my gaze" ([gaze-preview.md](gaze-preview.md)) is `overlay`: a click-through
+layer-shell surface (`gtk4-layer-shell`) over the monitor of the last display setup, drawing
+`GazeNative.dll`'s passes in a `gtk::GLArea` every 12 ms while the toggle is on, the page
+window is active and the device is tracking. The trail, the visibility rules and the
+output choice (`trail`, `preview`) build and test without GTK. Without layer-shell (X11)
+the preview stays off. The OpenGL calls go through `glow` in
+`crates/tobii-experience/src/overlay/gl.rs`, the crate's one module allowed `unsafe` (the
+crate denies it instead of forbidding it). The shell adds Mesa's llvmpipe so the overlay
+test renders under Xvfb; `TOBII_EXPERIENCE_BUBBLE_FRAMES=<directory>` makes it write the
+frames it checks as PNGs.
+
 ## Binary
 
 `crates/tobii-linux` builds the `tobii-linux` command without Python. Subcommands,

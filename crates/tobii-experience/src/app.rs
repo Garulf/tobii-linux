@@ -249,6 +249,7 @@ impl Controller {
             page_model: PageModel::default(),
         }));
         controller.start_service();
+        crate::overlay::attach(&controller);
         let weak = Rc::downgrade(&controller.0);
         glib::spawn_future_local(async move {
             while let Ok(event) = received.recv().await {
