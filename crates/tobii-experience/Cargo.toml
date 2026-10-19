@@ -23,6 +23,9 @@ serde_json.workspace = true
 tobii-control.workspace = true
 tobii-gaze.workspace = true
 
+[dev-dependencies]
+tobii-device.workspace = true
+
 [[bin]]
 name = "tobii-linux-experience"
 path = "src/main.rs"

@@ -109,7 +109,7 @@ impl Shell {
                     controller
                 }
             };
-            controller.handle(&options);
+            controller.handle(&options, command_line.is_remote());
             glib::ExitCode::SUCCESS
         });
         let cell = controller.clone();
@@ -467,9 +467,10 @@ impl Controller {
         });
     }
 
-    /// Acts on a command line: the own one at start or one a second instance forwarded.
-    fn handle(&self, options: &Options) {
-        if options.page {
+    /// Acts on a command line: the own one at start or one a second instance forwarded. A
+    /// second launch without `--guest` presents the page of the running app.
+    fn handle(&self, options: &Options, remote: bool) {
+        if options.page || (remote && !options.guest) {
             self.open_page();
         }
         if options.guest {

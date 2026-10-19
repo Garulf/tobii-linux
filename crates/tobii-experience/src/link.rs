@@ -9,11 +9,20 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tobii_control::{ControlClient, ControlError, GazeSample, Incoming, Request, Status};
+use tobii_gaze::calibration::TRANSFER_TIMEOUT_S;
 
 const CLIENT_NAME: &str = "experience";
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// The service's timeout for a device call without its own (`tobii_device::session::REQUEST_TIMEOUT`).
+const SERVICE_DEVICE_CALL_S: f64 = 3.0;
+/// The longest one profile apply on the service may take: 1490, 3160, 1110 (with
+/// `TRANSFER_TIMEOUT_S`) and 1490 again.
+const PROFILE_APPLY_S: f64 = 3.0 * SERVICE_DEVICE_CALL_S + TRANSFER_TIMEOUT_S;
+/// `SwitchProfile` and `SetTrackedEyes` wait for an apply already running (the one at attach)
+/// and then run their own, plus a margin for the reply.
+const PROFILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * PROFILE_APPLY_S as u64 + 2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What the link thread reports.
@@ -89,6 +98,15 @@ impl Drop for Link {
     }
 }
 
+/// How long the service may take to answer `request`: profile requests reach the device and
+/// may wait for each other, the rest answer at once.
+fn request_timeout(request: &Request) -> Duration {
+    match request {
+        Request::SwitchProfile { .. } | Request::SetTrackedEyes(_) => PROFILE_REQUEST_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
+
 struct Worker {
     addr: SocketAddr,
     on_incoming: Box<dyn Fn(LinkUpdate) + Send>,
@@ -147,7 +165,8 @@ impl Worker {
 
     /// Sends one request; false when the connection is no longer usable.
     fn dispatch(&self, client: &mut ControlClient, request: Request) -> bool {
-        match client.request(request, REQUEST_TIMEOUT) {
+        let timeout = request_timeout(&request);
+        match client.request(request, timeout) {
             Ok(status) => (self.on_incoming)(LinkUpdate::Status(Some(status))),
             Err(ControlError::Refused(reason)) => (self.on_incoming)(LinkUpdate::Failed(reason)),
             Err(error) => {
@@ -180,5 +199,26 @@ impl Worker {
                 done();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tobii_control::protocol::TrackedEyes;
+
+    use super::*;
+
+    #[test]
+    fn profile_requests_outlast_the_services_apply() {
+        let profile_requests =
+            [Request::SwitchProfile { name: "Other".into() }, Request::SetTrackedEyes(TrackedEyes::Left)];
+        for request in profile_requests {
+            assert_eq!(request_timeout(&request), Duration::from_secs(50), "{request:?}");
+            assert!(request_timeout(&request).as_secs_f64() > 2.0 * PROFILE_APPLY_S);
+        }
+        for request in [Request::Status, Request::SetEnabled(false), Request::Release, Request::SubscribeGaze(true)] {
+            assert_eq!(request_timeout(&request), REQUEST_TIMEOUT, "{request:?}");
+        }
+        assert_eq!(Duration::from_secs_f64(SERVICE_DEVICE_CALL_S), tobii_device::session::REQUEST_TIMEOUT);
     }
 }

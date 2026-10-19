@@ -1608,6 +1608,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tobii-control",
+ "tobii-device",
  "tobii-gaze",
 ]
 

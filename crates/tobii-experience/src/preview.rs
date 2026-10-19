@@ -4,7 +4,8 @@
 //! the app window is active and not minimized (docs/experience-app.md 4.8); here it also
 //! needs state Tracking and the tracked monitor. Becoming shown subscribes to gaze and
 //! becoming hidden unsubscribes. The output is the monitor of the last display setup
-//! (`display-setup.json`), found by connector, else by the EDID manufacturer and model.
+//! (`display-setup.json`), found by connector, else by the recorded output name, else by the
+//! EDID manufacturer and model.
 
 use std::path::Path;
 
@@ -62,6 +63,9 @@ impl Preview {
 pub struct RecordedOutput {
     /// DRM connector name, `card0-DP-1` or `DP-1`.
     pub connector: Option<String>,
+    /// `monitor.key`: the output name setup matched, `DP-1`; records written before the
+    /// `connector` field have only this and `edid_id`.
+    pub key: Option<String>,
     /// EDID manufacturer PNP id, for example `DEL`.
     pub manufacturer: Option<String>,
     pub product_code: Option<u16>,
@@ -78,8 +82,8 @@ pub struct OutputInfo {
 }
 
 impl RecordedOutput {
-    /// Reads `monitor.connector`, `monitor.edid` (hex) and `monitor.edid_id` from a display
-    /// record; `None` when the file is missing or unreadable.
+    /// Reads `monitor.connector`, `monitor.key`, `monitor.edid` (hex) and `monitor.edid_id`
+    /// from a display record; `None` when the file is missing or unreadable.
     pub fn read(path: &Path) -> Option<RecordedOutput> {
         let record: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
         Some(RecordedOutput::from_record(&record))
@@ -97,6 +101,7 @@ impl RecordedOutput {
         let id = id.filter(|bytes| bytes.len() >= 12);
         RecordedOutput {
             connector: text("connector"),
+            key: text("key"),
             manufacturer: id.as_deref().and_then(|bytes| pnp_id(u16::from_be_bytes([bytes[8], bytes[9]]))),
             product_code: id.as_deref().map(|bytes| u16::from_le_bytes([bytes[10], bytes[11]])),
             model: edid.as_deref().and_then(monitor_name),
@@ -104,13 +109,16 @@ impl RecordedOutput {
     }
 }
 
-/// The index of the output showing the recorded monitor: same connector, else same EDID
-/// manufacturer and model. `None` hides the bubble.
+/// The index of the output showing the recorded monitor: same connector, else the output
+/// named by `monitor.key`, else same EDID manufacturer and model. `None` hides the bubble.
 pub fn choose_output(recorded: &RecordedOutput, outputs: &[OutputInfo]) -> Option<usize> {
-    let by_connector = recorded.connector.as_deref().map(strip_card).and_then(|connector| {
-        outputs.iter().position(|output| output.connector.as_deref().map(strip_card) == Some(connector))
-    });
-    by_connector.or_else(|| outputs.iter().position(|output| same_edid(recorded, output)))
+    let by_name = |name: Option<&str>| {
+        let name = strip_card(name?);
+        outputs.iter().position(|output| output.connector.as_deref().map(strip_card) == Some(name))
+    };
+    by_name(recorded.connector.as_deref())
+        .or_else(|| by_name(recorded.key.as_deref()))
+        .or_else(|| outputs.iter().position(|output| same_edid(recorded, output)))
 }
 
 /// `card0-DP-1` as GDK names it, `DP-1`.
@@ -214,6 +222,7 @@ mod tests {
     fn no_matching_output_hides_overlay() {
         let recorded = RecordedOutput {
             connector: Some("card0-DP-1".into()),
+            key: None,
             manufacturer: Some("DEL".into()),
             product_code: Some(0xa0b1),
             model: Some("DELL U2720Q".into()),
@@ -248,6 +257,7 @@ mod tests {
     fn output_by_connector_then_edid() {
         let recorded = RecordedOutput {
             connector: Some("card1-DP-2".into()),
+            key: None,
             manufacturer: Some("DEL".into()),
             product_code: Some(0xa0b1),
             model: Some("DELL U2720Q".into()),
@@ -299,6 +309,7 @@ mod tests {
             full,
             RecordedOutput {
                 connector: Some("card0-DP-1".into()),
+                key: None,
                 manufacturer: Some("DEL".into()),
                 product_code: Some(0xa0b1),
                 model: Some("DELL U2720Q".into()),
@@ -311,6 +322,7 @@ mod tests {
             today,
             RecordedOutput {
                 connector: None,
+                key: Some("DP-1".into()),
                 manufacturer: Some("DEL".into()),
                 product_code: Some(0xa0b1),
                 model: None
@@ -318,5 +330,33 @@ mod tests {
             "edid_id holds the manufacturer and product code"
         );
         assert_eq!(RecordedOutput::from_record(&json!({"monitor": {"edid_id": "zz"}})), RecordedOutput::default());
+    }
+
+    #[test]
+    fn record_without_connector_uses_monitor_key() {
+        let recorded =
+            RecordedOutput::from_record(&json!({"monitor": {"key": "DP-2", "edid_id": "10ACB1A0000000000000"}}));
+        let outputs = [
+            OutputInfo {
+                connector: Some("DP-1".into()),
+                manufacturer: Some("DEL".into()),
+                model: Some("0xa0b1".into()),
+            },
+            OutputInfo {
+                connector: Some("DP-2".into()),
+                manufacturer: Some("Dell Inc.".into()),
+                model: Some("DELL U2720Q".into()),
+            },
+        ];
+        assert_eq!(choose_output(&recorded, &outputs), Some(1), "monitor.key names the output before the EDID");
+
+        let card_named = [OutputInfo { connector: Some("card0-DP-2".into()), ..OutputInfo::default() }];
+        assert_eq!(choose_output(&recorded, &card_named), Some(0), "a leading cardN- is stripped");
+
+        let unplugged = [outputs[0].clone()];
+        assert_eq!(choose_output(&recorded, &unplugged), Some(0), "no output of that name: the EDID id");
+
+        let connector_first = RecordedOutput { connector: Some("DP-1".into()), ..recorded.clone() };
+        assert_eq!(choose_output(&connector_first, &outputs), Some(0), "the connector field wins over the key");
     }
 }

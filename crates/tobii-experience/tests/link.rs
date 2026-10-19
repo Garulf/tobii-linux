@@ -37,12 +37,17 @@ struct Stub {
 
 impl Stub {
     fn bind(addr: SocketAddr) -> Stub {
-        Stub::start(addr, true)
+        Stub::start(addr, Some(Duration::ZERO))
     }
 
     /// Accepts the hello and the requests but never replies to them.
     fn bind_silent(addr: SocketAddr) -> Stub {
-        Stub::start(addr, false)
+        Stub::start(addr, None)
+    }
+
+    /// Answers `SwitchProfile` only after `delay`, as a service applying a calibration does.
+    fn bind_slow(addr: SocketAddr, delay: Duration) -> Stub {
+        Stub::start(addr, Some(delay))
     }
 
     fn received(&self) -> Vec<Request> {
@@ -57,7 +62,7 @@ impl Stub {
         }
     }
 
-    fn start(addr: SocketAddr, answer: bool) -> Stub {
+    fn start(addr: SocketAddr, answer: Option<Duration>) -> Stub {
         let deadline = Instant::now() + WAIT;
         let listener = loop {
             match TcpListener::bind(addr) {
@@ -94,7 +99,8 @@ impl Drop for Stub {
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool, log: &Mutex<Vec<Request>>, answer: bool) {
+/// `answer` is `None` for a silent stub, else the delay before answering `SwitchProfile`.
+fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool, log: &Mutex<Vec<Request>>, answer: Option<Duration>) {
     stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
     let mut received = Vec::new();
@@ -112,8 +118,12 @@ fn serve(mut stream: std::net::TcpStream, stop: &AtomicBool, log: &Mutex<Vec<Req
                 stream.write_all(&encode(FRAME_CONTROL_EVENT, &Event::Status(status())).unwrap()).unwrap();
             } else if kind == FRAME_CONTROL_REQUEST {
                 let (id, request) = decode_request(&payload).unwrap();
+                let switch = matches!(request, Request::SwitchProfile { .. });
                 log.lock().unwrap().push(request);
-                if answer {
+                if let Some(delay) = answer {
+                    if switch {
+                        std::thread::sleep(delay);
+                    }
                     let reply = Reply { id, result: Ok(status()) };
                     stream.write_all(&encode(FRAME_CONTROL_REPLY, &reply).unwrap()).unwrap();
                 }
@@ -279,4 +289,21 @@ fn gaze_subscription_switched_off_is_not_replayed() {
     wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
     std::thread::sleep(Duration::from_millis(300));
     assert!(!stub.received().contains(&Request::SubscribeGaze(true)));
+}
+
+#[test]
+fn a_slow_profile_switch_keeps_the_connection() {
+    let addr = free_port_addr();
+    let _stub = Stub::bind_slow(addr, Duration::from_millis(2600));
+    let (on_incoming, updates) = collect();
+    let link = Link::start(addr, on_incoming);
+    wait_for(&updates, |update| matches!(update, LinkUpdate::Status(Some(_))));
+    let (done, finished) = mpsc::channel();
+    link.send_then(Request::SwitchProfile { name: "Other".into() }, move || {
+        let _ = done.send(());
+    });
+    finished.recv_timeout(WAIT).expect("the switch was answered");
+    let seen: Vec<LinkUpdate> = updates.try_iter().collect();
+    assert!(seen.contains(&LinkUpdate::Status(Some(status()))), "{seen:?}");
+    assert!(!seen.iter().any(|update| matches!(update, LinkUpdate::Status(None) | LinkUpdate::Failed(_))), "{seen:?}");
 }

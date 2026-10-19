@@ -1,6 +1,6 @@
 //! The command line of `tobii-linux-experience`. A second instance forwards it to the
-//! running one, which acts on `--guest` and `--page`; the service options only apply to the
-//! instance that starts the app.
+//! running one, which acts on `--guest` and `--page` and opens the page when neither is
+//! given; the service options only apply to the instance that starts the app.
 
 use std::net::SocketAddr;
 
@@ -14,7 +14,7 @@ pub const USAGE: &str = "\
 usage: tobii-linux-experience [options]
 
 Tobii Experience for Linux: the tray icon, the Eye tracking page, on/off and quit. Run it
-again while it runs to hand it --guest or --page.
+again while it runs to open its page, or to hand it --guest.
 
 options:
   --guest              Start a temporary guest calibration (Tobii's Ctrl+Shift+F10); only

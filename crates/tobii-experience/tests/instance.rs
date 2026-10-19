@@ -131,6 +131,7 @@ impl SetupLauncher for FakeSetup {
 enum Step {
     WaitForTracking,
     Guest(Child),
+    Bare(Child),
     Page(Child),
     Dialog,
     FirstFailure,
@@ -139,8 +140,8 @@ enum Step {
     Quitting,
 }
 
-fn second_instance(argument: &str) -> Child {
-    Command::new(BINARY).args([argument, "--service-unit", "never-started.service"]).spawn().unwrap()
+fn second_instance(arguments: &[&str]) -> Child {
+    Command::new(BINARY).args(arguments).args(["--service-unit", "never-started.service"]).spawn().unwrap()
 }
 
 /// The exit status of a second instance once it ended, failing the test if it hangs.
@@ -252,7 +253,7 @@ fn run_primary() -> Outcome {
         let mut step = step.borrow_mut();
         let next = match &mut *step {
             Step::WaitForTracking if controller.device_status() == DeviceStatus::Tracking => {
-                Step::Guest(second_instance("--guest"))
+                Step::Guest(second_instance(&["--guest"]))
             }
             Step::WaitForTracking => return glib::ControlFlow::Continue,
             Step::Guest(child) => match ended(child, started) {
@@ -263,7 +264,20 @@ fn run_primary() -> Outcome {
                     return fail(format!("the primary ran setup with {:?}", setup.runs.borrow()));
                 }
                 Ok(Some(_)) if page.is_some() => return fail("--guest opened the page".into()),
-                Ok(Some(_)) => Step::Page(second_instance("--page")),
+                Ok(Some(_)) => Step::Bare(second_instance(&[])),
+            },
+            Step::Bare(child) => match ended(child, started) {
+                Err(message) => return fail(message),
+                Ok(None) => return glib::ControlFlow::Continue,
+                Ok(Some(status)) if !status.success() => return fail(format!("a bare launch exited with {status}")),
+                Ok(Some(_)) => {
+                    let Some(page) = page else { return fail("a bare second launch opened no page".into()) };
+                    if setup.runs.borrow().len() != 1 {
+                        return fail(format!("a bare launch ran setup: {:?}", setup.runs.borrow()));
+                    }
+                    page.close();
+                    Step::Page(second_instance(&["--page"]))
+                }
             },
             Step::Page(child) => match ended(child, started) {
                 Err(message) => return fail(message),
