@@ -682,8 +682,8 @@ exits with code 0 (printing usage when `--help` is given and a console is
 attached); an optional `-eyeTrackerUrl URL` is parsed too
 (`CCONT:FlowTypeResolver.cs:45-61`, `CONF:ApplicationConfiguration.cs:17-34,63-84`).
 `tobii-linux-setup` takes `-C`, `-N`, `-S`, `-R` and `-G` (also as `--guest`), at
-most one, and exits with Tobii's codes: 0 success, 1 argument error, 2 aborted, 3
-configuration error ([setup flow](setup-flow.md#tobii-linux-setup-arguments)).
+most one, and when started with one of them exits with Tobii's codes: 0 success, 1
+argument error, 2 aborted, 3 configuration error ([setup flow](setup-flow.md#tobii-linux-setup-arguments)).
 
 How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
 

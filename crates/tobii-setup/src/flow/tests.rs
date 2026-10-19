@@ -636,8 +636,10 @@ fn summaries_and_record_times() {
     assert_eq!(civil_time(0), [1970, 1, 1, 0, 0, 0]);
     assert_eq!(civil_time(1_792_150_200), [2026, 10, 16, 11, 30, 0]);
     assert!(valid_lines(0.02, 0.07) && !valid_lines(0.01, 0.5) && !valid_lines(0.5, 0.54));
-    let codes = [Status::Finished, Status::Cancelled, Status::Failed, Status::Running].map(Status::exit_code);
-    assert_eq!(codes, [0, 2, 3, 3], "Tobii's ConfigurationResult: success, aborted, configuration error");
+    let statuses = [Status::Finished, Status::Cancelled, Status::Failed, Status::Running];
+    assert_eq!(statuses.map(|s| ExitCodes::Legacy.status(s)), [0, 2, 1, 1]);
+    assert_eq!(statuses.map(|s| ExitCodes::Tobii.status(s)), [0, 2, 3, 3], "Tobii's ConfigurationResult");
+    assert_eq!((ExitCodes::Legacy.argument_error(), ExitCodes::Tobii.argument_error()), (2, 1));
 }
 
 /// The tracker's current calibration, as a profile would hold it.
@@ -751,4 +753,69 @@ fn resolve_configuration_calibrates_only_without_a_profile() {
     assert_eq!(outcome.profile.as_deref(), Some("Anna"), "{}", outcome.message);
     let names = empty.names();
     assert!(names.contains(&"display") && names.contains(&"calibration") && names.contains(&"profile"));
+}
+
+/// `-R` after a move to the portrait monitor of albedo's desktop, with Garulf calibrated by
+/// `calibrated_for` (None: only the legacy NAME.setpm).
+fn resolve_on_the_portrait_monitor(calibrated_for: Option<&str>) -> Harness {
+    let (_, portrait) = albedo();
+    let desktop = Desktop { monitors: vec![portrait], current: Some(0), movable: false };
+    let mut harness =
+        Harness::new(unmapped(), vec![("display", done_with(0.0)), ("display-save", always(Action::Save))])
+            .with_desktop(desktop);
+    with_current_profile(&harness, "Garulf", 0x1234);
+    if let Some(key) = calibrated_for {
+        let calibration = LocalCalibration { calibration_id: 0x5678, ..tracker_calibration(&harness) };
+        harness.store().save_for("Garulf", Some(key), &calibration, false).unwrap();
+    }
+    harness.window().view = View { screen_px: [1440.0, 2560.0], ..FULLSCREEN_VIEW };
+    harness.options.flow = FlowKind::ResolveConfiguration;
+    harness
+}
+
+const PORTRAIT_KEY: &str = "1E6D7F5B5FC20300061E";
+
+#[test]
+fn resolve_calibrates_a_monitor_the_profile_has_no_calibration_for() {
+    let mut harness = resolve_on_the_portrait_monitor(None);
+    let outcome = harness.run();
+    assert_eq!((outcome.status, outcome.profile.as_deref()), (Status::Finished, Some("Garulf")), "{}", outcome.message);
+    assert!(harness.names().contains(&"display") && harness.names().contains(&"calibration"));
+    let store = harness.store();
+    let tracker_id = harness.state.lock().unwrap().calibration_id;
+    assert_eq!(profiles::recorded_monitor_key(&harness.options.display_record).as_deref(), Some(PORTRAIT_KEY));
+    assert!(store.has_calibration_for("Garulf", Some(PORTRAIT_KEY)).unwrap());
+    assert_eq!(store.calibration_for("Garulf", Some(PORTRAIT_KEY)).unwrap().calibration_id, tracker_id);
+    assert_eq!(store.load("Garulf").unwrap().calibration.calibration_id, 0x1234);
+}
+
+#[test]
+fn resolve_ends_after_the_display_on_a_calibrated_monitor() {
+    let mut harness = resolve_on_the_portrait_monitor(Some(PORTRAIT_KEY));
+    let outcome = harness.run();
+    assert_eq!(outcome.status, Status::Finished, "{}", outcome.message);
+    assert!(harness.names().contains(&"display") && !harness.names().contains(&"calibration"));
+    assert_eq!(outcome.message, "Display setup done");
+}
+
+#[test]
+fn resolve_with_nothing_to_do_says_so() {
+    let mut harness = Harness::new(Simulation::default(), Vec::new());
+    with_current_profile(&harness, "Garulf", 0x1234);
+    harness.options.flow = FlowKind::ResolveConfiguration;
+    let outcome = harness.run();
+    assert_eq!(outcome.status, Status::Finished, "{}", outcome.message);
+    assert!(!harness.names().contains(&"display") && !harness.names().contains(&"calibration"));
+    assert_eq!(outcome.message, "Your eye tracker is set up");
+}
+
+#[test]
+fn resolve_without_a_display_setup_fails_even_with_a_calibrated_profile() {
+    let mut harness =
+        Harness::new(unmapped(), vec![("display", done_with(0.0)), ("display-save", always(Action::Skip))]);
+    with_current_profile(&harness, "Garulf", 0x1234);
+    harness.options.flow = FlowKind::ResolveConfiguration;
+    let outcome = harness.run();
+    assert_eq!(outcome.status, Status::Failed, "{}", outcome.message);
+    assert!(outcome.message.contains("no display setup"), "{}", outcome.message);
 }

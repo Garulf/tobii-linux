@@ -248,6 +248,18 @@ impl ProfileStore {
         }
     }
 
+    /// Whether the profile holds a calibration made for the monitor: its entry in NAME.json,
+    /// or NAME.setpm when there is no monitor key. The legacy fallback does not count.
+    pub fn has_calibration_for(&self, name: &str, monitor_key: Option<&str>) -> Result<bool> {
+        match monitor_key {
+            Some(key) => {
+                let settings = self.settings(name)?;
+                Ok(settings.calibrations.get(key).is_some_and(|file| self.directory.join(file).is_file()))
+            }
+            None => Ok(self.path(name)?.is_file()),
+        }
+    }
+
     /// Stores a calibration for a monitor. A new profile's first calibration is NAME.setpm;
     /// a monitor the profile has none for gets NAME@<monitor key>.setpm.
     pub fn save_for(
@@ -527,6 +539,24 @@ mod tests {
         assert_eq!(first, store.directory.join("New.setpm"));
         assert_eq!(store.calibration_for("New", Some("DP-1")).unwrap(), calibration(4));
         assert_eq!(store.names().unwrap(), ["Garulf", "New"]);
+        let _ = std::fs::remove_dir_all(&store.directory);
+    }
+
+    #[test]
+    fn a_calibration_for_a_monitor_is_its_own_file() {
+        let store = temporary_store("has-calibration");
+        assert!(!store.has_calibration_for("Garulf", None).unwrap());
+        store.save("Garulf", &calibration(1), false).unwrap();
+        assert!(store.has_calibration_for("Garulf", None).unwrap());
+        assert!(!store.has_calibration_for("Garulf", Some("10AC4C41")).unwrap(), "the legacy file is no monitor's");
+        store.save_for("Garulf", Some("10AC4C41"), &calibration(2), false).unwrap();
+        assert!(store.has_calibration_for("Garulf", Some("10AC4C41")).unwrap());
+        store.save_for("New", Some("DP-1"), &calibration(3), false).unwrap();
+        assert!(
+            store.has_calibration_for("New", Some("DP-1")).unwrap(),
+            "a first calibration registered as NAME.setpm"
+        );
+        assert!(!store.has_calibration_for("New", Some("DP-2")).unwrap());
         let _ = std::fs::remove_dir_all(&store.directory);
     }
 

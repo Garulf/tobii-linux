@@ -188,14 +188,32 @@ impl Status {
             Status::Failed => "failed",
         }
     }
+}
 
-    /// The process exit code, Tobii's `ConfigurationResult`: 0 finished, 2 cancelled, 3
-    /// failed (1 is an argument error).
-    pub fn exit_code(self) -> i32 {
+/// The process exit codes: tobii-linux's own, or Tobii's `ConfigurationResult` when the
+/// setup was started with one of Tobii's configuration arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCodes {
+    /// 0 finished, 1 failed, 2 cancelled or an argument error.
+    Legacy,
+    /// 0 finished, 1 argument error, 2 cancelled, 3 failed.
+    Tobii,
+}
+
+impl ExitCodes {
+    pub fn status(self, status: Status) -> u8 {
+        match (status, self) {
+            (Status::Finished, _) => 0,
+            (Status::Cancelled, _) => 2,
+            (Status::Running | Status::Failed, ExitCodes::Legacy) => 1,
+            (Status::Running | Status::Failed, ExitCodes::Tobii) => 3,
+        }
+    }
+
+    pub fn argument_error(self) -> u8 {
         match self {
-            Status::Finished => 0,
-            Status::Cancelled => 2,
-            Status::Running | Status::Failed => 3,
+            ExitCodes::Legacy => 2,
+            ExitCodes::Tobii => 1,
         }
     }
 }
@@ -528,30 +546,39 @@ impl SetupFlow {
         let display_mm = [round1(area.width_mm()), round1(area.height_mm())];
         self.report("device", json!({ "display_mm": display_mm, "mapped": ds::is_mapped(Some(&area)) }));
         let wanted = self.options.display;
-        let area = if wanted == DisplayMode::Always || (wanted == DisplayMode::Auto && !ds::is_mapped(Some(&area))) {
-            self.display_step(area, &mounting)?
-        } else {
-            area
-        };
-        if !self.options.calibrate || self.configuration_complete()? {
+        let display_runs =
+            wanted == DisplayMode::Always || (wanted == DisplayMode::Auto && !ds::is_mapped(Some(&area)));
+        let area = if display_runs { self.display_step(area, &mounting)? } else { area };
+        if !self.options.calibrate {
             self.finish("Display setup done", &display_summary(&area));
             return Ok(());
         }
         if !ds::is_mapped(Some(&area)) {
             return Err(FlowError::Other("The eye tracker has no display setup; run the display setup first".into()));
         }
+        if self.configuration_complete()? {
+            let (title, text) = if display_runs {
+                ("Display setup done", display_summary(&area))
+            } else {
+                ("Your eye tracker is set up", "The display and your calibration are set up already.".to_string())
+            };
+            self.finish(title, &text);
+            return Ok(());
+        }
         self.positioning_step(self.outcome.display_written)?;
         let (outcome, profile) = self.calibration_step(&area)?;
         self.result_step(outcome.calibration, profile)
     }
 
-    /// `-R` after the display: the current profile has a calibration, so nothing is left.
+    /// `-R` after the display: the current profile has a calibration for the monitor of the
+    /// display setup as it stands now, so nothing is left.
     fn configuration_complete(&self) -> FlowResult<bool> {
         if self.options.flow != FlowKind::ResolveConfiguration {
             return Ok(false);
         }
-        let current = self.store.current()?;
-        Ok(current.is_some_and(|name| self.store.names().is_ok_and(|names| names.contains(&name))))
+        let Some(current) = self.store.current()? else { return Ok(false) };
+        let monitor_key = profiles::recorded_monitor_key(&self.options.display_record);
+        Ok(self.store.has_calibration_for(&current, monitor_key.as_deref())?)
     }
 
     fn wait_for_window(&mut self) -> FlowResult<()> {

@@ -9,7 +9,9 @@ use tobii_gaze::display as ds;
 use tobii_gaze::monitors::{self, Monitor};
 
 use crate::device::{self, Session, WouldSend};
-use crate::flow::{self, Desktop, DisplayMode, FlowError, FlowKind, OpenSession, SetupOptions, load_display_record};
+use crate::flow::{
+    self, Desktop, DisplayMode, ExitCodes, FlowError, FlowKind, OpenSession, SetupOptions, load_display_record,
+};
 use crate::handover::{self, ServiceChoice};
 use crate::simulated::{SimulatedTracker, Simulation};
 
@@ -57,7 +59,8 @@ options:
   --log FILE                   Write the steps as JSON lines to this file
   -h, --help                   Show this help
 
-exit codes: 0 done, 1 argument error, 2 cancelled, 3 failed";
+exit codes: 0 done, 1 failed, 2 cancelled or an argument error; with one of Tobii's
+arguments Tobii's: 0 done, 1 argument error, 2 cancelled, 3 failed";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Args {
@@ -113,6 +116,16 @@ fn apply_flow(args: &mut Args, flow: FlowKind) {
         FlowKind::Recalibrate | FlowKind::NewProfile | FlowKind::Guest => (DisplayMode::Never, true),
         FlowKind::DisplaySetup => (DisplayMode::Always, false),
     };
+}
+
+/// Tobii's exit codes when one of Tobii's configuration arguments appears among the
+/// arguments (valid or not), else tobii-linux's own.
+pub fn exit_codes<I: IntoIterator<Item = String>>(arguments: I) -> ExitCodes {
+    if arguments.into_iter().any(|argument| tobii_flow(&argument).is_some()) {
+        ExitCodes::Tobii
+    } else {
+        ExitCodes::Legacy
+    }
 }
 
 /// Parses the arguments after the program name.
@@ -367,6 +380,17 @@ mod tests {
         }
         for unsupported in ["-P", "-Q", "-X"] {
             assert!(parse([unsupported.to_string()]).is_err(), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn a_tobii_argument_picks_tobii_exit_codes() {
+        let codes = |arguments: &[&str]| exit_codes(arguments.iter().map(|a| a.to_string()));
+        for legacy in [&[][..], &["--display", "always"], &["--bogus"], &["--simulate", "mapped", "--dry-run"]] {
+            assert_eq!(codes(legacy), ExitCodes::Legacy, "{legacy:?}");
+        }
+        for tobii in [&["-C"][..], &["--guest"], &["-G"], &["-R", "--bogus"], &["-C", "-N"], &["--windowed", "-S"]] {
+            assert_eq!(codes(tobii), ExitCodes::Tobii, "{tobii:?}");
         }
     }
 

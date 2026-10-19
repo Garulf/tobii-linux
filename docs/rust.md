@@ -193,7 +193,11 @@ it unchanged:
   refused. `headpose` still requires `--display`;
 - `demo`: the browser demo, serving `src/tobii_linux/demo/static` compiled in;
 - `setup`: runs `tobii-linux-setup` (the GTK app, `crates/tobii-setup`) with the same
-  arguments, found beside the executable or on `PATH`.
+  arguments, found beside the executable or on `PATH`. Its exit codes are the Python
+  command's (0 finished, 1 failed, 2 cancelled or an argument error) unless one of Tobii's
+  configuration arguments (`-C`, `-N`, `-S`, `-R`, `-G`, `--guest`) appears among the
+  arguments; then they are Tobii's (0 success, 1 argument error, 2 aborted, 3 failed), as
+  the Tobii Experience app reads them.
 
 I/O: the PRP relay, the SESP pipe, TCP 4455 and the demo's HTTP server run on one
 single-threaded tokio loop (`LocalSet`), as the asyncio servers did. The tracker is
