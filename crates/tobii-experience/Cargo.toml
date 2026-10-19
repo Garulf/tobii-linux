@@ -1,0 +1,16 @@
+[package]
+name = "tobii-experience"
+description = "Tobii Experience for Linux: tray state model, service link and the GTK 4 app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+gtk = []
+
+[dependencies]
+tobii-control.workspace = true
+
+[lints]
+workspace = true

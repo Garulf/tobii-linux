@@ -1088,6 +1088,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-experience"
+version = "0.1.0"
+dependencies = [
+ "tobii-control",
+]
+
+[[package]]
 name = "tobii-gaze"
 version = "0.1.0"
 dependencies = [
