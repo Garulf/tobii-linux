@@ -17,9 +17,10 @@
 //!
 //! Writes stay behind the user: a changed display area is sent (1440) only after the user
 //! pressed Done and, unless the options allow it, confirmed saving it; the calibration is
-//! changed only once positioning ended and the calibration started. Leaving after the
+//! changed only once positioning ended and the calibration started; a guest or new-profile
+//! calibration then first tracks both eyes (3160), as Tobii's flows do. Leaving after the
 //! calibration started (Esc, Cancel, a failure the user does not retry, a closed window)
-//! puts the previous calibration back (1110). The previous calibration and display area are
+//! puts the previous calibration back (1110), and the current profile's eye with it. The previous calibration and display area are
 //! also saved to files first. With `dry_run` every write is reported instead of sent.
 //!
 //! All tracker work runs on the thread that calls [`SetupFlow::run`], never on the GTK main
@@ -36,7 +37,7 @@ use tobii_control::ControlError;
 use tobii_device::DeviceError;
 use tobii_gaze::GazeError;
 use tobii_gaze::calibration::{self as cal, Calibrator, FocusCheck, UiEvent};
-use tobii_gaze::device::LocalCalibration;
+use tobii_gaze::device::{self as gdev, Eye, LocalCalibration};
 use tobii_gaze::display::{self as ds, DisplayArea, LineSetup, MountingGeometry};
 use tobii_gaze::monitors::{self, Monitor};
 use tobii_gaze::operation::{
@@ -467,6 +468,7 @@ pub struct SetupFlow {
     session: Option<Session>,
     handover: Option<Handover>,
     calibration_before: Option<LocalCalibration>,
+    eye_before: Option<Eye>,
     move_timeout: Duration,
 }
 
@@ -491,6 +493,7 @@ impl SetupFlow {
             session: None,
             handover: None,
             calibration_before: None,
+            eye_before: None,
             move_timeout: MOVE_TIMEOUT,
         }
     }
@@ -845,6 +848,9 @@ impl SetupFlow {
         let path = cal::save_backup(&self.backup_path("calibration")?, &before, false)?;
         self.outcome.backups.push(path);
         self.calibration_before = Some(before.clone());
+        if matches!(self.options.flow, FlowKind::Guest | FlowKind::NewProfile) {
+            self.track_both_eyes()?;
+        }
         let targets = cal::calibration_targets(Some([area.width_mm(), area.height_mm()]), &cal::INTERACTIVE_POINTS);
         let mut welcome = !recalibration;
         loop {
@@ -885,6 +891,31 @@ impl SetupFlow {
         }
     }
 
+    /// Tobii's guest and new-profile flows calibrate with both eyes tracked (3160), whatever
+    /// the current profile tracks (docs/experience-app.md section 6). A cancelled calibration
+    /// puts the current profile's eye back.
+    fn track_both_eyes(&mut self) -> FlowResult<()> {
+        let current = match self.store.current()? {
+            Some(name) => Some(profiles::tracked_eye(self.store.tracked_eyes(&name)?)),
+            None => None,
+        };
+        self.send_tracked_eye(Eye::Both)?;
+        self.eye_before = current.filter(|eye| *eye != Eye::Both);
+        Ok(())
+    }
+
+    fn send_tracked_eye(&mut self, eye: Eye) -> FlowResult<()> {
+        let send = Operation::new(move |io| async move {
+            io.call(gdev::set_enabled_eye(0, eye), None).await.map(drop).map_err(OperationError::External)
+        });
+        self.calls(send)?;
+        self.report(
+            "tracked_eyes",
+            json!({ "eye": format!("{eye:?}").to_lowercase(), "dry_run": self.options.dry_run }),
+        );
+        Ok(())
+    }
+
     fn result_step(&mut self, calibration: LocalCalibration, profile: Option<String>) -> FlowResult<()> {
         let profile = match profile {
             Some(profile) => profile,
@@ -901,6 +932,7 @@ impl SetupFlow {
         self.outcome.calibration_id = Some(calibration.calibration_id);
         self.outcome.profile = Some(profile.clone());
         self.calibration_before = None;
+        self.eye_before = None;
         let values = json!({
             "profile": profile,
             "calibration_id": format!("{:#x}", calibration.calibration_id),
@@ -940,6 +972,9 @@ impl SetupFlow {
             return Ok(false);
         }
         self.channel.show(ScreenKind::Busy { title: "Putting your previous calibration back...".into() });
+        if let Some(eye) = self.eye_before.take() {
+            self.send_tracked_eye(eye)?;
+        }
         let calibration_id = before.calibration_id;
         let restore = Operation::new(move |io| async move { cal::restore_calibration(&io, &before).await });
         self.calls(restore)?;

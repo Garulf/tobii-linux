@@ -240,7 +240,8 @@ impl Drop for Harness {
     }
 }
 
-const WRITES: [u32; 6] = [
+const WRITES: [u32; 7] = [
+    gc::SET_ENABLED_EYE,
     gc::CALIBRATION_START,
     gc::CALIBRATION_CLEAR,
     gc::CALIBRATION_COLLECT_2D,
@@ -819,4 +820,65 @@ fn resolve_without_a_display_setup_fails_even_with_a_calibrated_profile() {
     let outcome = harness.run();
     assert_eq!(outcome.status, Status::Failed, "{}", outcome.message);
     assert!(outcome.message.contains("no display setup"), "{}", outcome.message);
+}
+
+/// The eyes the flow sent with 3160, in order.
+fn enabled_eyes(harness: &Harness) -> Vec<i64> {
+    let state = harness.state.lock().unwrap();
+    let eye = |message: &tobii_protocol::Message| {
+        tobii_protocol::fields::values(&message.payload).unwrap().first().and_then(|value| value.as_int()).unwrap()
+    };
+    state.log.iter().filter(|message| message.command == gc::SET_ENABLED_EYE).map(eye).collect()
+}
+
+#[test]
+fn guest_and_new_profile_track_both_eyes_before_calibrating() {
+    for (flow, answers) in
+        [(FlowKind::Guest, Vec::new()), (FlowKind::NewProfile, vec![("profile", save_profile("Anna"))])]
+    {
+        let mut harness = Harness::new(Simulation::default(), answers);
+        with_current_profile(&harness, "Garulf", 0x1234);
+        harness.store().set_tracked_eyes("Garulf", 1).unwrap();
+        harness.options.flow = flow;
+        let outcome = harness.run();
+        assert_eq!(outcome.status, Status::Finished, "{flow:?}: {}", outcome.message);
+        assert_eq!(enabled_eyes(&harness), [Eye::Both as i64], "{flow:?}");
+        let commands = harness.commands();
+        let eye = commands.iter().position(|c| *c == gc::SET_ENABLED_EYE).unwrap();
+        let start = commands.iter().position(|c| *c == gc::CALIBRATION_START).unwrap();
+        assert!(eye < start, "{flow:?}: 3160 before the calibration commands: {commands:?}");
+    }
+
+    let mut recalibration = Harness::new(Simulation::default(), Vec::new());
+    with_current_profile(&recalibration, "Garulf", 0x1234);
+    recalibration.store().set_tracked_eyes("Garulf", 1).unwrap();
+    recalibration.options.flow = FlowKind::Recalibrate;
+    assert_eq!(recalibration.run().status, Status::Finished);
+    assert!(enabled_eyes(&recalibration).is_empty(), "a recalibration keeps the profile's eye");
+}
+
+#[test]
+fn cancelled_guest_puts_the_current_profiles_eye_back() {
+    let simulation = Simulation { fail_compute_at: vec![2], ..Simulation::default() };
+    let mut harness = Harness::new(simulation, vec![("calibration-failed", always(Action::Cancel))]);
+    with_current_profile(&harness, "Garulf", 0x1234);
+    harness.store().set_tracked_eyes("Garulf", 2).unwrap();
+    harness.options.flow = FlowKind::Guest;
+    assert_eq!(harness.run().status, Status::Cancelled);
+    assert_eq!(enabled_eyes(&harness), [Eye::Both as i64, Eye::Right as i64]);
+    let commands = harness.commands();
+    assert_eq!(
+        commands[commands.len() - 3..],
+        [gc::SET_ENABLED_EYE, gc::CALIBRATION_APPLY, command::GET_DEVICE_STATUS]
+    );
+}
+
+#[test]
+fn dry_run_holds_the_tracked_eye_back() {
+    let mut harness = Harness::new(Simulation::default(), Vec::new());
+    harness.options.flow = FlowKind::Guest;
+    harness.options.dry_run = true;
+    assert_eq!(harness.run().status, Status::Finished);
+    assert!(enabled_eyes(&harness).is_empty());
+    assert!(harness.dry_run_held.lock().unwrap().contains(&gc::SET_ENABLED_EYE));
 }
