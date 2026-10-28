@@ -17,9 +17,10 @@ Recorded 2026-10-19.
   serves a private control channel on the relay port
   ([control channel](control-channel.md)).
 - **App:** `tobii-linux-experience` (`crates/tobii-experience`, GTK 4) has
-  Tobii's tray icon, tooltip and menu, the Eye tracking page, the quit dialog
-  (Quit stops the service unit), `--guest` for the Ctrl+Shift+F10 shortcut,
-  and the gaze preview as a layer-shell overlay drawn with Tobii's gradient
+  a tray icon (the project's own artwork) with Tobii's tooltips and menu, the
+  Eye tracking page, the quit dialog (Quit stops the service unit), `--guest`
+  for the Ctrl+Shift+F10 shortcut, and the gaze preview as a layer-shell
+  overlay drawn with a gradient shaped like Tobii's
   ([Tobii Experience](experience-app.md), [gaze preview](gaze-preview.md)).
   `tobii-linux-setup` takes Tobii's `-C`, `-N`, `-S`, `-R` and `-G` and
   borrows the tracker from a running service.
