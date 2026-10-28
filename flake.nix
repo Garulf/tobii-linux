@@ -66,6 +66,7 @@
         '';
         checkPhase = ''
           runHook preCheck
+          patchShebangs tools
           mkdir -p models && ln -s ${models} models/tobii-et5
           cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
