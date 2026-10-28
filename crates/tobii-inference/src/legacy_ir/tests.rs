@@ -12,7 +12,7 @@ fn layer_types(xml: &str) -> Vec<String> {
 
 #[test]
 fn hash_mismatch_is_rejected_before_translation() {
-    let target = option_env!("CARGO_TARGET_DIR").map_or_else(|| MODELS.join("../../target"), std::path::PathBuf::from);
+    let target = option_env!("CARGO_TARGET_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
     let directory = target.join(format!("tobii-inference-tests/hash-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("model.xml"), "<net version=\"4\"/>").unwrap();
