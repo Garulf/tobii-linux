@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from .model_paths import default_models_dir
 from .prp_service import DEFAULT_NAME, DEFAULT_PORT, WINE_CLOCKS
 from .usb import USBContext, USBError
 

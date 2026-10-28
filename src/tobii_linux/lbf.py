@@ -3,9 +3,15 @@
 Based on the installed runtime's file readers; not a landmark predictor.
 Tree payloads retain their original bytes because their semantics are unresolved.
 Coefficient matrices preserve decoded file values, before runtime int8 quantization.
-The readers are crates/tobii-models/src/lbf.rs.
+The readers are crates/tobii-models/src/lbf.rs; decoded_lbf_tree, which expands the
+coefficients into the decoded-lbf/ files, is crates/tobii-models/src/decoded.rs.
 """
 from ._native import lbf as _lbf
+
+LBF_MODELS = tuple(_lbf.LBF_MODELS)
+
+decoded_lbf_tree = _lbf.decoded_lbf_tree
+write_tree = _lbf.write_tree
 
 
 def _matrix(matrix):

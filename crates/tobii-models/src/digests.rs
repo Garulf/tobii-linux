@@ -1,7 +1,6 @@
-//! SHA-256 of every file the pinned Tobii runtime yields in the models/tobii-et5 layout.
+//! SHA-256 of every file in the models/tobii-et5 layout the pipeline was validated with.
 //!
-//! Generated from the committed models/tobii-et5 tree (validation reports excluded); the
-//! tests check the two agree while that tree exists.
+//! The tests compare the files of a local layout against it when one is present.
 
 pub const EXPECTED_SHA256: [(&str, &str); 107] = [
     ("alignpre/manifest.json", "f9dbc2e3c12e55875bbf2dd86957efdfb46208598af82b037b01f8d571fa42b4"),
@@ -139,4 +138,21 @@ pub const EXPECTED_SHA256: [(&str, &str); 107] = [
 
 pub fn expected_sha256(path: &str) -> Option<&'static str> {
     EXPECTED_SHA256.iter().find(|(p, _)| *p == path).map(|(_, digest)| *digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytes::sha256_hex;
+    use crate::test_util::COMMITTED;
+
+    #[test]
+    fn local_models_match_the_expected_digests() {
+        for (relative, digest) in EXPECTED_SHA256 {
+            let path = COMMITTED.join(relative);
+            if path.is_file() {
+                assert_eq!(sha256_hex(&std::fs::read(&path).unwrap()), digest, "{relative}");
+            }
+        }
+    }
 }

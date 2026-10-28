@@ -1,7 +1,6 @@
 //! tobii_linux model and asset modules: one submodule per Python module, over tobii-models.
 
-use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tobii_models::{Error, FileTree};
@@ -11,7 +10,7 @@ use crate::convert::bytes_like;
 mod face_assets;
 mod lbf;
 mod model_digests;
-
+mod model_paths;
 
 pub fn error(error: Error) -> PyErr {
     match error {
@@ -44,6 +43,7 @@ pub fn tree_dict<'py>(py: Python<'py>, tree: &FileTree) -> PyResult<Bound<'py, P
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::submodule(m, "model_paths", model_paths::register)?;
     crate::submodule(m, "model_digests", model_digests::register)?;
     crate::submodule(m, "face_assets", face_assets::register)?;
     crate::submodule(m, "lbf", lbf::register)

@@ -10,7 +10,8 @@ fn checkout() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `TOBII_LINUX_MODELS`, else the checkout's models/tobii-et5, else the installed models.
+/// `TOBII_LINUX_MODELS`, else the checkout's models/tobii-et5, else
+/// `~/.local/share/tobii-linux/models` (`$XDG_DATA_HOME/tobii-linux/models`).
 pub fn default_models() -> PathBuf {
     if let Some(configured) = std::env::var_os(MODELS_VARIABLE).filter(|value| !value.is_empty()) {
         return PathBuf::from(configured);
@@ -19,7 +20,7 @@ pub fn default_models() -> PathBuf {
     if repository.is_dir() {
         return repository;
     }
-    tobii_models::install::default_models_dir()
+    tobii_models::paths::default_models_dir()
 }
 
 /// Directories that may hold `libopenvino_c`: an `openvino` package on `PYTHONPATH` (the

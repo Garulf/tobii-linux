@@ -4,6 +4,7 @@ from itertools import groupby
 import json
 from pathlib import Path
 from tobii_linux.face_assets import read_mesh, read_fdp, read_landmark_ids, read_shapes, landmark_vertices
+from tobii_linux.lbf import LBF_MODELS, decoded_lbf_tree, write_tree
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / 'models/tobii-et5'

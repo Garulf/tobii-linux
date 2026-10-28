@@ -3,10 +3,11 @@
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use tobii_models::decoded;
 use tobii_models::lbf::{Forest, LbfModel, LvModel, Matrix};
 
-use super::ModelResult;
+use super::{ModelResult, tree_arg, tree_dict};
 use crate::convert::bytes_like;
 
 fn forest_tuple<'py>(py: Python<'py>, forest: &Forest) -> PyResult<Bound<'py, PyTuple>> {
@@ -76,11 +77,28 @@ fn quantize_matrix<'py>(
     Ok((PyBytes::new(py, &quantized), PyBytes::new(py, &scales)))
 }
 
+/// `{path: bytes}` of `decoded-lbf/`, read from an on-disk support directory.
+#[pyfunction]
+fn decoded_lbf_tree(py: Python<'_>, support: PathBuf) -> PyResult<Bound<'_, PyDict>> {
+    let tree = crate::exit::detached(py, || decoded::decoded_lbf_tree(&support)).py()?;
+    tree_dict(py, &tree)
+}
+
+#[pyfunction]
+#[pyo3(signature = (tree, root, refuse_changes=false))]
+fn write_tree(tree: &Bound<'_, PyDict>, root: PathBuf, refuse_changes: bool) -> PyResult<()> {
+    tree_arg(tree)?.write(&root, refuse_changes).py()
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    for function in
-        [wrap_pyfunction!(read_lbf, m)?, wrap_pyfunction!(read_lv, m)?, wrap_pyfunction!(quantize_matrix, m)?]
-    {
+    for function in [
+        wrap_pyfunction!(read_lbf, m)?,
+        wrap_pyfunction!(read_lv, m)?,
+        wrap_pyfunction!(quantize_matrix, m)?,
+        wrap_pyfunction!(decoded_lbf_tree, m)?,
+        wrap_pyfunction!(write_tree, m)?,
+    ] {
         m.add_function(function)?;
     }
-    Ok(())
+    m.add("LBF_MODELS", decoded::LBF_MODELS.to_vec())
 }

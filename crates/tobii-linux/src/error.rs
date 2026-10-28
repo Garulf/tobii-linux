@@ -79,9 +79,7 @@ fn device_type(error: &DeviceError) -> &'static str {
 
 fn models_type(error: &tobii_models::Error) -> &'static str {
     match error {
-        tobii_models::Error::Archive(_) => "ArchiveError",
         tobii_models::Error::Format(_) => "ValueError",
-        tobii_models::Error::Install(_) => "InstallError",
         tobii_models::Error::Io(error) => io_type(error),
     }
 }
