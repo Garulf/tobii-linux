@@ -75,12 +75,13 @@ impl D1Pose {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{MODELS, runtime};
+    use crate::test_util::{models, runtime};
 
     #[test]
     fn rejected_landmarks_are_not_fitted() {
+        let Some(models) = models() else { return };
         let Some(runtime) = runtime() else { return };
-        let pose = D1Pose::new(&runtime, &MODELS).unwrap();
+        let pose = D1Pose::new(&runtime, models).unwrap();
         let result = pose.predict_frame(&vec![0; 160 * 120], 160, 120, [30, 20, 65, 80], 0, 0.0).unwrap();
         assert_eq!(result.landmarks.normalized_points.len(), 57);
         assert!(!result.quality_accepted && result.fit.is_none());

@@ -1,8 +1,10 @@
-use super::*;
-use crate::test_util::{MODELS, runtime};
+use std::path::Path;
 
-fn installed_shape() -> Vec<Point> {
-    let shapes = tobii_models::Shapes::read(&MODELS.join("support/bdtsdata/NN/vnn_nir/init_shape.bin"), 2).unwrap();
+use super::*;
+use crate::test_util::{models, runtime};
+
+fn installed_shape(models: &Path) -> Vec<Point> {
+    let shapes = tobii_models::Shapes::read(&models.join("support/bdtsdata/NN/vnn_nir/init_shape.bin"), 2).unwrap();
     shapes.values.as_chunks::<2>().0.to_vec()
 }
 
@@ -88,7 +90,9 @@ fn degenerate_geometry_is_rejected() {
     assert!(normalize_reference_shape(&[[1.0, 1.0]; 57]).is_err());
     assert!(inverse_transform_points(&[[0.0, 0.0]], &[[0.0; 3]; 2]).is_err());
     assert!(warp_grayscale(&[0; 4], 2, 2, &[[0.0; 3]; 2], 96, 96).is_err());
-    assert!(crop_transform(&installed_shape(), [0, 0, 0, 10], 0.0, true).is_err());
+    if let Some(models) = models() {
+        assert!(crop_transform(&installed_shape(models), [0, 0, 0, 10], 0.0, true).is_err());
+    }
 }
 
 /// The crop tensor of tools/d1_input_oracle.py's inputs equals the original conversion
@@ -123,7 +127,8 @@ fn warp_matches_original_fixtures() {
 /// the NumPy reconstruction produced.
 #[test]
 fn crop_matches_original_preprocessing() {
-    let reference = normalize_reference_shape(&installed_shape()).unwrap();
+    let Some(models) = models() else { return };
+    let reference = normalize_reference_shape(&installed_shape(models)).unwrap();
     let bytes: Vec<u8> = reference.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(hex(&bytes), REFERENCE_DIGEST);
     let pixels = ramp();
@@ -141,8 +146,9 @@ fn crop_matches_original_preprocessing() {
 
 #[test]
 fn landmark_model_runs_supplied_boxes() {
+    let Some(models) = models() else { return };
     let Some(runtime) = runtime() else { return };
-    let model = D1LandmarkModel::new(&runtime, &MODELS.join("d1"), &installed_shape()).unwrap();
+    let model = D1LandmarkModel::new(&runtime, &models.join("d1"), &installed_shape(models)).unwrap();
     for roll in [0.0, 20.0, -32.0] {
         let result = model.predict_frame(&ramp(), 160, 120, [30, 20, 65, 80], roll, true).unwrap();
         assert_eq!(result.image_points.len(), 57);

@@ -57,7 +57,7 @@ impl HeadPoseProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{MODELS, runtime};
+    use crate::test_util::{models, runtime};
 
     const ALBEDO: DisplayArea = DisplayArea {
         top_left: [-296.62, 326.0, 111.82],
@@ -67,8 +67,9 @@ mod tests {
 
     #[test]
     fn blank_frames_give_invalid_samples_after_start() {
+        let Some(models) = models() else { return };
         let Some(runtime) = runtime() else { return };
-        let mut processor = HeadPoseProcessor::new(&runtime, &MODELS, ALBEDO).unwrap();
+        let mut processor = HeadPoseProcessor::new(&runtime, models, ALBEDO).unwrap();
         assert!(processor.process(&vec![0; 320 * 240], 320, 240, 5_000).is_err());
         processor.start([0.0, 0.0, 4.14], [0.0; 3]);
         let sample = processor.process(&vec![0; 320 * 240], 320, 240, 5_000).unwrap();

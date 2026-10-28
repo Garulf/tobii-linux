@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_util::{MODELS, runtime};
+use crate::test_util::{models, runtime};
 
 #[test]
 fn anchor_count_matches_network_output() {
@@ -95,8 +95,9 @@ fn original_detector_vectors() {
 
 #[test]
 fn face_finder_runs_the_network() {
+    let Some(models) = models() else { return };
     let Some(runtime) = runtime() else { return };
-    let finder = FaceFinder::new(&runtime, &MODELS.join("ff")).unwrap();
+    let finder = FaceFinder::new(&runtime, &models.join("ff")).unwrap();
     assert_eq!(finder.run(&[0; INPUT_WIDTH * INPUT_HEIGHT]).unwrap().len(), 25380);
     assert!(finder.detect(&[0; 640 * 480], 640, 480, &DetectOptions::default()).is_ok());
     assert!(finder.run(&[0; 10]).is_err());

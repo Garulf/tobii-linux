@@ -52,7 +52,18 @@ pub(crate) mod test_util {
 
     const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
-    pub static MODELS: LazyLock<PathBuf> = LazyLock::new(|| Path::new(ROOT).join("models/tobii-et5"));
+    static MODELS: LazyLock<PathBuf> = LazyLock::new(|| Path::new(ROOT).join("models/tobii-et5"));
+
+    /// The local models/tobii-et5 layout, or `None` (the test then skips) when it is absent.
+    /// The models are not part of the repository; see models/README.md.
+    pub fn models() -> Option<&'static Path> {
+        if MODELS.is_dir() {
+            Some(MODELS.as_path())
+        } else {
+            eprintln!("skipped: models/tobii-et5 is absent");
+            None
+        }
+    }
 
     /// The OpenVINO runtime from `TOBII_OPENVINO_LIBRARY` or the wheel under `.local/inference`,
     /// or `None` (the test then skips) when neither is available.

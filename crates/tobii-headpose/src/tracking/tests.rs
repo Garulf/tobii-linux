@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_util::{MODELS, runtime};
+use crate::test_util::{models, runtime};
 
 #[test]
 fn region_expands_around_centre_and_clamps() {
@@ -76,8 +76,9 @@ fn core_records_carry_the_four_aliases() {
 
 #[test]
 fn blank_frame_stays_searching() {
+    let Some(models) = models() else { return };
     let Some(runtime) = runtime() else { return };
-    let mut tracker = FaceTracker::new(&runtime, &MODELS, None, None).unwrap();
+    let mut tracker = FaceTracker::new(&runtime, models, None, None).unwrap();
     assert_eq!(tracker.recovery_timeout_ms, 800);
     let tracked = tracker.process(&vec![0; 640 * 480], 640, 480, 0).unwrap();
     assert_eq!((tracker.state, tracked.state, tracked.face), (CoreState::Searching, CoreState::Searching, None));

@@ -17,6 +17,7 @@ def neutral_fit(model, rigid=NEUTRAL):
 
 
 @unittest.skipUnless(importlib.util.find_spec('numpy'), 'Optional NumPy is not installed')
+@unittest.skipUnless((MODELS/'support').is_dir(), 'models/tobii-et5 is absent')
 class FaceWireframeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

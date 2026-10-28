@@ -94,9 +94,9 @@ mod tests {
     /// original alias filling 0x140055a20 and aggregation 0x14007a880.
     #[test]
     fn scores_match_the_original_aggregation() {
-        let path =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/tobii-et5/support/bdtsdata/NN/vnn_nir/landmarks.bin");
-        let ids: Vec<(i64, i64)> = tobii_models::face::read_landmark_ids(std::path::Path::new(path))
+        let Some(models) = crate::test_util::models() else { return };
+        let path = models.join("support/bdtsdata/NN/vnn_nir/landmarks.bin");
+        let ids: Vec<(i64, i64)> = tobii_models::face::read_landmark_ids(&path)
             .unwrap()
             .into_iter()
             .map(|(g, i)| (i64::from(g), i64::from(i)))

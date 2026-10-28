@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_util::MODELS;
+use crate::test_util::models;
 
 fn layer_types(xml: &str) -> Vec<String> {
     let document = roxmltree::Document::parse(xml).unwrap();
@@ -76,19 +76,20 @@ fn declared_shapes_are_checked() {
 /// of the translation, checked against it by comparing compiled outputs bit for bit.
 #[test]
 fn committed_networks_translate_to_the_python_graphs() {
+    let Some(models) = models() else { return };
     for (name, inputs, digest) in [
         ("alignpre", vec![1, 1, 32, 32], ALIGNPRE_DIGEST),
         ("fr", vec![1, 3, 128, 128], FR_DIGEST),
         ("ff", vec![1, 1, 192, 256], FF_DIGEST),
         ("d1", vec![1, 1, 96, 96], D1_DIGEST),
     ] {
-        let model = load(&MODELS.join(name)).unwrap();
+        let model = load(&models.join(name)).unwrap();
         assert_eq!(model.inputs, [inputs], "{name}");
         let mut combined = model.xml.clone().into_bytes();
         combined.extend(&model.weights);
         assert_eq!(sha256_hex(&combined), digest, "{name}");
     }
-    let d1 = load(&MODELS.join("d1")).unwrap();
+    let d1 = load(&models.join("d1")).unwrap();
     let types = layer_types(&d1.xml);
     let count = |kind: &str| types.iter().filter(|t| *t == kind).count();
     assert_eq!(
