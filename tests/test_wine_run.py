@@ -1,4 +1,5 @@
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -38,6 +39,14 @@ exit 3
 """
 
 
+def resolve_env_shebang(text):
+    """Nix build sandboxes have no /usr/bin/env, so point the shebang at the interpreter itself."""
+    first, _, rest = text.partition("\n")
+    if first.startswith("#!/usr/bin/env "):
+        first = "#!" + shutil.which(first.split()[1])
+    return first + "\n" + rest
+
+
 def free_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -65,7 +74,7 @@ class WineRunTest(unittest.TestCase):
     def tool(self, name, text):
         path = self.root / "bin" / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_text(resolve_env_shebang(text))
         path.chmod(0o755)
         return path
 
