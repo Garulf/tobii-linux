@@ -8,7 +8,6 @@
     packages = forAllSystems (system: let
       pkgs = import nixpkgs { inherit system; };
       lib = pkgs.lib;
-      repoModels = ./models/tobii-et5;
       bridge = import ./nix/bridge.nix { inherit pkgs; };
     in rec {
       prp-bridge = bridge.prpBridge;
@@ -53,7 +52,6 @@
         '';
         env.TOBII_OPENVINO_LIBRARY_DIR = "${lib.getLib pkgs.openvino}/lib";
         dependencies = with pkgs.python3Packages; [ numpy openvino ];
-        makeWrapperArgs = [ "--set-default" "TOBII_LINUX_MODELS" "${models}" ];
         postBuild = ''
           cargo build --release --offline --frozen -p tobii-linux --bin tobii-linux --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
         '';
@@ -61,13 +59,11 @@
           install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/tobii-linux $out/bin/tobii-linux
         '';
         postFixup = ''
-          wrapProgram $out/bin/tobii-linux --set-default TOBII_LINUX_MODELS ${models}
           ln -s ${lib.getExe tobii-setup} $out/bin/tobii-linux-setup
         '';
         checkPhase = ''
           runHook preCheck
           patchShebangs tools
-          mkdir -p models && ln -s ${models} models/tobii-et5
           cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
             -- --skip the_wrapper_starts_serve_for_the_game_and_stops_it_afterwards
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
@@ -81,11 +77,6 @@
           mainProgram = "tobii-linux";
         };
       };
-    } // lib.optionalAttrs (builtins.pathExists repoModels) {
-      modelsFromRepo = pkgs.runCommand "tobii-linux-models-from-repo" { } ''
-        mkdir -p $out
-        cp -r ${repoModels}/. $out/
-      '';
     });
     nixosModules.default = import ./nix/module.nix self;
     overlays.wine = import ./nix/wine.nix;
@@ -101,6 +92,7 @@
               headPoseService = {
                 enable = true;
                 displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
+                models = "/srv/tobii-et5";
               };
             };
             boot.loader.grub.enable = false;
@@ -112,10 +104,12 @@
       names = map (p: p.name or "") ;
       installed = builtins.elem self.packages.${system}.default.name (names machine.config.environment.systemPackages);
       ruled = builtins.elem "tobii-eye-tracker-5-udev" (names machine.config.services.udev.packages);
-      served = machine.config.systemd.user.services.tobii-head-pose.serviceConfig.ExecStart != "";
+      service = machine.config.systemd.user.services.tobii-head-pose;
+      served = service.serviceConfig.ExecStart != "";
+      modelled = service.environment.TOBII_LINUX_MODELS == "/srv/tobii-et5";
     in {
       package = self.packages.${system}.default;
-      nixos-module = assert installed && ruled && served; pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
+      nixos-module = assert installed && ruled && served && modelled; pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
     } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
       wine-run = self.packages.${system}.wine-run;
     });

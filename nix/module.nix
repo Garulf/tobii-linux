@@ -52,6 +52,18 @@ in {
           itself; see docs/game-integration-layer.md.
         '';
       };
+      models = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/home/alice/tobii-et5";
+        description = ''
+          Directory holding the models/tobii-et5 layout (alignpre, fr, ff, d1,
+          support/ and catalog.json), passed to the service as
+          TOBII_LINUX_MODELS. The models are not part of this project. With
+          null the binary's default, ~/.local/share/tobii-linux/models of the
+          user running the service, is used.
+        '';
+      };
       deviceName = lib.mkOption {
         type = lib.types.str;
         default = "ET5-LINUX";
@@ -85,6 +97,9 @@ in {
     systemd.user.services.tobii-head-pose = lib.mkIf cfg.headPoseService.enable {
       description = "Eye Tracker 5 head pose for Windows games under Wine";
       wantedBy = [ "default.target" ];
+      environment = lib.mkIf (cfg.headPoseService.models != null) {
+        TOBII_LINUX_MODELS = cfg.headPoseService.models;
+      };
       serviceConfig = {
         ExecStart = lib.escapeShellArgs ([ (lib.getExe package) ] ++ serveArguments);
         Restart = "on-failure";
