@@ -53,7 +53,7 @@
         '';
         env.TOBII_OPENVINO_LIBRARY_DIR = "${lib.getLib pkgs.openvino}/lib";
         dependencies = with pkgs.python3Packages; [ numpy openvino ];
-        makeWrapperArgs = [ "--set-default TOBII_LINUX_MODELS ${models}" ];
+        makeWrapperArgs = [ "--set-default" "TOBII_LINUX_MODELS" "${models}" ];
         postBuild = ''
           cargo build --release --offline --frozen -p tobii-linux --bin tobii-linux --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
         '';
