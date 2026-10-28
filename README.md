@@ -54,11 +54,12 @@ Probe for the tracker (no interface is claimed):
 PYTHONPATH=src python3 -m tobii_linux.cli probe
 ```
 
-Experimental head-pose session. It needs NumPy and OpenVINO, Tobii's models,
-and the display area in millimetres in Stream Engine's corner order (top-left,
-top-right, bottom-left).
-
-Then start the session:
+Experimental head-pose session. It needs NumPy and OpenVINO, Tobii's
+head-tracking models, and the display area in millimetres in Stream Engine's
+corner order (top-left, top-right, bottom-left). The models are not part of this
+project and it does not produce them. Put a models/tobii-et5 layout in
+`models/tobii-et5` (ignored by Git), in `~/.local/share/tobii-linux/models` or
+in the directory `TOBII_LINUX_MODELS` names ([models](models/README.md)):
 
 ```sh
 PYTHONPATH=src python3 -m tobii_linux.cli headpose \
@@ -171,6 +172,9 @@ hardware.tobii-eye-tracker-5.headPoseService = {
 };
 ```
 
+The service reads the models from `~/.local/share/tobii-linux/models` of the
+user it runs as; `headPoseService.models` names another directory.
+
 The flake and module evaluate (`nix flake check` includes a module
 evaluation), but no NixOS machine has run them yet.
 
@@ -181,8 +185,7 @@ evaluation), but no NixOS machine has run them yet.
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)
 - [Launching games](docs/game-launch.md), [game client transport and Wine](docs/service-transport.md), [PRP bridge](docs/prp-bridge.md), [game integration layer](docs/game-integration-layer.md), [Wine pipe listing](docs/wine-pipe-enumeration.md), [game interface](docs/game-interface.md)
-- [models](models/README.md)
-- [Managed API](docs/managed-api.md), [Linux inference](docs/linux-inference.md)
+- [Models](models/README.md), [managed API](docs/managed-api.md), [Linux inference](docs/linux-inference.md)
 
 Private analysis inputs live in `evidence/private/`, which is excluded from Git
 and from the Nix package.

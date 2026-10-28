@@ -239,17 +239,15 @@ NixOS/Wine end-to-end operation remain unverified.
 
 ### Neural model inference checkpoint
 
-- All **four** discovered model pairs are in
-  `models/tobii-et5/{alignpre,fr,ff,d1}/`. Each has XML, weights and a manifest.
-  All XML parses and every maximum weight extent equals its unpadded binary
+- The pipeline reads all **four** discovered model pairs from a local
+  `models/tobii-et5/{alignpre,fr,ff,d1}/` layout, which is not part of the
+  repository ([models](../models/README.md)). Each has XML, weights and a
+  manifest. All XML parses and every maximum weight extent equals its binary
   length. `models/tobii-et5/catalog.json` records all input/output hashes,
   tensor shapes, graph operations and supporting files.
-- All 14 additional installed dependency files are copied under
-  `models/tobii-et5/support/`. Text mesh/configurations and numeric shape files
-  are readable. LBF source data is copied unchanged; subsequent `fa`/`fc` decoding is
-  described above. `lv` and tree semantics remain unresolved.
-- Original remote directory listing is retained as
-  `evidence/private/model-files.txt`.
+- The 14 supporting files live under `models/tobii-et5/support/`. Text
+  mesh/configurations and numeric shape files are readable. `fa`/`fc` decoding
+  is described above. `lv` and tree semantics remain unresolved.
 - Remote PowerShell inventory and `certutil -hashfile` returned access denied
   during this pass. Legacy SCP succeeded. New model hashes are computed from
   local copies; do not claim an independent remote hash match for those files.
@@ -354,7 +352,8 @@ truncated copies or apply address offsets to an unverified binary version.
 ## Resume here
 
 1. Trace the earlier device-decoder-to-image-callback path to determine whether
-   any actual USB input is encrypted. Do not infer wire encryption from service licensing errors or unrelated crypto imports.
+   any actual USB input is encrypted. Do not infer wire encryption from service
+   licensing errors or unrelated crypto imports.
 2. Establish which models run for ET5 head pose and reconstruct their
    preprocessing, inference inputs/outputs, pose fitting and coordinate units.
 3. Complete and validate normal USB startup, TTP negotiation, stream selection

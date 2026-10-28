@@ -42,6 +42,7 @@ New files must be `git add`ed before a git flake build sees them.
 | `crates/tobii-protocol` | USB channel framing, TTP messages and items, typed values and the reply reader, request builders, stream ids, column sets, image frames, camera hardware info, gaze and presence stream decoding with the platmod records. Pure: no I/O, clocks or threads. | `hmac`, `md-5` |
 | `crates/tobii-usb` | nusb backend: sysfs descriptor probe, `BulkTransport` on interface 0, `UsbChannel` (vendor open/close, framed writes, demultiplexed reads) with its continuous reader thread, the raw traffic log and its replay. | `tobii-protocol`, `nusb` |
 | `crates/tobii-device` | `TrackerSession` (startup, realms, calls, hardware info, image frames), `StreamReader` and `ItemPump` (subscriptions, demultiplexing, silence and suspend checks), `DeviceClockWatch`, `ClockMapper`, `TrackerLink` with `Backoff`, reader threads (`newest`, `drained`), `usb_session`. Generic over the `Channel` trait. | `tobii-protocol`, `tobii-usb`, `rustix` |
+| `crates/tobii-models` | The user's models/tobii-et5 layout: its default location (`paths`), the SHA-256 of its files (`digests`), typed readers for the face mesh, FDP, landmark, shape and LBF files, and the expanded `decoded-lbf/` coefficients (`decoded`). No dependency on the other crates; bound as `_native.model_paths`, `model_digests`, `face_assets` and `lbf` from `tobii-py/src/models/`. | `sha2` |
 | `crates/tobii-gaze` | Gaze configuration: calibration, persistent-file and display-area requests, setting files, stimulus and blob point records, the display-area model and moving-lines wizard, EDID hints, eye positioning, calibration profiles, monitor rules and parsers. Device procedures (backup, restore, display setup, profile switching, the calibration sequence) are `Operation`s, state machines whose caller sends each request and runs each UI event; `operation::run` drives them on a `TrackerSession`. | `tobii-protocol`, `tobii-device`, `serde_json`, `sha2` |
 | `crates/tobii-service` | Game service: PRP envelopes, stream bodies and session codecs, the gaze PRP stream records, SESP framing and flatcc-shaped messages, the Wine counter clock (classifier, follower, `ServiceClock`, counter mapping), relay framing, property answers and presence cache of the PRP service, the SESP legacy position transform, the tet-tcp policy, answers and restamping. Pure apart from `ServiceClock` reading the host clocks; the asyncio servers stay in Python. | `tobii-protocol`, `tobii-device`, `rustix` |
 | `crates/tobii-inference` | Tobii's networks on OpenVINO: the IR4/IR6 to IR v11 translation, the OpenVINO C API loaded at run time (`openvino`, the crate's only unsafe code), the D1 crop, tensor, decoding and landmark model, the D1 quality aggregation and gate, and the face finder (letterbox, priors, decoding, suppression). Bound as `_native.legacy_ir`, `d1`, `d1_quality` and `face_detect` from `tobii-py/src/inference/`. | `libloading`, `roxmltree`, `serde_json`, `sha2` |
@@ -75,6 +76,7 @@ Python wrapper needs that is not a type conversion belongs in a core crate.
 | `tet_tcp.py`, `tet_tcp_service.py` (policy, answers, restamp) | `tobii_service::tet_tcp` | recording proxy (threads, router, raw log) and asyncio endpoint stay |
 | `streams.py` (reader, watches) | `tobii_device::streams` | `GazeAndImageStreams`, `serve_tracker` stay |
 | `supervisor.py` | `tobii_device::supervisor` | `TrackerLink` holds the Python callables |
+| `model_paths.py`, `model_digests.py`, `face_assets.py`, `lbf.py` (readers, `decoded_lbf_tree`) | `tobii_models::{paths, digests, face, lbf, decoded}` | `landmark_vertices` and the result dataclasses and dicts in Python |
 | `gaze_device.py` | `tobii_gaze::device` | dataclasses and enums in Python; `drive` sends the requests of native operations |
 | `calibration.py` | `tobii_gaze::calibration`, `operation` | `Calibrator.run` drives the native sequence on Python sessions and UIs; `DryRunSession` and the reports stay |
 | `calibration_profiles.py` | `tobii_gaze::profiles` | `ProfileStore` keeps the directory |
@@ -160,8 +162,8 @@ replay_events` prints every recorded frame through the demo and head-pose proces
 Still Python: the asyncio servers, the cli and the demo stay importable for the tools
 and the Python suite; the tet-tcp recording proxy (`tet_tcp.py`, used only by
 `tools/tet_tcp_probe.py`); the browser setup (`tobii_linux.setup`, replaced by the GTK
-app for `tobii-linux setup`). `pip install .` still installs the Python `tobii-linux` entry point; the Nix
-package installs the Rust binary under that name.
+app for `tobii-linux setup`). `pip install .` still installs the Python `tobii-linux`
+entry point; the Nix package installs the Rust binary under that name.
 
 ## Conventions
 
@@ -284,6 +286,7 @@ Makefile `ORACLES` list, this document) take one line per phase.
 | Face tracking and HeadPoseProcessor (done) | (in `tobii-headpose`) | `face_tracking.py`, `headpose.py`, `HeadPoseProcessor` in `driver.py` | `tobii-inference`, `tobii-headpose` | after both |
 | Gaze device and calibration, display setup (done) | `tobii-gaze` | `gaze_device.py`, `calibration.py`, `calibration_profiles.py`, `display_setup.py`, `eye_positioning.py`, `monitors.py` | `tobii-device` | all |
 | Setup app (gtk4-rs, done; `tobii-linux setup` of the binary runs it) | `tobii-setup` | `setup/`, `calibration_page.py`, `display_setup_page.py`, `simulated_tracker.py` | `tobii-gaze` API | after `tobii-gaze` has its API |
+| Models and assets (done) | `tobii-models` | `model_digests.py`, `face_assets.py`, the readers of `lbf.py` | none | all |
 | Inference (done) | `tobii-inference` | `legacy_ir.py`, `face_detect.py`, `d1.py`, `d1_quality.py` | none | all |
 | Binary (done) | `tobii-linux` (bin) | `cli.py`, `streams.GazeAndImageStreams`, `serve_tracker`, `demo/`; the Python modules stay for tools and tests | everything | last |
 
