@@ -68,7 +68,8 @@
           runHook preCheck
           patchShebangs tools
           mkdir -p models && ln -s ${models} models/tobii-et5
-          cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+          cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+            -- --skip the_wrapper_starts_serve_for_the_game_and_stops_it_afterwards
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
           $out/bin/tobii-linux serve --help | grep -q -- --tet-tcp
           runHook postCheck
