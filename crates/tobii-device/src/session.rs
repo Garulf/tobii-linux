@@ -164,9 +164,37 @@ impl<C: Channel> TrackerSession<C> {
         None
     }
 
+    /// Like [`TrackerSession::route`], but stream data after the reply is kept too.
+    fn route_streaming(&mut self, messages: Vec<Message>, request_id: u32) -> Option<Message> {
+        let mut reply = None;
+        for message in messages {
+            if reply.is_none() && message.kind == RESPONSE_KIND && message.request_id == request_id {
+                reply = Some(message);
+            } else if message.kind == STREAM_DATA_KIND {
+                self.pending_streams.push(message);
+            }
+        }
+        reply
+    }
+
     /// Sends `message` and waits for the reply with its request id; stream data arriving
     /// meanwhile goes to `pending_streams`, other messages are dropped.
     pub fn request(&mut self, message: &Message, timeout: Duration) -> Result<Option<Message>> {
+        self.await_reply(message, timeout, Self::route)
+    }
+
+    /// Like [`TrackerSession::request`], but the stream data that arrives in the same read
+    /// as the reply is kept as well, for a session whose streams keep running meanwhile.
+    pub fn request_streaming(&mut self, message: &Message, timeout: Duration) -> Result<Option<Message>> {
+        self.await_reply(message, timeout, Self::route_streaming)
+    }
+
+    fn await_reply(
+        &mut self,
+        message: &Message,
+        timeout: Duration,
+        route: fn(&mut Self, Vec<Message>, u32) -> Option<Message>,
+    ) -> Result<Option<Message>> {
         self.write(&message.encode()?)?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -175,7 +203,7 @@ impl<C: Channel> TrackerSession<C> {
                 return Ok(None);
             }
             let messages = self.receive(milliseconds(deadline - now))?;
-            if let Some(reply) = self.route(messages, message.request_id) {
+            if let Some(reply) = route(self, messages, message.request_id) {
                 return Ok(Some(reply));
             }
         }

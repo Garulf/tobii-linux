@@ -204,6 +204,46 @@ package's `bin/wine`. `tobii-linux-wine.stable` (11.0) and `.unstable` (11.19)
 are also available; `.patchedSourceCheck.<name>` only applies the patch.
 All current nixpkgs Wines read `CLOCK_BOOTTIME`.
 
+### Tobii Experience
+
+`experience.enable` runs the service the way Tobii's runs on Windows: from login,
+whether or not a game is running, with the tray app beside it
+([Tobii Experience](experience-app.md)):
+
+```nix
+hardware.tobii-eye-tracker-5 = {
+  enable = true;
+  experience.enable = true;
+};
+```
+
+This enables the `tobii-head-pose` user unit (`tobii-linux serve`) without any Wine
+setting: `displayArea` is optional, since the service reads the display area from the
+tracker, and the other `headPoseService` options keep their defaults and still apply.
+It also adds a `tobii-linux-experience` user unit that is part of
+`graphical-session.target` and starts after the service. The app's Quit stops the service
+unit; starting the app again, from the launcher entry "Tobii Experience" or as
+`tobii-linux-experience`, starts it.
+
+Sessions that reach `graphical-session.target` (GNOME, Plasma, Hyprland under uwsm) need
+nothing else. A Hyprland session started without uwsm never reaches that target, so
+start the app from the Hyprland config instead:
+
+```text
+exec-once = tobii-linux-experience
+```
+
+Tobii's guest calibration shortcut, Ctrl+Shift+F10, needs a key binding, because a
+Wayland app cannot grab global keys:
+
+```text
+bind = CTRL SHIFT, F10, exec, tobii-linux-experience --guest
+```
+
+The bind does something only while the tray shows "In use" or "Action needed", as on
+Windows. [The live checklist](experience-live-checklist.md) lists what still needs a
+check on the real tracker.
+
 ## Patched runners
 
 Results of `patches/wine/apply.sh` on current sources are in

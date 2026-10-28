@@ -8,13 +8,18 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::*;
+use tobii_device::DeviceError;
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::service::clock::{Clocks, now_us, wine_clock};
-use tobii_linux::service::{Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame};
+use tobii_linux::service::enabled::{EnabledState, not_supported};
+use tobii_linux::service::{
+    DeviceCallError, Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame,
+};
 use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
-    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, decode_names, encode_frame, error_response,
+    FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPES, GAZE_SERVICE_STREAMS, PROPERTY_DEVICE_PAUSED, decode_names,
+    display_area_notification, encode_frame, error_response, paused_notification, word_value,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
@@ -75,7 +80,7 @@ impl Fixture {
     }
 
     fn attach(&self) {
-        self.service.attach_tracker(None);
+        self.service.attach_tracker(None, None);
         self.service.publish_presence(REAL_PRESENCE_SINCE_US, i64::from(PLATMOD_AWAY));
     }
 
@@ -399,6 +404,44 @@ fn property_get_and_subscribe_keep_the_session() {
     });
 }
 
+const MOVED_AREA: [[f64; 3]; 3] = [[-300.0, 330.0, 100.0], [300.0, 330.0, 100.0], [-300.0, 10.0, -5.0]];
+
+async fn subscribe_display_area(session: &mut Session) -> tobii_service::prp_session::PropertyResponse {
+    let tag = session.next_tag();
+    let request = encode_property_subscribe_request(tag, PROPERTY_DISPLAY_AREA, COMMAND_PROPERTY_SUBSCRIBE).unwrap();
+    session.command.send_packet(&request).await;
+    decode_property_subscribe_response(&session.command.packet().await).unwrap()
+}
+
+#[test]
+fn a_new_display_area_from_the_tracker_notifies_property_1_subscribers() {
+    run(async {
+        let fixture = Fixture::default().await;
+        assert_eq!(fixture.service.display_area(), None);
+        fixture.service.attach_tracker(None, Some(ALBEDO_AREA));
+        let mut session = fixture.session().await;
+        assert_eq!(subscribe_display_area(&mut session).await.status, 0);
+        fixture.service.attach_tracker(None, Some(ALBEDO_AREA));
+        fixture.service.attach_tracker(None, Some(MOVED_AREA));
+        let moved: Vec<f64> = MOVED_AREA.iter().flatten().copied().collect();
+        assert_eq!(session.subscription.packet().await, display_area_notification(&moved).unwrap());
+        assert_eq!(fixture.service.display_area(), Some(MOVED_AREA));
+    });
+}
+
+#[test]
+fn a_configured_display_area_ignores_the_tracker() {
+    run(async {
+        let fixture = Fixture::new(Options { display_area: Some(ALBEDO_AREA), ..common::options("ET5-TEST") }).await;
+        let mut session = fixture.session().await;
+        assert_eq!(subscribe_display_area(&mut session).await.status, 0);
+        fixture.service.attach_tracker(None, Some(MOVED_AREA));
+        fixture.service.attach_tracker(None, None);
+        assert_eq!(fixture.service.display_area(), Some(ALBEDO_AREA));
+        assert_eq!(session.subscription.receive_within(Duration::from_millis(100)).await, Received::Timeout);
+    });
+}
+
 #[test]
 fn unsupported_property_subscribe_carries_a_value_block() {
     run(async {
@@ -426,9 +469,9 @@ fn every_property_subscription_matches_the_real_service() {
             ..common::options("ET5-TEST")
         };
         let fixture = Fixture::new(options).await;
-        fixture.service.attach_tracker(Some(0xBC38_1A37));
+        fixture.service.attach_tracker(Some(0xBC38_1A37), None);
         fixture.service.detach_tracker();
-        fixture.service.attach_tracker(None);
+        fixture.service.attach_tracker(None, None);
         fixture.service.publish_presence(0xD4_41C5_AAA6, i64::from(PLATMOD_AWAY));
         let mut session = fixture.session_with(Vec::new(), 2).await;
         for (command, key) in [(5, "subscribe"), (6, "unsubscribe")] {
@@ -499,6 +542,107 @@ fn presence_changes_reach_only_subscribed_clients() {
         assert_eq!(watching.subscription.packet_within(Duration::from_millis(200)).await, None);
         assert_eq!(fixture.service.counters().sent_notifications.get(), 1);
     });
+}
+
+fn state_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("tobii-linux-enabled-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory
+}
+
+#[test]
+fn enabled_state_round_trips() {
+    let directory = state_directory("round-trip");
+    let path = directory.join("nested/eye-tracking-enabled");
+    let state = EnabledState::new(path.clone());
+    assert!(state.load());
+    state.store(false).unwrap();
+    assert!(!state.load());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0\n");
+    state.store(true).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n");
+    assert!(state.load());
+    std::fs::write(&path, "garbage").unwrap();
+    assert!(state.load());
+    let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["eye-tracking-enabled"]);
+    std::fs::remove_dir_all(&directory).unwrap();
+
+    let state_file = std::path::PathBuf::from("tobii-linux/eye-tracking-enabled");
+    assert_eq!(
+        EnabledState::default_path(Some("/state"), Some("/home/u")),
+        std::path::Path::new("/state").join(&state_file)
+    );
+    let home = std::path::Path::new("/home/u/.local/state").join(&state_file);
+    assert_eq!(EnabledState::default_path(None, Some("/home/u")), home);
+    assert_eq!(EnabledState::default_path(Some(""), Some("/home/u")), home);
+}
+
+async fn paused_answer(session: &mut Session) -> Vec<u8> {
+    let tag = session.next_tag();
+    session.command.send_packet(&encode_property_request(tag, PROPERTY_DEVICE_PAUSED)).await;
+    decode_property_response(&session.command.packet().await).unwrap().block
+}
+
+#[test]
+fn disabling_without_a_tracker_session_is_stored_and_read_back() {
+    run(async {
+        let directory = state_directory("detached");
+        let path = directory.join("eye-tracking-enabled");
+        let options = Options { enabled_state: Some(path.clone()), ..common::options("ET5-TEST") };
+        let fixture = Fixture::new(options.clone()).await;
+        assert!(fixture.service.enabled());
+        let mut session = fixture.session().await;
+        assert_eq!(paused_answer(&mut session).await, word_value(0).0);
+        let tag = session.next_tag();
+        session
+            .command
+            .send_packet(
+                &encode_property_subscribe_request(tag, PROPERTY_DEVICE_PAUSED, COMMAND_PROPERTY_SUBSCRIBE).unwrap(),
+            )
+            .await;
+        session.command.packet().await;
+
+        fixture.service.set_enabled(false).await.unwrap();
+        assert!(!fixture.service.enabled());
+        assert_eq!(session.subscription.packet().await, paused_notification(true));
+        assert_eq!(paused_answer(&mut session).await, word_value(1).0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0\n");
+        fixture.service.set_enabled(false).await.unwrap();
+        assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+
+        let restarted = Fixture::new(options).await;
+        assert!(!restarted.service.enabled());
+        assert_eq!(paused_answer(&mut restarted.session().await).await, word_value(1).0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    });
+}
+
+#[test]
+fn a_state_that_cannot_be_stored_changes_nothing() {
+    run(async {
+        let directory = state_directory("unwritable");
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocker = directory.join("file");
+        std::fs::write(&blocker, "").unwrap();
+        let options =
+            Options { enabled_state: Some(blocker.join("eye-tracking-enabled")), ..common::options("ET5-TEST") };
+        let fixture = Fixture::new(options).await;
+        let mut session = fixture.session().await;
+        let outcome = fixture.service.set_enabled(false).await;
+        assert!(matches!(outcome, Err(DeviceCallError::Store(_))), "{outcome:?}");
+        assert!(fixture.service.enabled());
+        assert_eq!(paused_answer(&mut session).await, word_value(0).0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    });
+}
+
+#[test]
+fn only_not_supported_statuses_count_as_applied() {
+    let failed = |status| DeviceError::Failed { command: 3100, status, name: String::new() };
+    let applied: Vec<u32> = (0..22).filter(|&status| not_supported(&failed(status))).collect();
+    assert_eq!(applied, [9, 10, 13, 15]);
+    assert!(!not_supported(&DeviceError::Timeout { command: 3100 }));
 }
 
 async fn two_clients_receive_every_sample_with(fixture: Fixture) {

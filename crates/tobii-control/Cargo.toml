@@ -1,0 +1,17 @@
+[package]
+name = "tobii-control"
+description = "Private control channel of tobii-linux serve: status, on/off, gaze and tracker handover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tobii-gaze.workspace = true
+tobii-service.workspace = true
+
+[lints]
+workspace = true

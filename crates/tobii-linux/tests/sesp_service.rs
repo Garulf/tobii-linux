@@ -13,7 +13,8 @@ use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::service::clock::{Clocks, wine_clock};
 use tobii_linux::service::{Options, PrpService};
 use tobii_service::prp_service::{
-    FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_REPLY_PIPE, decode_names, encode_frame, encode_pipe_open,
+    DEFAULT_NAME, FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN, FRAME_REPLY_PIPE, decode_names, encode_frame,
+    encode_pipe_open,
 };
 use tobii_service::sesp::{
     CAPABILITY_HEAD_POSE, CAPABILITY_STREAM_STATUS, COMMAND_CHANNEL, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, Field,
@@ -128,9 +129,14 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let clock = wine_clock("raw", Clocks::Scripted(Arc::new(|_| 0))).unwrap();
-        let options = Options { display_area: Some(ALBEDO_AREA), tet_tcp: true, tet_tcp_port: 0, ..Options::default() };
+        let options = Options {
+            display_area: Some(ALBEDO_AREA),
+            tet_tcp: true,
+            tet_tcp_port: 0,
+            ..common::options(DEFAULT_NAME)
+        };
         let (service, port, _) = service(options, clock).await;
-        service.attach_tracker(None);
+        service.attach_tracker(None, None);
         Self { service, port }
     }
 

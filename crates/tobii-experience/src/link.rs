@@ -1,0 +1,224 @@
+//! The link to `tobii-linux serve`: one thread that keeps a control connection open and
+//! reconnects when the service goes away or restarts.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use tobii_control::{ControlClient, ControlError, GazeSample, Incoming, Request, Status};
+use tobii_gaze::calibration::TRANSFER_TIMEOUT_S;
+
+const CLIENT_NAME: &str = "experience";
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// The service's timeout for a device call without its own (`tobii_device::session::REQUEST_TIMEOUT`).
+const SERVICE_DEVICE_CALL_S: f64 = 3.0;
+/// The longest one profile apply on the service may take: 1490, 3160, 1110 (with
+/// `TRANSFER_TIMEOUT_S`) and 1490 again.
+const PROFILE_APPLY_S: f64 = 3.0 * SERVICE_DEVICE_CALL_S + TRANSFER_TIMEOUT_S;
+/// `SwitchProfile` and `SetTrackedEyes` wait for an apply already running (the one at attach)
+/// and then run their own, plus a margin for the reply.
+const PROFILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * PROFILE_APPLY_S as u64 + 2);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What the link thread reports.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkUpdate {
+    /// The latest service status, or `None` when the service is unreachable.
+    Status(Option<Status>),
+    Gaze(GazeSample),
+    /// A request the service refused or that could not be sent.
+    Failed(String),
+}
+
+/// Called on the link thread once a request was answered, refused or dropped.
+pub type Done = Box<dyn FnOnce() + Send>;
+
+/// A thread that keeps a control connection open; dropping it stops the thread.
+///
+/// The service ends a gaze subscription with its connection, so the link remembers the last
+/// `SubscribeGaze` value it was given and sends `SubscribeGaze(true)` again right after every
+/// reconnect when that value is true.
+#[derive(Debug)]
+pub struct Link {
+    requests: Sender<(Request, Option<Done>)>,
+    gaze: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Link {
+    /// Starts the thread. `on_incoming` is called from that thread: with `Status(None)` when
+    /// a connection attempt fails or the connection drops (once per outage), and with the
+    /// service's status and gaze samples while connected.
+    pub fn start(addr: SocketAddr, on_incoming: impl Fn(LinkUpdate) + Send + 'static) -> Link {
+        let (requests, queue) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let gaze = Arc::new(AtomicBool::new(false));
+        let worker = Worker { addr, on_incoming: Box::new(on_incoming), queue, stop: stop.clone(), gaze: gaze.clone() };
+        let thread = std::thread::Builder::new()
+            .name("tobii-experience-link".into())
+            .spawn(move || worker.run())
+            .expect("the OS refused to start the link thread");
+        Link { requests, gaze, stop, thread: Some(thread) }
+    }
+
+    /// Queues `request` for the link thread. Requests that are queued while the link is not
+    /// connected are dropped and reported as [`LinkUpdate::Failed`], except `SubscribeGaze`:
+    /// its value is remembered and replayed after the next connect when it is true. The
+    /// reply status arrives as [`LinkUpdate::Status`].
+    pub fn send(&self, request: Request) {
+        self.queue(request, None);
+    }
+
+    /// [`Link::send`], then `done` once the request's [`LinkUpdate`] was reported (or the
+    /// request was dropped). A link that stops first never calls it.
+    pub fn send_then(&self, request: Request, done: impl FnOnce() + Send + 'static) {
+        self.queue(request, Some(Box::new(done)));
+    }
+
+    fn queue(&self, request: Request, done: Option<Done>) {
+        if let Request::SubscribeGaze(on) = request {
+            self.gaze.store(on, Ordering::Relaxed);
+        }
+        let _ = self.requests.send((request, done));
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// How long the service may take to answer `request`: profile requests reach the device and
+/// may wait for each other, the rest answer at once.
+fn request_timeout(request: &Request) -> Duration {
+    match request {
+        Request::SwitchProfile { .. } | Request::SetTrackedEyes(_) => PROFILE_REQUEST_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
+
+struct Worker {
+    addr: SocketAddr,
+    on_incoming: Box<dyn Fn(LinkUpdate) + Send>,
+    queue: Receiver<(Request, Option<Done>)>,
+    stop: Arc<AtomicBool>,
+    gaze: Arc<AtomicBool>,
+}
+
+impl Worker {
+    fn run(self) {
+        let mut reported_outage = false;
+        while !self.stopped() {
+            if let Ok(client) = ControlClient::connect(self.addr, CLIENT_NAME, CONNECT_TIMEOUT) {
+                reported_outage = false;
+                self.serve(client);
+            }
+            if !reported_outage {
+                (self.on_incoming)(LinkUpdate::Status(None));
+                reported_outage = true;
+            }
+            self.wait_to_reconnect();
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn serve(&self, mut client: ControlClient) {
+        if self.gaze.load(Ordering::Relaxed) && !self.dispatch(&mut client, Request::SubscribeGaze(true)) {
+            return;
+        }
+        while !self.stopped() {
+            while let Ok((request, done)) = self.queue.try_recv() {
+                if self.stopped() {
+                    return;
+                }
+                let usable = self.dispatch(&mut client, request);
+                if let Some(done) = done {
+                    done();
+                }
+                if !usable {
+                    return;
+                }
+            }
+            match client.next(POLL_INTERVAL) {
+                Ok(Some(Incoming::Event(tobii_control::Event::Status(status)))) => {
+                    (self.on_incoming)(LinkUpdate::Status(Some(status)));
+                }
+                Ok(Some(Incoming::Gaze(sample))) => (self.on_incoming)(LinkUpdate::Gaze(sample)),
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Sends one request; false when the connection is no longer usable.
+    fn dispatch(&self, client: &mut ControlClient, request: Request) -> bool {
+        let timeout = request_timeout(&request);
+        match client.request(request, timeout) {
+            Ok(status) => (self.on_incoming)(LinkUpdate::Status(Some(status))),
+            Err(ControlError::Refused(reason)) => (self.on_incoming)(LinkUpdate::Failed(reason)),
+            Err(error) => {
+                (self.on_incoming)(LinkUpdate::Failed(error.to_string()));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn wait_to_reconnect(&self) {
+        let deadline = Instant::now() + RECONNECT_INTERVAL;
+        while !self.stopped() {
+            self.fail_queued_requests();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            std::thread::sleep(remaining.min(POLL_INTERVAL));
+        }
+    }
+
+    fn fail_queued_requests(&self) {
+        while let Ok((request, done)) = self.queue.try_recv() {
+            if !matches!(request, Request::SubscribeGaze(_)) {
+                let reason = format!("The service is not connected: {request:?} was dropped");
+                (self.on_incoming)(LinkUpdate::Failed(reason));
+            }
+            if let Some(done) = done {
+                done();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tobii_control::protocol::TrackedEyes;
+
+    use super::*;
+
+    #[test]
+    fn profile_requests_outlast_the_services_apply() {
+        let profile_requests =
+            [Request::SwitchProfile { name: "Other".into() }, Request::SetTrackedEyes(TrackedEyes::Left)];
+        for request in profile_requests {
+            assert_eq!(request_timeout(&request), Duration::from_secs(50), "{request:?}");
+            assert!(request_timeout(&request).as_secs_f64() > 2.0 * PROFILE_APPLY_S);
+        }
+        for request in [Request::Status, Request::SetEnabled(false), Request::Release, Request::SubscribeGaze(true)] {
+            assert_eq!(request_timeout(&request), REQUEST_TIMEOUT, "{request:?}");
+        }
+        assert_eq!(Duration::from_secs_f64(SERVICE_DEVICE_CALL_S), tobii_device::session::REQUEST_TIMEOUT);
+    }
+}

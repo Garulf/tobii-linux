@@ -229,7 +229,7 @@ fn presence(platmod: i64) -> UserPresence {
 }
 
 fn source<'a>(area: Option<&'a [f64]>, display_id: Option<&'a str>, presence: &'a UserPresence) -> PropertySource<'a> {
-    PropertySource { display_area: area, display_id, calibration_id: 0, presence, field_of_use: None }
+    PropertySource { display_area: area, display_id, calibration_id: 0, presence, field_of_use: None, paused: false }
 }
 
 fn reply(source: &PropertySource, tag: u32, property_id: u32) -> Vec<u8> {
@@ -315,6 +315,31 @@ fn zero_word_properties_and_refusals() {
     for (tag, property_id, expected) in REAL_PROPERTY_REFUSALS {
         assert_eq!(reply(&configured, tag, property_id), hex(expected), "property {property_id:#x}");
     }
+}
+
+#[test]
+fn property_4_follows_the_paused_state() {
+    let presence = UserPresence::default();
+    let mut paused = source(None, None, &presence);
+    paused.paused = true;
+    for subscribe in [false, true] {
+        let response = answer_property(&paused, 1, PROPERTY_DEVICE_PAUSED, subscribe).unwrap();
+        assert_eq!((response.status, response.block), (STATUS_OK, word_value(1).0));
+    }
+    let running = answer_property(&source(None, None, &presence), 1, PROPERTY_DEVICE_PAUSED, false).unwrap();
+    assert_eq!(running.block, word_value(0).0);
+    let (block, region) = word_value(1);
+    let expected = encode_property_notification(NOTIFICATION_TAG, PROPERTY_DEVICE_PAUSED, &block, &region);
+    assert_eq!(paused_notification(true), expected);
+}
+
+#[test]
+fn display_area_notification_carries_the_get_value() {
+    let area = real_display_area();
+    let (block, region) = display_area_value(&area).unwrap();
+    let expected = encode_property_notification(NOTIFICATION_TAG, PROPERTY_DISPLAY_AREA, &block, &region);
+    assert_eq!(display_area_notification(&area).unwrap(), expected);
+    assert!(display_area_notification(&area[..8]).is_err());
 }
 
 #[test]

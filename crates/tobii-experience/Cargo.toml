@@ -1,0 +1,56 @@
+[package]
+name = "tobii-experience"
+description = "Tobii Experience for Linux: tray state model, service link and the GTK 4 app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+gtk = ["dep:gtk4", "dep:async-channel", "dep:glow", "dep:gtk4-layer-shell", "dep:libloading"]
+
+[dependencies]
+async-channel = { workspace = true, optional = true }
+glow = { version = "0.17", optional = true }
+gtk4 = { version = "0.11", features = ["v4_14"], optional = true }
+gtk4-layer-shell = { version = "0.8.1", optional = true }
+ksni.workspace = true
+libloading = { workspace = true, optional = true }
+log.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tobii-control.workspace = true
+tobii-gaze.workspace = true
+
+[dev-dependencies]
+tobii-device.workspace = true
+
+[[bin]]
+name = "tobii-linux-experience"
+path = "src/main.rs"
+required-features = ["gtk"]
+
+[[test]]
+name = "instance"
+harness = false
+required-features = ["gtk"]
+
+[[test]]
+name = "page"
+harness = false
+required-features = ["gtk"]
+
+[[test]]
+name = "overlay"
+harness = false
+required-features = ["gtk"]
+
+# The workspace lints, except that unsafe code is denied rather than forbidden: the OpenGL
+# calls of the gaze preview in src/overlay/gl.rs are the one module allowed to use it.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+disallowed_methods = "deny"

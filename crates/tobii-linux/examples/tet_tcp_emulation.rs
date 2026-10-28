@@ -150,7 +150,7 @@ async fn run(arguments: Arguments) -> Result<(), Failure> {
     let service = PrpService::new(options, Arc::clone(&clock));
     let (device, gaze) = recorded(&arguments.device_query, &arguments.replay)?;
     let accept = service.serve(listen(&arguments.host, arguments.port).await?);
-    service.attach_tracker(Some(0));
+    service.attach_tracker(Some(0), None);
     service.attach_device(device.clone());
     let tasks = [
         tokio::task::spawn_local(publish_synthetic(service.clone(), REAL_SERVICE_PERIOD)),
@@ -172,7 +172,7 @@ async fn run(arguments: Arguments) -> Result<(), Failure> {
             log::info!(target: "tobii_linux", "interrupting the tracker session for {:.1} s", INTERRUPTION.as_secs_f64());
             service.detach_tracker();
             tokio::time::sleep(INTERRUPTION).await;
-            service.attach_tracker(Some(0));
+            service.attach_tracker(Some(0), None);
             service.attach_device(device);
             tokio::time::sleep(seconds.saturating_sub(interrupt_at + INTERRUPTION)).await;
         }

@@ -14,9 +14,9 @@ use tobii_device::streams::{
 use tobii_device::{CameraCalibration, DeviceError, StopFlag, TrackerSession};
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::error::{Error, Result};
-use tobii_linux::tracker::{FrameProcessor, LiveStreams, SharedStats, drained_items, head_pose_samples};
+use tobii_linux::tracker::{DeviceRequest, FrameProcessor, LiveStreams, SharedStats, drained_items, head_pose_samples};
 use tobii_protocol::Message;
-use tobii_protocol::commands::{Stream, command, subscribe_stream, unsubscribe_stream};
+use tobii_protocol::commands::{Stream, command, header_only_request, subscribe_stream, unsubscribe_stream};
 use tobii_protocol::frames::ImageFrame;
 use tobii_protocol::gaze::build::int64_column;
 use tobii_protocol::gaze::{GazeFrame, PLATMOD_PRESENT, PLATMOD_UNKNOWN, Presence};
@@ -206,6 +206,8 @@ fn live_streams_keep_reading_under_slow_processing() {
 struct SlowProcessor;
 
 impl FrameProcessor for SlowProcessor {
+    fn set_display_area(&mut self, _: &[[f64; 3]; 3]) {}
+
     fn start(&mut self, _: &CameraCalibration) {}
 
     fn process(&mut self, frame: &ImageFrame) -> Result<HeadPoseSample> {
@@ -321,4 +323,56 @@ fn unsubscribe_reaches_every_stream_after_a_failure() {
     let mut wanted = expected(|id, s| unsubscribe_stream(id, s).unwrap().payload).to_vec();
     wanted.sort();
     assert_eq!(unsubscribed, wanted);
+}
+
+type Replied = tokio::sync::oneshot::Receiver<std::result::Result<Message, DeviceError>>;
+
+/// An inbox holding one device status request (1490), and where its reply arrives.
+fn status_request() -> (std::sync::mpsc::Receiver<DeviceRequest>, Replied) {
+    let (requests, inbox) = std::sync::mpsc::channel();
+    let (reply, replied) = tokio::sync::oneshot::channel();
+    let build = Box::new(|id| header_only_request(id, command::GET_DEVICE_STATUS));
+    requests.send(DeviceRequest { build, timeout: Duration::from_secs(2), reply }).unwrap();
+    (inbox, replied)
+}
+
+#[test]
+fn stream_data_read_with_a_reply_reaches_the_reader_in_order() {
+    let stream = vec![gaze_message(payload("both")), gaze_message(payload("left")), gaze_message(payload("none"))];
+    let device = FakeTracker::scripted(Vec::new(), 2).trailing(command::GET_DEVICE_STATUS, stream);
+    let published = Mutex::new(Vec::new());
+    let gaze = |frame: GazeFrame| published.lock().unwrap().push(frame);
+    let (inbox, mut replied) = status_request();
+    let mut live = LiveStreams::new(ticking_clock(), &gaze);
+    live.silence = Duration::from_millis(300);
+    live.device_clock = any_order();
+    live.requests = Some(inbox);
+    let outcome = live.run(&mut unstarted(&device), &StopFlag::new(), |_| {}, |_, _| Ok(()));
+    assert!(matches!(outcome, Err(Error::Device(DeviceError::Silent { .. }))), "{outcome:?}");
+    assert_eq!(replied.try_recv().unwrap().unwrap().word4, 0);
+    let valid: Vec<u32> = published.into_inner().unwrap().iter().map(|f| f.gaze_point.valid).collect();
+    assert_eq!(valid, [1, 1, 0]);
+}
+
+#[test]
+fn a_reply_slower_than_the_silence_timeout_keeps_the_session_alive() {
+    let silence = Duration::from_millis(200);
+    let device = FakeTracker::scripted(Vec::new(), 2).slow_reply(command::GET_DEVICE_STATUS, silence * 2);
+    let (inbox, replied) = status_request();
+    let mut live = LiveStreams::new(ticking_clock(), &ignore_gaze);
+    live.silence = silence;
+    live.requests = Some(inbox);
+    let stop = StopFlag::new();
+    let stopper = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let reply = replied.blocking_recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            stop.set();
+            reply
+        })
+    };
+    let outcome = live.run(&mut unstarted(&device), &stop, |_| {}, |_, _| Ok(()));
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(stopper.join().unwrap().unwrap().word4, 0);
 }

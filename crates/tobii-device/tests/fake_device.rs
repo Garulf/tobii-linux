@@ -2,13 +2,14 @@
 //! layouts (NOT device traffic): startup, calibration, stream demultiplexing, the stall of
 //! a tracker whose endpoint is left unread, and reconnection.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tobii_device::channel::{Channel, ChannelError};
 use tobii_device::session::{HEAD_POSE_REALM_EXTRA, HEAD_POSE_REALM_KEY, TrackerSession, UNLOCK_REALM_KEY};
 use tobii_device::stop::{StopFlag, StopSignal};
-use tobii_device::streams::{ItemPump, StreamReader, StreamValue};
+use tobii_device::streams::{ItemPump, Pending, StreamReader, StreamValue};
 use tobii_device::supervisor::{Backoff, LinkHost, LinkState, TrackerLink};
 use tobii_device::{DeviceError, threads};
 use tobii_protocol::Message;
@@ -284,6 +285,18 @@ fn a_dropped_gaze_message_and_a_malformed_image_are_counted_not_yielded() {
 }
 
 #[test]
+fn stream_messages_kept_during_a_call_reach_the_pump() {
+    let (_, mut session) = started(Duration::from_secs(10));
+    let mut reader = StreamReader::new(&[Stream::Gaze], &[]);
+    let mut pump = ItemPump::new(session.take_pending_streams(), Duration::from_secs(1));
+    let stop = StopFlag::new();
+    assert!(matches!(pump.pending_item(&mut reader, &stop), Pending::Empty));
+    pump.extend(vec![gaze_message(9)]);
+    let Pending::Item(item) = pump.pending_item(&mut reader, &stop) else { panic!("no item") };
+    assert_eq!(item.stream, Stream::Gaze);
+}
+
+#[test]
 fn a_subscribed_stream_left_unread_stalls_the_tracker_and_the_session_dies() {
     let (_, mut session) = started(Duration::from_millis(400));
     let mut reader = StreamReader::new(&[Stream::Gaze], &[]);
@@ -297,6 +310,56 @@ fn a_subscribed_stream_left_unread_stalls_the_tracker_and_the_session_dies() {
     assert_eq!(error.to_string(), "The tracker sent no stream data for 0.3 s");
     assert!(session.is_dead());
     assert!(reader.unsubscribe(&mut session).unwrap().is_empty());
+}
+
+const PUMP_SILENCE: Duration = Duration::from_millis(300);
+
+fn stalled_pump(paused: &Arc<AtomicBool>) -> (TrackerSession<FakeTracker>, ItemPump) {
+    let (tracker, mut session) = started(Duration::from_secs(10));
+    let mut reader = StreamReader::new(&[Stream::Gaze], &[]);
+    reader.subscribe(&mut session).unwrap();
+    let pump = ItemPump::with_pause(session.take_pending_streams(), PUMP_SILENCE, Arc::clone(paused));
+    tracker.device.lock().unwrap().stalled = true;
+    (session, pump)
+}
+
+fn read_for(session: &mut TrackerSession<FakeTracker>, pump: &mut ItemPump, span: Duration) -> Result<(), DeviceError> {
+    let until = Instant::now() + span;
+    while Instant::now() < until {
+        let data = session.read(20)?;
+        pump.received(session, &data, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn paused_pump_stays_alive_through_silence() {
+    let paused = Arc::new(AtomicBool::new(true));
+    let (mut session, mut pump) = stalled_pump(&paused);
+    read_for(&mut session, &mut pump, PUMP_SILENCE * 2).unwrap();
+    assert!(!session.is_dead());
+}
+
+#[test]
+fn pump_counts_silence_from_resume() {
+    let paused = Arc::new(AtomicBool::new(true));
+    let (mut session, mut pump) = stalled_pump(&paused);
+    read_for(&mut session, &mut pump, PUMP_SILENCE * 2).unwrap();
+    paused.store(false, Ordering::Relaxed);
+    let resumed_at = Instant::now();
+    let error = read_for(&mut session, &mut pump, PUMP_SILENCE * 3).unwrap_err();
+    assert!(matches!(error, DeviceError::Silent { .. }), "{error}");
+    assert!(resumed_at.elapsed() >= PUMP_SILENCE, "silent only a full timeout after resuming");
+    assert!(session.is_dead());
+}
+
+#[test]
+fn a_suspended_host_still_fails_a_paused_pump() {
+    let paused = Arc::new(AtomicBool::new(true));
+    let (mut session, mut pump) = stalled_pump(&paused);
+    let error = pump.received(&mut session, &[], true).unwrap_err();
+    assert!(matches!(error, DeviceError::Suspended), "{error}");
+    assert!(session.is_dead());
 }
 
 #[test]

@@ -45,8 +45,15 @@ pub async fn service(options: Options, clock: Arc<Clock>) -> (PrpService, u16, t
     (service, port, accept)
 }
 
+/// Options that never read the host's profiles or display record.
 pub fn options(name: &str) -> Options {
-    Options { name: name.into(), ..Options::default() }
+    let absent = std::env::temp_dir().join(format!("tobii-linux-test-absent-{}", std::process::id()));
+    Options {
+        name: name.into(),
+        profiles: Some(absent.join("profiles")),
+        display_record: Some(absent.join("display-setup.json")),
+        ..Options::default()
+    }
 }
 
 /// Reads one relay frame; `None` at the end of the connection.
@@ -247,3 +254,4 @@ pub fn take_logs(level: log::Level) -> Vec<String> {
 }
 
 pub mod fake_tracker;
+pub mod link;

@@ -86,6 +86,10 @@ little-endian, payload at most 1 MiB.
 | 6 | `DISPLAY_ID` | bridge to service, on the control connection after `PIPES` | UTF-8 device instance id of the primary monitor inside the prefix, no NUL; skipped on Wine 9 and older |
 | 7 | `QPC` | bridge to service, on the control connection right after `PIPES`, then every 2 s | u64 `QueryPerformanceCounter`, u64 `QueryPerformanceFrequency`; the first frame adds UTF-8 `key=value` lines: `wine` (`wine_get_version`), `build` (`wine_get_build_id`), `host` (`wine_get_host_version`), `proton` (first line of `$STEAM_COMPAT_DATA_PATH/version`), each only when available |
 
+Types 8 to 12 belong to tobii-linux's own control channel for the experience
+app and the setup app ([control-channel.md](control-channel.md)); the bridge
+never sends them.
+
 Connections:
 
 1. **Control**: the bridge connects, sends `BRIDGE_HELLO`, receives `PIPES`

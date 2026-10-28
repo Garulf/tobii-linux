@@ -10,13 +10,18 @@ use std::time::{Duration, Instant};
 
 use tobii_device::channel::{Channel, ChannelError};
 use tobii_device::clock::HostClock;
+use tobii_gaze::device::{STATUS_CALIBRATION_ID, STATUS_STRUCT, blob_calibration_id, gaze_command};
 use tobii_linux::tracker::HostTime;
 use tobii_protocol::Message;
 use tobii_protocol::camera_info::{CameraRecord, HardwareInfo, hardware_info_response};
-use tobii_protocol::commands::{RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command};
-use tobii_protocol::fields::{encode_payload, int32_field, uint32_field};
+use tobii_protocol::commands::{
+    RESPONSE_KIND, STREAM_DATA_KIND, Stream, blob_field, command, pause_device, string_field,
+};
+use tobii_protocol::fields::{
+    Value, array_fields, encode_payload, int32_field, struct_field, triple_fixed42_fields, uint32_field, values,
+};
 use tobii_protocol::gaze::PLATMOD_PRESENT;
-use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column};
+use tobii_protocol::gaze::build::{columns_payload, int32_column, int64_column, uint32_column, vec2_column};
 use tobii_protocol::ttp::{Decoder, Field};
 
 const SALT: &[u8] = b"0123456789abcdef";
@@ -24,6 +29,9 @@ const REFUSED_STATUS: u32 = 3;
 pub const STREAMING_START_US: i64 = 900_000_000_000;
 pub const STREAMING_PERIOD_US: i64 = 30_207;
 const UNPLUGGED: &str = "LIBUSB_ERROR_NO_DEVICE";
+/// The display area every fake tracker holds unless told otherwise; exact in fixed42.
+pub const DEVICE_AREA: [[f64; 3]; 3] =
+    [[-296.625, 326.0, 111.8125], [300.375, 326.0, 111.8125], [-296.625, 10.25, -3.125]];
 
 /// The gaze stream payloads tools/linux_stream_capture.py recorded from a live tracker.
 pub fn payload(name: &str) -> Vec<u8> {
@@ -60,6 +68,15 @@ pub fn image_message_at(timestamp: i64) -> Message {
 
 pub const IMAGE_TIMESTAMP: i64 = 123_456_789;
 
+/// The combined gaze point of [`gaze_point_message`], normalized display coordinates.
+pub const GAZE_POINT: [f64; 2] = [0.25, 0.75];
+
+/// A valid combined gaze point at `timestamp`.
+pub fn gaze_point_message(timestamp: i64) -> Message {
+    let point = vec2_column(GAZE_POINT).unwrap();
+    gaze_columns_message(&[(1, int64_column(timestamp)), (27, uint32_column(1)), (28, point)])
+}
+
 pub fn image_message() -> Message {
     image_message_at(IMAGE_TIMESTAMP)
 }
@@ -91,6 +108,13 @@ fn camera() -> CameraRecord {
 fn reply(request: &Message, status: u32, items: &[Field]) -> Message {
     let payload = if items.is_empty() { Vec::new() } else { encode_payload(items).unwrap() };
     Message::new(RESPONSE_KIND, request.request_id, 0, request.command, status, payload)
+}
+
+/// A 1430 reply body: the three corners as fixed42 triples, then the empty trailing array.
+fn display_area_fields(area: [[f64; 3]; 3]) -> Vec<Field> {
+    let mut fields: Vec<Field> = area.into_iter().flat_map(|corner| triple_fixed42_fields(corner).unwrap()).collect();
+    fields.extend(array_fields(0, tobii_gaze::device::DISPLAY_AREA_TRAILER).unwrap());
+    fields
 }
 
 /// The wire id a subscribe or unsubscribe request names.
@@ -125,6 +149,15 @@ struct Device {
     stalled: bool,
     last_read: Option<Instant>,
     sent: u64,
+    trailing: Option<(u32, Vec<Message>)>,
+    slow: Option<(u32, Duration)>,
+    delayed: Option<(Instant, Vec<u8>)>,
+    pausable: bool,
+    paused: bool,
+    pause_status: u32,
+    display_area: Option<[[f64; 3]; 3]>,
+    gaze: bool,
+    calibration_id: Option<u32>,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -147,6 +180,15 @@ impl FakeTracker {
             stalled: false,
             last_read: None,
             sent: 0,
+            trailing: None,
+            slow: None,
+            delayed: None,
+            pausable: false,
+            paused: false,
+            pause_status: 0,
+            display_area: Some(DEVICE_AREA),
+            gaze: false,
+            calibration_id: None,
         })))
     }
 
@@ -156,6 +198,13 @@ impl FakeTracker {
 
     pub fn streaming() -> Self {
         Self::new(Behaviour::Streaming)
+    }
+
+    /// Streams like [`Self::streaming`], but sends no stream data while 3100 has paused it.
+    pub fn pausable() -> Self {
+        let tracker = Self::streaming();
+        tracker.device().pausable = true;
+        tracker
     }
 
     pub fn stalling(after: usize) -> Self {
@@ -179,6 +228,40 @@ impl FakeTracker {
         self
     }
 
+    /// Sends `stream` in the same read as the reply to the next `command` request.
+    pub fn trailing(self, command: u32, stream: Vec<Message>) -> Self {
+        self.device().trailing = Some((command, stream));
+        self
+    }
+
+    /// Answers every pause or resume request with this raw status and ignores it.
+    pub fn refusing_pause(self, status: u32) -> Self {
+        self.device().pause_status = status;
+        self
+    }
+
+    /// Refuses the display area getter (1430), as a tracker that holds none.
+    pub fn without_display_area(self) -> Self {
+        self.device().display_area = None;
+        self
+    }
+
+    /// Holds every reply to `command` back for `delay`.
+    pub fn slow_reply(self, command: u32, delay: Duration) -> Self {
+        self.device().slow = Some((command, delay));
+        self
+    }
+
+    /// Reports this calibration id in 1490 and takes the id of the blob a 1110 applies.
+    pub fn calibrated(self, calibration_id: u32) -> Self {
+        self.device().calibration_id = Some(calibration_id);
+        self
+    }
+
+    pub fn calibration_id(&self) -> Option<u32> {
+        self.device().calibration_id
+    }
+
     pub fn log(&self) -> Vec<Message> {
         self.device().log.clone()
     }
@@ -193,6 +276,17 @@ impl FakeTracker {
 
     pub fn stalled(&self) -> bool {
         self.device().stalled
+    }
+
+    /// Streams a gaze message at [`GAZE_POINT`] after every image.
+    pub fn gazing(self) -> Self {
+        self.device().gaze = true;
+        self
+    }
+
+    /// Clones of this tracker alive, the caller's included; a closed session holds none.
+    pub fn handles(&self) -> usize {
+        Arc::strong_count(&self.0)
     }
 }
 
@@ -211,9 +305,38 @@ impl Device {
                 reply(&request, status(self.refuse.contains(&requested_stream(&request))), &[])
             }
             command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
+            command::GET_DISPLAY_AREA => match self.display_area {
+                Some(area) => reply(&request, 0, &display_area_fields(area)),
+                None => reply(&request, REFUSED_STATUS, &[]),
+            },
+            command::GET_DEVICE_STATUS if self.calibration_id.is_some() => {
+                let id = self.calibration_id.unwrap_or_default().to_string();
+                let header = struct_field(2, STATUS_STRUCT).unwrap();
+                let entry = [header, uint32_field(STATUS_CALIBRATION_ID as u32), string_field(&id).unwrap()];
+                reply(&request, 0, &entry)
+            }
+            gaze_command::CALIBRATION_APPLY if self.calibration_id.is_some() => {
+                let fields = values(&request.payload).unwrap();
+                let Some(Value::Bytes(blob)) = fields.first() else { panic!("1110 without a blob") };
+                self.calibration_id = Some(blob_calibration_id(blob).unwrap());
+                reply(&request, 0, &[])
+            }
+            command::PAUSE_DEVICE if self.pause_status != 0 => reply(&request, self.pause_status, &[]),
+            command::PAUSE_DEVICE if self.pausable => {
+                self.paused = request.payload == pause_device(0).payload;
+                reply(&request, 0, &[])
+            }
             _ => reply(&request, 0, &[]),
         };
-        self.outgoing.push_back(answer.encode().unwrap());
+        let mut bytes = answer.encode().unwrap();
+        if let Some((_, stream)) = self.trailing.take_if(|(command, _)| *command == request.command) {
+            stream.iter().for_each(|message| bytes.extend(message.encode().unwrap()));
+        }
+        if let Some((_, delay)) = self.slow.filter(|(command, _)| *command == request.command) {
+            self.delayed = Some((Instant::now() + delay, bytes));
+            return;
+        }
+        self.outgoing.push_back(bytes);
         if request.command == command::SUBSCRIBE_STREAM {
             self.subscribed(&request);
         }
@@ -228,7 +351,7 @@ impl Device {
             }
             Behaviour::Streaming => {
                 self.streaming = true;
-                if requested_stream(request) == Stream::Presence.wire_id() {
+                if requested_stream(request) == Stream::Presence.wire_id() && !self.paused {
                     let present = presence_message(self.timestamp, PLATMOD_PRESENT);
                     self.outgoing.push_back(present.encode().unwrap());
                 }
@@ -241,6 +364,10 @@ impl Device {
     fn next_stream_message(&mut self) -> Option<Message> {
         match self.behaviour {
             Behaviour::Streaming => {
+                self.sent += 1;
+                if self.gaze && self.sent.is_multiple_of(2) {
+                    return Some(gaze_point_message(self.timestamp));
+                }
                 self.timestamp += STREAMING_PERIOD_US;
                 Some(image_message_at(self.timestamp))
             }
@@ -297,10 +424,14 @@ impl Channel for FakeTracker {
             idle(timeout_ms);
             return Ok(Vec::new());
         }
+        if let Some((_, bytes)) = device.delayed.take_if(|(at, _)| *at <= now) {
+            return Ok(bytes);
+        }
         if let Some(message) = device.outgoing.pop_front() {
             return Ok(message);
         }
         if device.streaming
+            && !device.paused
             && let Some(message) = device.next_stream_message()
         {
             let pause = device.stream_pause();

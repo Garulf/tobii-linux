@@ -493,24 +493,58 @@ from its own state.
 
 ### Linux implementation
 
-`src/tobii_linux/calibration_profiles.py` keeps profiles as files: a profile
-is `NAME.setpm` in the `calibration.setpm` layout (version 4, kind 1, size,
-id, blob) under `$XDG_DATA_HOME/tobii-linux/profiles` (default
-`~/.local/share/tobii-linux/profiles`), the active name is in `current`
-beside them, and names follow the Windows rules.
+`ProfileStore` (`crates/tobii-gaze/src/profiles.rs`, wrapped by
+`src/tobii_linux/calibration_profiles.py`) keeps profiles as files under
+`$XDG_DATA_HOME/tobii-linux/profiles` (default
+`~/.local/share/tobii-linux/profiles`). The layout is this project's choice,
+not Tobii's:
+
+| File | Holds |
+| --- | --- |
+| `NAME.setpm` | the calibration in the `calibration.setpm` layout (version 4, kind 1, size, id, blob); a profile exists when this file does |
+| `NAME.json` | `{"tracked_eyes": 0, "calibrations": {"<monitor key>": "<file>.setpm"}}`: Tobii's `TrackedEyes` (0 both, 1 left, 2 right) and which file serves which monitor |
+| `NAME@<monitor key>.setpm` | the calibration for another monitor |
+| `current` | the name of the active profile |
+
+The monitor key is the record's `monitor.edid_id` (the EDID id in hex) when it
+was read, else its `monitor.key` (the output name the desktop reports, `DP-1`),
+both as `tobii-linux-setup` records them in
+`$XDG_DATA_HOME/tobii-linux/display-setup.json`
+(`recorded_monitor_key`, `crates/tobii-gaze/src/profiles.rs`); the record's
+`connector` field is not used for it; characters other than letters,
+digits, `-` and `_` become `_` in a file name. A profile's first calibration
+is `NAME.setpm`, which stays the calibration of the monitor it was made on and
+serves every monitor without one of its own. A profile without `NAME.json`
+tracks both eyes. Names follow the Windows rules, so `@` and `.` cannot occur
+in a name and `NAME@...` files never list as profiles.
 
 - `ProfileStore`: `names`, `load`, `save` (refuses to overwrite unless asked),
-  `current`, `set_current`.
+  `current`, `set_current`, `tracked_eyes`, `set_tracked_eyes`,
+  `calibration_for(name, monitor)` (that monitor's file, else `NAME.setpm`),
+  `save_for(name, monitor, ...)`, and `delete`, which removes `NAME.setpm`,
+  `NAME.json` and every `NAME@*.setpm` and refuses the current profile and
+  `Guest` (Tobii's guest profile is never listed and cannot be deleted,
+  docs/experience-app.md section 6).
 - `save_from_device(session, store, name)`: the read-only backup (1490, 1100,
   1490) into the store, then the verification reads.
 - `switch(session, store, name, eye=Eye.BOTH)`: reads the device id (1490);
   if it differs from the profile's, sends 3160 with the eye and 1110 with the
-  blob, as the engine does; reads the id again and, on a real session,
-  requires the profile's id and records the profile as current. With a
-  `DryRunSession` the writes are reported instead. Unlike the engine it skips
-  both writes when the device already holds the profile's calibration, as the
-  runtime's start check does; profiles do not store tracked eyes, so the eye
-  is always both unless the caller passes another.
+  blob of `NAME.setpm`, as the engine does; reads the id again and, on a real
+  session, requires the profile's id and records the profile as current. With
+  a `DryRunSession` the writes are reported instead. Unlike the engine it
+  skips both writes when the device already holds the profile's calibration,
+  as the runtime's start check does. `switch_with` (Rust) takes the monitor
+  key, can force both writes (`force`), and can send 3160 even when the ids
+  match (`always_set_eye`); `switch` and the Python binding set neither.
+- `tobii-linux serve` applies the current profile with `switch_with` whenever
+  a tracker session starts, with the eye from `NAME.json` and the calibration
+  for the recorded monitor, and on the control channel's `switch_profile` and
+  `set_tracked_eyes` (docs/control-channel.md). It always sends 3160 with the
+  profile's eye and sends 1110 only when the device reports another calibration
+  id (`set_tracked_eyes` sends both), so a profile that `tobii-linux-setup` or
+  `profiles switch` made current with other tracked eyes reaches the device on
+  the next attach, as the engine puts calibration and tracked eyes on the
+  device at every start.
 
 `tools/gaze_calibrate.py`:
 

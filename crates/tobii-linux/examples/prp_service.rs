@@ -74,7 +74,7 @@ async fn serve(arguments: Arguments) -> std::io::Result<()> {
     };
     let service = PrpService::new(options, Arc::clone(&clock));
     if arguments.synthetic {
-        service.attach_tracker(None);
+        service.attach_tracker(None, None);
         service.publish_presence(now_us(&clock), i64::from(PLATMOD_PRESENT));
     }
     let listener = listen(&arguments.host, arguments.port).await?;

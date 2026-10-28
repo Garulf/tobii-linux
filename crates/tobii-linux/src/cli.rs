@@ -2,8 +2,9 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tobii_device::streams::HostSuspendWatch;
 use tobii_device::supervisor::{Backoff, LinkHost, LinkState, TrackerLink};
@@ -16,6 +17,7 @@ use crate::args::{Exit, OptionSpec, Parser, help_for};
 use crate::error::{Error, Result};
 use crate::pyjson::{self, Json, object};
 use crate::service::clock::{Clocks, ServiceTime, WINE_CLOCKS, wine_clock};
+use crate::service::enabled::EnabledState;
 use crate::service::{Corners, Event, Options, PrpService, list_repr, listen};
 use crate::tracker::{FrameProcessor, HostTime, ModelProcessor, ServiceFeed, serve_tracker};
 
@@ -27,17 +29,16 @@ pub const COMMANDS: [&str; 5] = ["probe", "demo", "setup", "headpose", "serve"];
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const DISPLAY_VALUES: usize = 9;
 
-fn session_options() -> Vec<OptionSpec> {
-    vec![
-        OptionSpec::floats("--display", DISPLAY_VALUES).required(),
-        OptionSpec::text("--models"),
-        OptionSpec::int("--channel"),
-        OptionSpec::int("--index"),
-    ]
+fn display_option() -> OptionSpec {
+    OptionSpec::floats("--display", DISPLAY_VALUES)
+}
+
+fn session_options(display: OptionSpec) -> Vec<OptionSpec> {
+    vec![display, OptionSpec::text("--models"), OptionSpec::int("--channel"), OptionSpec::int("--index")]
 }
 
 fn serve_options() -> Vec<OptionSpec> {
-    let mut options = session_options();
+    let mut options = session_options(display_option());
     options.extend([
         OptionSpec::text("--host"),
         OptionSpec::int("--port"),
@@ -61,10 +62,10 @@ pub fn display_area(corners: &Corners) -> DisplayArea {
     DisplayArea { top_left: corner(corners[0]), top_right: corner(corners[1]), bottom_left: corner(corners[2]) }
 }
 
-/// Options shared by the head-pose session and the service.
+/// Options shared by the head-pose session and the service; only `serve` may omit `--display`.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub corners: Corners,
+    pub corners: Option<Corners>,
     pub models: PathBuf,
     pub channel: i64,
     pub index: i64,
@@ -73,7 +74,7 @@ pub struct Session {
 impl Session {
     fn from(values: &crate::args::Values) -> Self {
         Self {
-            corners: corners(&values.floats("--display").expect("required")),
+            corners: values.floats("--display").map(|values| corners(&values)),
             models: values.text("--models").map_or_else(crate::paths::default_models, PathBuf::from),
             channel: values.int("--channel").unwrap_or(0),
             index: values.int("--index").unwrap_or(0),
@@ -157,7 +158,8 @@ pub fn sample_json(sample: &tobii_headpose::pipeline::HeadPoseSample) -> Json {
 fn headpose(session: &Session) -> Result<ExitCode> {
     use std::io::Write;
     let (_, mut tracker) = session.open()?;
-    let mut processor = ModelProcessor::load(&session.models, display_area(&session.corners))?;
+    let corners = session.corners.expect("headpose requires --display");
+    let mut processor = ModelProcessor::load(&session.models, display_area(&corners))?;
     let mut stdout = std::io::stdout();
     crate::tracker::head_pose_samples(&mut tracker, &mut processor, |sample| {
         writeln!(stdout, "{}", pyjson::dumps(&sample_json(&sample)))?;
@@ -182,11 +184,15 @@ impl Serve {
         let session = Session::from(values);
         let options = Options {
             name: values.text("--name").unwrap_or(DEFAULT_NAME).into(),
-            display_area: Some(session.corners),
+            display_area: session.corners,
             display_id: values.text("--display-id").map(String::from),
             gaze: !values.flag("--no-gaze"),
             tet_tcp: values.flag("--tet-tcp"),
             compensate_sesp_position: values.text("--sesp-positions").unwrap_or("prp") == "prp",
+            enabled_state: Some(EnabledState::default_path(
+                std::env::var("XDG_STATE_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            )),
             ..Options::default()
         };
         Self {
@@ -196,6 +202,121 @@ impl Serve {
             options,
             wine_clock: values.text("--wine-clock").unwrap_or("auto").into(),
         }
+    }
+}
+
+/// How often a wait on the gate looks at the process-wide stop signal.
+const GATE_STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Lends the tracker to another program (`tobii-linux-setup`) through the control channel.
+///
+/// While the gate is held the running session stops and no new one opens USB. Sessions take
+/// a [`UsbClaim`] before opening the tracker and drop it after closing it, so a holder can
+/// wait in [`ReleaseGate::closed`] until USB is free.
+#[derive(Debug)]
+pub struct ReleaseGate {
+    held: Mutex<bool>,
+    changed: Condvar,
+    usb: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ReleaseGate {
+    fn default() -> Self {
+        Self { held: Mutex::new(false), changed: Condvar::new(), usb: tokio::sync::watch::Sender::new(false) }
+    }
+}
+
+impl ReleaseGate {
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set(&self, held: bool) {
+        *self.lock() = held;
+        self.changed.notify_all();
+    }
+
+    /// Stops the running session and keeps new ones from opening the tracker.
+    pub fn hold(&self) {
+        self.set(true);
+    }
+
+    pub fn open(&self) {
+        self.set(false);
+    }
+
+    pub fn is_held(&self) -> bool {
+        *self.lock()
+    }
+
+    /// Whether a session holds the tracker's USB device.
+    pub fn usb_open(&self) -> bool {
+        *self.usb.borrow()
+    }
+
+    /// Waits until the gate is open, then claims USB until the claim is dropped; `None` when
+    /// `stop` is set first.
+    pub fn wait_open(&self, stop: &dyn StopSignal) -> Option<UsbClaim<'_>> {
+        let mut held = self.lock();
+        loop {
+            if stop.is_set() {
+                return None;
+            }
+            if !*held {
+                self.usb.send_replace(true);
+                return Some(UsbClaim(self));
+            }
+            held = self.changed.wait_timeout(held, GATE_STOP_POLL).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// Waits up to `timeout` until the gate is held or `stop` is set; true when either is.
+    fn wait_held(&self, stop: &dyn StopSignal, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut held = self.lock();
+        loop {
+            if *held || stop.is_set() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let slice = remaining.min(GATE_STOP_POLL);
+            held = self.changed.wait_timeout(held, slice).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// Returns once no session holds USB.
+    pub async fn closed(&self) {
+        let mut usb = self.usb.subscribe();
+        let _ = usb.wait_for(|open| !open).await;
+    }
+}
+
+/// A session's hold on the tracker's USB device, taken from [`ReleaseGate::wait_open`].
+#[derive(Debug)]
+pub struct UsbClaim<'a>(&'a ReleaseGate);
+
+impl Drop for UsbClaim<'_> {
+    fn drop(&mut self) {
+        self.0.usb.send_replace(false);
+    }
+}
+
+/// A session's stop: the process-wide one, or the gate being held.
+struct SessionStop<'a> {
+    stop: &'a dyn StopSignal,
+    gate: &'a ReleaseGate,
+}
+
+impl StopSignal for SessionStop<'_> {
+    fn is_set(&self) -> bool {
+        self.stop.is_set() || self.gate.is_held()
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        self.gate.wait_held(self.stop, timeout)
     }
 }
 
@@ -209,6 +330,12 @@ pub struct ServiceLink<'a, C> {
     pub clock: HostTime,
     pub feed: &'a ServiceFeed,
     pub events: mpsc::UnboundedSender<Event>,
+    /// The service's pause flag, set while eye tracking is off.
+    pub paused: Arc<AtomicBool>,
+    /// The service's release gate; sessions open the tracker only while it is open.
+    pub gate: Arc<ReleaseGate>,
+    /// The configured display area; each session reads the tracker's when `None`.
+    pub display_area: Option<Corners>,
 }
 
 impl<C> std::fmt::Debug for ServiceLink<'_, C> {
@@ -222,15 +349,31 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
 
     fn on_state(&mut self, state: LinkState, detail: &str) -> Result<()> {
         let _ = self.events.send(Event::Detach);
+        let detail = if state == LinkState::Lost && self.gate.is_held() { "Released to a client" } else { detail };
         log::info!("tracker {}: {detail}", state.name());
         Ok(())
     }
 
     fn attempt(&mut self, stop: &dyn StopSignal, opened: &mut dyn FnMut()) -> Result<()> {
+        let gate = Arc::clone(&self.gate);
+        let Some(_usb) = gate.wait_open(stop) else { return Ok(()) };
         let mut session = (self.open)()?;
         opened();
+        let (requests, inbox) = std::sync::mpsc::channel();
+        let _ = self.events.send(Event::Requests(requests));
         let suspend = Box::new(HostSuspendWatch::default());
-        serve_tracker(&mut session, self.processor, self.clock.clone(), self.feed, stop, Some(suspend))
+        let paused = Arc::clone(&self.paused);
+        serve_tracker(
+            &mut session,
+            self.processor,
+            self.clock.clone(),
+            self.feed,
+            &SessionStop { stop, gate: &gate },
+            Some(suspend),
+            Some(inbox),
+            paused,
+            self.display_area,
+        )
     }
 
     fn now_s(&mut self) -> f64 {
@@ -245,7 +388,10 @@ fn rustix_monotonic() -> i64 {
 }
 
 /// The feed of one service: every callback posts an event to the service's loop.
-pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: bool) -> ServiceFeed {
+///
+/// Gaze frames are always posted, for the control channel; whether games get gaze streams
+/// is the service's `gaze` option.
+pub fn service_feed(events: &mpsc::UnboundedSender<Event>, tet_tcp: bool) -> ServiceFeed {
     let post = |events: &mpsc::UnboundedSender<Event>| {
         let events = events.clone();
         move |event: Event| {
@@ -256,9 +402,11 @@ pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: 
     let (gaze_post, device, device_stream) = (post(events), post(events), post(events));
     ServiceFeed {
         sample: Some(Box::new(move |s| sample(Event::Sample(s)))),
-        gaze: gaze.then(|| Box::new(move |frame| gaze_post(Event::Gaze(Box::new(frame)))) as Box<_>),
+        gaze: Some(Box::new(move |frame| gaze_post(Event::Gaze(Box::new(frame))))),
         presence: Some(Box::new(move |time_us, value| presence(Event::Presence(time_us, value)))),
-        started: Some(Box::new(move |calibration_id| started(Event::Attach(calibration_id)))),
+        started: Some(Box::new(move |calibration_id, display_area| {
+            started(Event::Attach(calibration_id, display_area))
+        })),
         device: tet_tcp.then(|| Box::new(move |replies| device(Event::Device(Box::new(replies)))) as Box<_>),
         device_stream: tet_tcp.then(|| {
             Box::new(move |message: &tobii_protocol::Message, time_us| {
@@ -276,7 +424,8 @@ pub fn service_feed(events: &mpsc::UnboundedSender<Event>, gaze: bool, tet_tcp: 
 fn serve(arguments: &Serve) -> Result<ExitCode> {
     crate::logger::install(log::Level::Info, crate::logger::TimeFormat::Milliseconds);
     let clock = wine_clock(&arguments.wine_clock, Clocks::Host).expect("checked by the parser");
-    let processor = ModelProcessor::load(&arguments.session.models, display_area(&arguments.session.corners))?;
+    let replaced_per_session = arguments.session.corners.unwrap_or_default();
+    let processor = ModelProcessor::load(&arguments.session.models, display_area(&replaced_per_session))?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, run_service(arguments, clock, Box::new(processor)))
@@ -306,7 +455,8 @@ async fn run_service(
         let service = service.clone();
         tokio::task::spawn_local(async move { service.follow(received).await })
     };
-    let feed = service_feed(&events, arguments.options.gaze, arguments.options.tet_tcp);
+    let feed = service_feed(&events, arguments.options.tet_tcp);
+    let (paused, gate) = (service.pause_flag(), service.release_gate());
     let stop = StopFlag::new();
     let (finished, done) = tokio::sync::oneshot::channel::<(u64, u64)>();
     let link_thread = {
@@ -317,7 +467,16 @@ async fn run_service(
             let mut link = TrackerLink::new(Backoff::default());
             let processor = processor.as_mut();
             let mut open = || session.open().map(|(_, tracker)| tracker);
-            let mut host = ServiceLink { open: &mut open, processor, clock: host_clock, feed: &feed, events };
+            let mut host = ServiceLink {
+                open: &mut open,
+                processor,
+                clock: host_clock,
+                feed: &feed,
+                events,
+                paused,
+                gate,
+                display_area: session.corners,
+            };
             link.run(&mut host, &stop);
             let _ = finished.send((link.sessions(), link.failures()));
         })?
@@ -407,7 +566,9 @@ pub fn parse(prog: &str, args: &[String]) -> std::result::Result<Command, Exit> 
             (Command::Probe, unknown)
         }
         "headpose" => {
-            let (values, unknown) = subparser(prog, "headpose", HEADPOSE_HELP, session_options()).parse_known(rest)?;
+            let (values, unknown) =
+                subparser(prog, "headpose", HEADPOSE_HELP, session_options(display_option().required()))
+                    .parse_known(rest)?;
             (Command::Headpose(Session::from(&values)), unknown)
         }
         "serve" => {

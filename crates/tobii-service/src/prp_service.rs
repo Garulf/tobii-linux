@@ -28,6 +28,12 @@ pub const FRAME_REPLY_PIPE: u32 = 4;
 pub const FRAME_MESSAGE: u32 = 5;
 pub const FRAME_DISPLAY_ID: u32 = 6;
 pub const FRAME_QPC: u32 = 7;
+/// First frame of a control connection (docs/control-channel.md); tobii-linux's own, not Tobii's.
+pub const FRAME_CONTROL_HELLO: u32 = 8;
+pub const FRAME_CONTROL_REQUEST: u32 = 9;
+pub const FRAME_CONTROL_REPLY: u32 = 10;
+pub const FRAME_CONTROL_EVENT: u32 = 11;
+pub const FRAME_CONTROL_GAZE: u32 = 12;
 pub const MAX_FRAME: usize = 1 << 20;
 pub const DEFAULT_PORT: u16 = 7760;
 pub const DEFAULT_NAME: &str = "ET5-LINUX";
@@ -47,11 +53,13 @@ pub const GAZE_SERVICE_STREAMS: [u32; 5] =
 /// client decoder except connect (0x180055780, operation 10).
 pub const ERROR_BODY_WORDS: usize = 4;
 pub const PROPERTY_MODEL: u32 = 8;
-/// Power save active (2), device paused (4), exclusive mode (5), calibration active (7) and
-/// 0x10: the real service answered subscribe with 0 (and get, where tried: 2, 4, 5). The
-/// game layer drops its notification subscriptions when one of them is refused, and its
-/// reconnect then stalls re-subscribing the refused one.
-pub const PROPERTY_ZERO_WORDS: [u32; 5] = [2, 4, 5, 7, 0x10];
+/// Power save active (2), exclusive mode (5), calibration active (7) and 0x10: the real
+/// service answered subscribe with 0 (and get, where tried: 2, 5). The game layer drops its
+/// notification subscriptions when one of them is refused, and its reconnect then stalls
+/// re-subscribing the refused one.
+pub const PROPERTY_ZERO_WORDS: [u32; 4] = [2, 5, 7, 0x10];
+/// Whether the device is paused (command 3100); the real service answered 0 while running.
+pub const PROPERTY_DEVICE_PAUSED: u32 = 4;
 pub const PROPERTY_CALIBRATION_ID: u32 = 6;
 pub const PROPERTY_TRACK_BOX: u32 = 0xF;
 pub const PROPERTY_FIELD_OF_USE: u32 = 0x11;
@@ -370,6 +378,8 @@ pub struct PropertySource<'a> {
     pub presence: &'a UserPresence,
     /// Field of use of the client's connect request; `None` without a subscription.
     pub field_of_use: Option<i32>,
+    /// Whether the tracker is paused because eye tracking is disabled.
+    pub paused: bool,
 }
 
 impl PropertySource<'_> {
@@ -396,6 +406,7 @@ impl PropertySource<'_> {
             }
             PROPERTY_MODEL if !subscribe => string_value(MODEL_NAME).map(Some),
             id if PROPERTY_ZERO_WORDS.contains(&id) => Ok(Some(word_value(0))),
+            PROPERTY_DEVICE_PAUSED => Ok(Some(word_value(u32::from(self.paused)))),
             PROPERTY_USER_PRESENCE if subscribe && self.presence.value.is_some() => {
                 self.presence.value_block().map(Some)
             }
@@ -404,12 +415,25 @@ impl PropertySource<'_> {
     }
 }
 
+/// Operation 2 for property 4 subscribers once the device is paused or resumed.
+pub fn paused_notification(paused: bool) -> Vec<u8> {
+    let (block, region) = word_value(u32::from(paused));
+    encode_property_notification(NOTIFICATION_TAG, PROPERTY_DEVICE_PAUSED, &block, &region)
+}
+
+/// Operation 2 for property 1 subscribers once the display area changes: the same value a
+/// get answers.
+pub fn display_area_notification(corners: &[f64]) -> Result<Vec<u8>> {
+    let (block, region) = display_area_value(corners)?;
+    Ok(encode_property_notification(NOTIFICATION_TAG, PROPERTY_DISPLAY_AREA, &block, &region))
+}
+
 /// Value of a property for a get, or for a subscribe (command 5), or a refusal.
 ///
 /// Served: display area and display id when configured, the model name, properties 2
-/// (power save active), 4 (device paused) and 5 (exclusive mode), all 0 as the real service
-/// sent them, and user presence for subscribes only (the real service refused the plain
-/// get).
+/// (power save active) and 5 (exclusive mode), both 0 as the real service sent them, 4
+/// (device paused) from the source, and user presence for subscribes only (the real service
+/// refused the plain get).
 pub fn answer_property(
     source: &PropertySource,
     tag: u32,

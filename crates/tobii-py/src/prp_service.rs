@@ -204,6 +204,7 @@ fn answer_property<'py>(
         calibration_id,
         presence: &presence,
         field_of_use,
+        paused: false,
     };
     let response = service::answer_property(&source, u32_arg(tag)?, masked_u32(property_id)?, subscribe).py()?;
     Ok(property_tuple(py, &response))

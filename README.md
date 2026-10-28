@@ -175,12 +175,28 @@ hardware.tobii-eye-tracker-5.headPoseService = {
 The service reads the models from `~/.local/share/tobii-linux/models` of the
 user it runs as; `headPoseService.models` names another directory.
 
+For the Tobii Experience app (tray icon, on/off, the Eye tracking page and
+the gaze preview), which runs the same service from login whether or not a
+game is running and starts the app with the graphical session:
+
+```nix
+hardware.tobii-eye-tracker-5.experience.enable = true;
+```
+
+Sessions without `graphical-session.target` (Hyprland without uwsm) start it
+with `exec-once = tobii-linux-experience`; Tobii's guest shortcut becomes
+`bind = CTRL SHIFT, F10, exec, tobii-linux-experience --guest`
+([launching games](docs/game-launch.md#tobii-experience)). The app has not run
+against a real tracker yet; [the live checklist](docs/experience-live-checklist.md)
+lists what to check.
+
 The flake and module evaluate (`nix flake check` includes a module
 evaluation), but no NixOS machine has run them yet.
 
 ## Documents
 
 - [Project status](docs/project-status.md), [Rust core](docs/rust.md), [browser demo](docs/demo.md), [setup flow](docs/setup-flow.md), [display setup](docs/display-setup.md), [gaze calibration](docs/gaze-calibration.md)
+- [Tobii Experience](docs/experience-app.md), [control channel](docs/control-channel.md), [gaze preview](docs/gaze-preview.md), [live checklist](docs/experience-live-checklist.md)
 - [USB startup, streams and frames](docs/usb-streams.md), [TTP replies](docs/ttp-replies.md), [USB protocol](docs/usb-protocol.md), [transport](docs/usb-transport-static.md)
 - [Face detection](docs/face-detection.md), [tracking loop](docs/face-tracking.md), [face assets and LBF](docs/face-assets.md)
 - [Pose fitting](docs/pose-fitting.md), [head-pose output](docs/head-pose-output.md), [geometry stage](docs/pose-geometry.md)

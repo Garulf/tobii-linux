@@ -14,6 +14,8 @@
 //! tobii_service::prp_service; this module runs them on a single-threaded tokio loop.
 
 pub mod clock;
+pub mod control;
+pub mod enabled;
 pub mod hub;
 pub mod link;
 pub mod sesp;
@@ -23,27 +25,36 @@ pub mod tet_tcp;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use tobii_device::DeviceError;
+use tobii_gaze::error::GazeError;
+use tobii_gaze::operation::{
+    Action, External, Input, LogRecord, LogValue, Operation, OperationError, OperationResult, Step,
+};
+use tobii_gaze::profiles::{ProfileStore, default_display_record};
 use tobii_headpose::pipeline::HeadPoseSample;
-use tobii_protocol::Message;
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
+use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
 use tobii_service::prp_service::{
-    self as decisions, FRAME_BRIDGE_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES, FRAME_QPC, FRAME_REPLY_PIPE,
-    GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS, LICENSED_SUBSCRIPTIONS, PropertySource,
-    STATUS_CONNECTION_FAILED, STATUS_INSUFFICIENT_LICENSE, STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED,
-    UserPresence, encode_names,
+    self as decisions, FRAME_BRIDGE_HELLO, FRAME_CONTROL_HELLO, FRAME_DISPLAY_ID, FRAME_PIPE_OPEN, FRAME_PIPES,
+    FRAME_QPC, FRAME_REPLY_PIPE, GAZE_SERVICE_STREAMS, GAZE_STREAMS, INTERNAL_URL_SCHEME, LICENSED_STREAMS,
+    LICENSED_SUBSCRIPTIONS, PROPERTY_DEVICE_PAUSED, PropertySource, STATUS_CONNECTION_FAILED,
+    STATUS_INSUFFICIENT_LICENSE, STATUS_INVALID_PARAMETER, STATUS_NOT_SUBSCRIBED, UserPresence,
+    display_area_notification, encode_names, paused_notification,
 };
 use tobii_service::prp_session::{
     COMMAND_CHANNEL, COMMAND_CONNECT, COMMAND_PROPERTY_SUBSCRIBE, COMMAND_PROPERTY_UNSUBSCRIBE, COMMAND_STREAM_START,
     COMMAND_TIMESYNC, CommandRequest, CommandResponse, ConnectResponse, HandshakeInfo, OPERATION_PROPERTY_GET,
-    PropertyResponse, ResponseBody, SERVER_PIPE_PREFIX, STATUS_NOT_SUPPORTED, STATUS_OK, SUBSCRIPTION_CHANNEL,
-    TIMESYNC_CHANNEL, decode_client_hello, decode_client_pid, decode_command_request, decode_property_request,
-    decode_property_subscribe_request, encode_command_response, encode_handshake_ack, encode_handshake_info,
-    encode_property_response, encode_property_subscribe_response, split_packets,
+    PROPERTY_DISPLAY_AREA, PropertyResponse, ResponseBody, SERVER_PIPE_PREFIX, STATUS_NOT_SUPPORTED, STATUS_OK,
+    SUBSCRIPTION_CHANNEL, TIMESYNC_CHANNEL, decode_client_hello, decode_client_pid, decode_command_request,
+    decode_property_request, decode_property_subscribe_request, encode_command_response, encode_handshake_ack,
+    encode_handshake_info, encode_property_response, encode_property_subscribe_response, split_packets,
 };
 use tobii_service::prp_streams::{
     PRP_GAZE_ORIGIN, PRP_GAZE_POINT, PRP_RESPONSIVE_GAZE_POINT, PlatmodRecord, prp_record, stream_packet,
@@ -52,8 +63,10 @@ use tobii_service::qpc_clock::{Basis, ClockSwitch, CounterMapping, QpcClockFollo
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use crate::tracker::DeviceReplies;
+use crate::cli::ReleaseGate;
+use crate::tracker::{DeviceReplies, DeviceRequest};
 use clock::{Clock, now_us, readings};
+use enabled::EnabledState;
 use hub::Hub;
 use link::{Ended, Frames, Link, Outcome, peer_repr, refused};
 
@@ -73,6 +86,7 @@ pub type Corners = [[f64; 3]; 3];
 pub struct Options {
     pub name: String,
     pub serial: Option<String>,
+    /// Overrides the display area the tracker holds.
     pub display_area: Option<Corners>,
     pub display_id: Option<String>,
     pub gaze: bool,
@@ -80,6 +94,13 @@ pub struct Options {
     pub tet_tcp_host: String,
     pub tet_tcp_port: u16,
     pub compensate_sesp_position: bool,
+    /// Where the on/off state is kept; `None` keeps it in memory, enabled at start.
+    pub enabled_state: Option<PathBuf>,
+    /// The profiles directory; `None` uses the default location.
+    pub profiles: Option<PathBuf>,
+    /// The display setup record naming the monitor whose calibration a profile applies;
+    /// `None` uses the default location.
+    pub display_record: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -94,6 +115,9 @@ impl Default for Options {
             tet_tcp_host: "127.0.0.1".into(),
             tet_tcp_port: tobii_service::tet_tcp::COMMAND_PORT,
             compensate_sesp_position: true,
+            enabled_state: None,
+            profiles: None,
+            display_record: None,
         }
     }
 }
@@ -101,13 +125,51 @@ impl Default for Options {
 /// What a tracker session delivers to the service, in order, from its own threads.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Attach(Option<u32>),
+    /// A session started, with the device's calibration id and the display area it uses.
+    Attach(Option<u32>, Option<Corners>),
     Detach,
     Sample(HeadPoseSample),
     Gaze(Box<GazeFrame>),
     Presence(i64, i64),
     Device(Box<DeviceReplies>),
     DeviceStream(Box<Message>, i64),
+    /// Where the session that just started takes device requests.
+    Requests(std::sync::mpsc::Sender<DeviceRequest>),
+}
+
+/// Why [`PrpService::device_call`] got no reply, or [`PrpService::set_enabled`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceCallError {
+    #[error("No tracker session is running")]
+    NotAttached,
+    #[error(transparent)]
+    Device(DeviceError),
+    #[error("The tracker session ended before replying")]
+    Dropped,
+    #[error("Could not store the eye tracking state: {0}")]
+    Store(#[source] std::io::Error),
+}
+
+impl External for DeviceCallError {
+    fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+fn log_value(value: &LogValue) -> String {
+    match value {
+        LogValue::Int(n) => n.to_string(),
+        LogValue::Float(x) => x.to_string(),
+        LogValue::Bool(flag) => flag.to_string(),
+        LogValue::Text(text) => text.clone(),
+        LogValue::StimulusPoints(points) => format!("{} point(s)", points.len()),
+    }
+}
+
+fn log_record(record: &LogRecord) {
+    let values: Vec<String> =
+        record.values.iter().map(|(name, value)| format!("{name}={}", log_value(value))).collect();
+    log::info!("{} {}", record.kind, values.join(" "));
 }
 
 /// Service-clock microseconds as the game's QueryPerformanceCounter microseconds.
@@ -183,7 +245,8 @@ pub struct Counters {
 struct Inner {
     name: String,
     serial: String,
-    display_area: Option<Corners>,
+    display_override: bool,
+    display_area: Cell<Option<Corners>>,
     display_id: Option<String>,
     reported_display_id: RefCell<Option<String>>,
     clock: Arc<Clock>,
@@ -205,6 +268,19 @@ struct Inner {
     presence: Cell<UserPresence>,
     tracker_attached: Cell<bool>,
     calibration_id: Cell<u32>,
+    device: RefCell<Option<std::sync::mpsc::Sender<DeviceRequest>>>,
+    enabled_state: Option<EnabledState>,
+    paused: Arc<AtomicBool>,
+    profiles: ProfileStore,
+    display_record: PathBuf,
+    /// The device holds the current profile's calibration, as the last apply found.
+    profile_matches: Cell<bool>,
+    /// Serializes profile applies on the tracker.
+    profile_lock: tokio::sync::Mutex<()>,
+    controls: RefCell<Vec<Rc<control::ControlConnection>>>,
+    control_keys: Cell<u64>,
+    release_gate: Arc<ReleaseGate>,
+    release_holder: Cell<Option<u64>>,
 }
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
@@ -258,6 +334,10 @@ pub fn gaze_package(frame: &GazeFrame, stream: u32) -> Option<Vec<u8>> {
     stream_packet(&prp_record(&record), 0, true).ok().flatten()
 }
 
+fn flat(area: &Corners) -> Vec<f64> {
+    area.iter().flatten().copied().collect()
+}
+
 fn word_response(tag: u32, command: u32, status: i32, value: i32) -> CommandResponse {
     CommandResponse { tag, command, status, body: ResponseBody::Word(value) }
 }
@@ -279,10 +359,13 @@ impl PrpService {
         } else {
             (None, None)
         };
+        let enabled_state = options.enabled_state.clone().map(EnabledState::new);
+        let enabled = enabled_state.as_ref().is_none_or(EnabledState::load);
         Self(Rc::new(Inner {
             serial: options.serial.clone().unwrap_or_else(|| options.name.clone()),
             name: options.name,
-            display_area: options.display_area,
+            display_override: options.display_area.is_some(),
+            display_area: Cell::new(options.display_area),
             display_id: options.display_id,
             reported_display_id: RefCell::new(None),
             follower: RefCell::new(QpcClockFollower::default()),
@@ -304,6 +387,20 @@ impl PrpService {
             presence: Cell::new(UserPresence::default()),
             tracker_attached: Cell::new(false),
             calibration_id: Cell::new(0),
+            device: RefCell::new(None),
+            enabled_state,
+            paused: Arc::new(AtomicBool::new(!enabled)),
+            profiles: options.profiles.map_or_else(ProfileStore::default_location, ProfileStore::new),
+            display_record: options.display_record.unwrap_or_else(|| {
+                let get = |name: &str| std::env::var(name).ok();
+                default_display_record(get("XDG_DATA_HOME").as_deref(), get("HOME").as_deref())
+            }),
+            profile_matches: Cell::new(false),
+            profile_lock: tokio::sync::Mutex::new(()),
+            controls: RefCell::new(Vec::new()),
+            control_keys: Cell::new(0),
+            release_gate: Arc::new(ReleaseGate::default()),
+            release_holder: Cell::new(None),
         }))
     }
 
@@ -323,8 +420,29 @@ impl PrpService {
         &self.0.counters
     }
 
+    /// The configured display area, else the one the tracker holds; `None` when neither exists.
+    pub fn display_area(&self) -> Option<Corners> {
+        self.0.display_area.get()
+    }
+
     pub fn presence(&self) -> UserPresence {
         self.0.presence.get()
+    }
+
+    /// Whether eye tracking is on; off pauses the tracker for every client.
+    pub fn enabled(&self) -> bool {
+        !self.0.paused.load(Ordering::SeqCst)
+    }
+
+    /// Set while eye tracking is off; tracker sessions pause the device when they start
+    /// with it set and do not take its silence for a lost tracker.
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0.paused)
+    }
+
+    /// The gate through which control clients borrow the tracker; tracker sessions wait on it.
+    pub fn release_gate(&self) -> Arc<ReleaseGate> {
+        Arc::clone(&self.0.release_gate)
     }
 
     pub fn tracker_attached(&self) -> bool {
@@ -389,41 +507,159 @@ impl PrpService {
     /// Applies one event of the tracker session.
     pub fn apply(&self, event: Event) {
         match event {
-            Event::Attach(calibration_id) => self.attach_tracker(calibration_id),
+            Event::Attach(calibration_id, display_area) => self.attach_tracker(calibration_id, display_area),
             Event::Detach => self.detach_tracker(),
             Event::Sample(sample) => self.0.hub.publish(&sample),
             Event::Gaze(frame) => {
                 if let Some(hub) = &self.0.gaze_hub {
                     hub.publish(&frame);
                 }
+                self.publish_control_gaze(&frame);
             }
             Event::Presence(time_us, value) => self.publish_presence(time_us, value),
             Event::Device(replies) => self.attach_device(*replies),
             Event::DeviceStream(message, time_us) => self.publish_device_stream(&message, time_us),
+            Event::Requests(sender) => self.set_device(Some(sender)),
+        }
+    }
+
+    /// Where device requests go; `None` while no session runs.
+    pub fn set_device(&self, sender: Option<std::sync::mpsc::Sender<DeviceRequest>>) {
+        *self.0.device.borrow_mut() = sender;
+    }
+
+    /// Sends the request `build` makes through the running tracker session and waits for
+    /// the reply, which fails on a nonzero status or when none arrives within `timeout`.
+    /// A missing reply ends the whole tracker session, as any unanswered call does, so
+    /// `timeout` must leave the device ample time.
+    pub async fn device_call(
+        &self,
+        build: impl FnOnce(u32) -> Result<Message, ProtocolError> + Send + 'static,
+        timeout: Duration,
+    ) -> Result<Message, DeviceCallError> {
+        let Some(sender) = self.0.device.borrow().clone() else { return Err(DeviceCallError::NotAttached) };
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        sender
+            .send(DeviceRequest { build: Box::new(build), timeout, reply })
+            .map_err(|_| DeviceCallError::NotAttached)?;
+        match replied.await {
+            Ok(outcome) => outcome.map_err(DeviceCallError::Device),
+            Err(_) => Err(DeviceCallError::Dropped),
+        }
+    }
+
+    /// Turns eye tracking on or off for every client, as Tobii's EyeTrackerToggle does: the
+    /// state is stored, the pause flag flipped and property 4 subscribers notified. The
+    /// running tracker session pauses (3100 with 1) or resumes (3100 with 0) the device when
+    /// it sees the flag change, and a session that starts later applies it first. A state
+    /// that cannot be stored changes nothing.
+    pub async fn set_enabled(&self, enabled: bool) -> Result<(), DeviceCallError> {
+        if let Some(state) = &self.0.enabled_state {
+            state.store(enabled).map_err(DeviceCallError::Store)?;
+        }
+        let was_paused = self.0.paused.swap(!enabled, Ordering::SeqCst);
+        if was_paused == enabled {
+            self.notify(PROPERTY_DEVICE_PAUSED, &paused_notification(!enabled));
+            log::info!("eye tracking {}", if enabled { "enabled" } else { "disabled" });
+            self.broadcast_status();
+        }
+        Ok(())
+    }
+
+    fn notify(&self, property_id: u32, notification: &[u8]) {
+        let subscriptions: Vec<Rc<Subscription>> = self.0.subscriptions.borrow().values().cloned().collect();
+        for subscription in subscriptions {
+            if subscription.properties.borrow().contains(&property_id) {
+                subscription.connection.send(notification);
+                self.0.counters.sent_notifications.set(self.0.counters.sent_notifications.get() + 1);
+            }
+        }
+    }
+
+    /// Drives an operation that only sends requests (profile switching) on the running session.
+    pub async fn run_operation<T>(
+        &self,
+        mut operation: Operation<T, DeviceCallError>,
+    ) -> OperationResult<T, DeviceCallError> {
+        let start = Instant::now();
+        let mut input = Input::Start;
+        loop {
+            let action = match operation.resume(input, start.elapsed().as_secs_f64()) {
+                Step::Finished(result) => return result,
+                Step::Action(action) => action,
+            };
+            input = match action {
+                Action::Call(call) => {
+                    let timeout =
+                        call.timeout_s.map_or(tobii_device::session::REQUEST_TIMEOUT, Duration::from_secs_f64);
+                    let reply = self.device_call(move |id| Ok(call.request(id)), timeout).await;
+                    match reply.and_then(|reply| {
+                        tobii_protocol::fields::values(&reply.payload)
+                            .map_err(|error| DeviceCallError::Device(error.into()))
+                    }) {
+                        Ok(values) => Input::Replied(values),
+                        Err(error) => Input::Failed(error),
+                    }
+                }
+                Action::Check => Input::Done,
+                Action::Log(record) => {
+                    log_record(&record);
+                    Input::Done
+                }
+                other => {
+                    return Err(OperationError::Gaze(GazeError::Value(format!("The service cannot drive {other:?}"))));
+                }
+            };
         }
     }
 
     /// A tracker session is running: accept clients, as the real server starts listening.
-    pub fn attach_tracker(&self, calibration_id: Option<u32>) {
+    /// Without a configured display area the service takes the session's. The current
+    /// profile is then put on the tracker, as the EyeX engine's
+    /// `TrySetCalibrationAndProfileSettings` does when it starts.
+    pub fn attach_tracker(&self, calibration_id: Option<u32>, display_area: Option<Corners>) {
         if let Some(id) = calibration_id {
             self.0.calibration_id.set(id);
+        }
+        if !self.0.display_override {
+            self.set_tracker_display_area(display_area);
         }
         if !self.0.tracker_attached.get() {
             log::info!("tracker attached; accepting game clients (calibration id {:#x})", self.0.calibration_id.get());
         }
         self.0.tracker_attached.set(true);
+        self.broadcast_status();
+        self.apply_current_profile();
+    }
+
+    /// Stores the tracker's display area and notifies property 1 subscribers when it changed.
+    fn set_tracker_display_area(&self, display_area: Option<Corners>) {
+        if self.0.display_area.replace(display_area) == display_area {
+            return;
+        }
+        let Some(area) = display_area else {
+            log::info!("the tracker holds no display area");
+            return;
+        };
+        log::info!("display area from the tracker: {area:?}");
+        match display_area_notification(&flat(&area)) {
+            Ok(notification) => self.notify(PROPERTY_DISPLAY_AREA, &notification),
+            Err(error) => log::warn!("no display area notification: {error}"),
+        }
     }
 
     /// The tracker is gone: close every client connection and refuse new ones.
     ///
     /// The real service shuts its server down when the device is removed or the host goes
     /// to sleep, destroying every command, subscription and timesync client, and listens
-    /// again once the device is re-added; clients reconnect.
+    /// again once the device is re-added; clients reconnect. Control connections stay.
     pub fn detach_tracker(&self) {
         if self.0.tracker_attached.get() {
             log::info!("tracker detached; closing {} client connection(s)", self.0.connections.borrow().len());
         }
         self.0.tracker_attached.set(false);
+        self.0.profile_matches.set(false);
+        self.set_device(None);
         let connections = self.0.connections.borrow().clone();
         for connection in connections {
             connection.link.close();
@@ -442,6 +678,7 @@ impl PrpService {
         if let Some(tet_tcp) = &self.0.tet_tcp {
             tet_tcp.detach();
         }
+        self.broadcast_status();
     }
 
     /// One platmod presence record on the service clock; pushes operation 2 when due.
@@ -453,13 +690,7 @@ impl PrpService {
             return;
         }
         let Ok(notification) = presence.notification() else { return };
-        let subscriptions: Vec<Rc<Subscription>> = self.0.subscriptions.borrow().values().cloned().collect();
-        for subscription in subscriptions {
-            if subscription.properties.borrow().contains(&PROPERTY_USER_PRESENCE) {
-                subscription.connection.send(&notification);
-                self.0.counters.sent_notifications.set(self.0.counters.sent_notifications.get() + 1);
-            }
-        }
+        self.notify(PROPERTY_USER_PRESENCE, &notification);
         log::info!("user presence {} since {}", presence.value.unwrap_or_default(), presence.since_us);
     }
 
@@ -476,9 +707,9 @@ impl PrpService {
         }
     }
 
-    /// The display area the game's legacy module got from the device, else the configured one.
+    /// The display area the game's legacy module got from the device, else the service's.
     pub fn legacy_display_area(&self) -> Option<Corners> {
-        self.0.tet_tcp.as_ref().and_then(|tet_tcp| tet_tcp.device_display_area()).or(self.0.display_area)
+        self.0.tet_tcp.as_ref().and_then(|tet_tcp| tet_tcp.device_display_area()).or(self.display_area())
     }
 
     fn stop_stream(&self, subscription: &Subscription, stream: u32) {
@@ -662,7 +893,7 @@ impl PrpService {
         subscribe: bool,
         subscription: Option<&Subscription>,
     ) -> Outcome<PropertyResponse> {
-        let corners: Option<Vec<f64>> = self.0.display_area.map(|area| area.iter().flatten().copied().collect());
+        let corners: Option<Vec<f64>> = self.display_area().as_ref().map(flat);
         let reported = self.0.reported_display_id.borrow().clone();
         let display_id = self.0.display_id.clone().filter(|id| !id.is_empty()).or(reported);
         let presence = self.0.presence.get();
@@ -672,6 +903,7 @@ impl PrpService {
             calibration_id: self.0.calibration_id.get(),
             presence: &presence,
             field_of_use: subscription.map(|s| s.field_of_use.get()),
+            paused: self.0.paused.load(Ordering::SeqCst),
         };
         Ok(decisions::answer_property(&source, tag, property_id, subscribe)?)
     }
@@ -787,7 +1019,8 @@ impl PrpService {
 
     /// One relay connection from the bridge: its control connection or one relayed pipe.
     pub async fn handle(&self, stream: TcpStream) {
-        let peer = peer_repr(stream.peer_addr().ok());
+        let address = stream.peer_addr().ok();
+        let peer = peer_repr(address);
         let (reader, writer) = stream.into_split();
         let link = Link::spawn(writer);
         let mut frames = Frames::new(reader, link.clone());
@@ -798,6 +1031,7 @@ impl PrpService {
                     link.frame(FRAME_PIPES, &encode_names(&self.pipe_names())?);
                     self.serve_bridge(&peer, &link, &mut frames).await
                 }
+                FRAME_CONTROL_HELLO => control::serve(self, link.clone(), &mut frames, &payload, address).await,
                 FRAME_PIPE_OPEN => {
                     let (client_pid, pipe) = decisions::decode_pipe_open(&payload)?;
                     if !self.0.tracker_attached.get() {
@@ -978,7 +1212,7 @@ impl PrpService {
         })
     }
 
-    /// Disconnects every client and bridge.
+    /// Disconnects every client, control connection and bridge.
     pub fn close(&self) {
         self.detach_tracker();
         if let Some(tet_tcp) = &self.0.tet_tcp {
@@ -988,6 +1222,7 @@ impl PrpService {
         for bridge in bridges {
             bridge.link.close();
         }
+        self.close_controls();
     }
 
     /// Applies the events of a tracker session until their sender is dropped.

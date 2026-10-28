@@ -196,7 +196,7 @@ fn live_session<C: Channel>(
 /// The USB session of `index` and `channel`, with the bus and address the status shows.
 pub fn usb_opener(index: i64, channel: i64) -> OpenSession<tobii_usb::UsbChannel> {
     Box::new(move || {
-        let session = crate::cli::Session { corners: [[0.0; 3]; 3], models: PathBuf::new(), channel, index };
+        let session = crate::cli::Session { corners: None, models: PathBuf::new(), channel, index };
         let (device, tracker) = session.open()?;
         Ok((vec![("bus".into(), device.bus.into()), ("address".into(), device.address.into())], tracker))
     })
