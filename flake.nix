@@ -153,6 +153,7 @@
         displayArea = [ (-296.62) 326 111.82 300.38 326 111.82 (-296.62) 10.27 (-3.1) ];
       };
       experienceMachine = machineWith { experience.enable = true; };
+      quietMachine = machineWith { experience = { enable = true; banner = false; autoSetup = false; }; };
       userUnits = machine: machine.config.systemd.user.services;
       execStart = machine: (userUnits machine).tobii-head-pose.serviceConfig.ExecStart;
       names = map (p: p.name or "") ;
@@ -171,10 +172,13 @@
         && builtins.elem "tobii-head-pose.service" app.after
         && nixpkgs.lib.hasSuffix "/bin/tobii-linux-experience --service 127.0.0.1:7760 --service-unit tobii-head-pose.service"
           app.serviceConfig.ExecStart;
+      experienceQuiet = nixpkgs.lib.hasSuffix "--service-unit tobii-head-pose.service --no-banner --no-auto-setup"
+        (userUnits quietMachine).tobii-linux-experience.serviceConfig.ExecStart;
     in {
       package = self.packages.${system}.default;
       experience = self.packages.${system}.tobii-experience;
-      nixos-module = assert installed && ruled && served && deviceArea && modelled && noApp && experienceServed && experienceStarted;
+      nixos-module = assert installed && ruled && served && deviceArea && modelled && noApp && experienceServed && experienceStarted
+        && experienceQuiet;
         pkgs.runCommand "tobii-linux-nixos-module-eval" { } "touch $out";
     } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
       wine-run = self.packages.${system}.wine-run;

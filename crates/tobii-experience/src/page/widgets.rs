@@ -14,7 +14,7 @@ use tobii_control::{Request, TrackedEyes};
 
 use super::style::{self, Icon, Paint, Segment};
 use super::{
-    Availability, BOTH_EYES, BannerAction, BannerKind, DISABLE_DELAY, EYES_BODY, EYES_TITLE, GazeCapability,
+    Availability, BOTH_EYES, Banner, BannerAction, BannerKind, DISABLE_DELAY, EYES_BODY, EYES_TITLE, GazeCapability,
     IMPROVE_BODY, IMPROVE_BUTTON, IMPROVE_TITLE, LEFT_EYE, NEW_PROFILE_BUTTON, OFF_TEXT, ON_TEXT, PREVIEW_BODY,
     PREVIEW_TITLE, PROFILE_BODY, PROFILE_TITLE, PageAction, PageState, ProfileList, RIGHT_EYE, SCREEN_BODY,
     SCREEN_BUTTON, SCREEN_TITLE, SWITCH_TITLE, SetupFlow, UNDO_TEXT, availability, banner, gaze_capability, page_state,
@@ -22,6 +22,7 @@ use super::{
 };
 use crate::app::{AppEvent, Controller, PAGE_HEIGHT, PAGE_TITLE, PAGE_WIDTH, WeakController};
 use crate::guest::{OnExit, SetupResult, setup_result};
+use crate::status::DeviceStatus;
 
 /// Work that ends on another thread and comes back to the page.
 pub(crate) enum PageEvent {
@@ -47,6 +48,8 @@ pub(crate) struct PageModel {
     /// Tobii's `IsPaused` busy marker, held by every command in flight.
     busy: Cell<u32>,
     preview: Cell<bool>,
+    /// The app already started the setup by itself in this run.
+    auto_setup_done: Cell<bool>,
     /// The tracked-eyes fold-out; navigation does not reset it.
     eyes_open: Cell<bool>,
     /// The value a click asked for, shown until its request is answered.
@@ -72,6 +75,11 @@ impl Controller {
     /// Tobii's `TrackingDeviceState` for the latest service status.
     pub fn page_state(&self) -> PageState {
         page_state(self.device_status(), self.status().as_ref())
+    }
+
+    /// The banner the page shows now: none while tracking, or with the banner turned off.
+    pub fn page_banner(&self) -> Option<Banner> {
+        banner(self.page_state()).filter(|_| self.shows_banner())
     }
 
     pub fn gaze_capability(&self) -> GazeCapability {
@@ -141,6 +149,25 @@ pub(crate) fn on_service_update(controller: &Controller) {
         controller.set_settings(settings);
     }
     refresh(controller);
+    auto_setup(controller);
+}
+
+/// Tobii's licence page: once it is accepted, an `InvalidConfiguration` tracker starts the
+/// setup that resolves it (`-R`). Linux has no licence page, so the app does this the first
+/// time a status says nothing is set up, once per run.
+fn auto_setup(controller: &Controller) {
+    let model = controller.page_model();
+    if model.auto_setup_done.get()
+        || !controller.auto_setup()
+        || controller.quitting()
+        || controller.page_busy()
+        || controller.device_status() != DeviceStatus::InvalidConfiguration
+    {
+        return;
+    }
+    model.auto_setup_done.set(true);
+    log::info!("nothing is set up ({:?}); starting the setup", controller.page_state());
+    start_setup(controller, SetupFlow::ResolveConfiguration);
 }
 
 pub(crate) fn on_page_event(controller: &Controller, event: PageEvent) {
@@ -720,7 +747,7 @@ impl PageView {
                 controller.set_preview_requested(button.is_active());
             }
         });
-        let fix = on(|controller| match banner(controller.page_state()).and_then(|banner| banner.button) {
+        let fix = on(|controller| match controller.page_banner().and_then(|banner| banner.button) {
             Some((_, BannerAction::Enable)) => set_enabled(controller, true),
             Some((_, BannerAction::Setup(flow))) => start_setup(controller, flow),
             None => {}
@@ -761,7 +788,7 @@ impl PageView {
             header.set_label(current.as_deref().unwrap_or_default());
             header.set_visible(shown.profiles_section);
         }
-        let shown_banner = banner(controller.page_state());
+        let shown_banner = controller.page_banner();
         self.banner.set_visible(shown_banner.is_some());
         if let Some(shown_banner) = shown_banner {
             self.banner_message.set_label(shown_banner.message);

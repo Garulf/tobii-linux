@@ -25,8 +25,9 @@ use tobii_control::{Event, Reply, Request, Status, TrackedEyes};
 use tobii_experience::app::{Controller, Deps, PAGE_TITLE, PAGE_WIDTH};
 use tobii_experience::cli::Options;
 use tobii_experience::guest::{LaunchError, OnExit, SetupLauncher};
-use tobii_experience::page::PageState;
+use tobii_experience::page::{PageState, banner};
 use tobii_experience::quit::ServiceUnit;
+use tobii_experience::settings::Settings;
 use tobii_gaze::profiles::ProfileStore;
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -575,6 +576,43 @@ fn unknown_state_keeps_the_switch_on(app: &gtk::Application, store: &ProfileStor
     check(!failing.page_busy(), || "Error: the page is busy".into())
 }
 
+/// Tobii's licence page starts `-R` when nothing is set up. The app does it once per run, on
+/// the first status without a profile or display area, and holds the page for the run;
+/// `--no-banner` hides the banner and the `auto_setup` setting keeps the setup from starting.
+fn nothing_set_up_starts_the_setup_once(app: &gtk::Application, store: &ProfileStore) -> Result<(), String> {
+    let message = banner(PageState::NoCalibrationProfile).ok_or("NoCalibrationProfile has no banner")?.message;
+    let service = StubService::start(store.clone());
+    service.change(|status| status.profile = None);
+    let setup = Rc::new(FakeSetup::default());
+    let options = Options { service: service.addr, ..Options::default() };
+    let controller = Controller::new(app, &options, deps(setup.clone(), store));
+    spin_until("the setup to start", || !setup.runs.borrow().is_empty())?;
+    check(*setup.runs.borrow() == [vec!["-R".to_string()]], || format!("ran {:?}", setup.runs.borrow()))?;
+    check(controller.page_state() == PageState::NoCalibrationProfile, || format!("{:?}", controller.page_state()))?;
+    check(controller.page_busy(), || "the page is not held during the run".into())?;
+    let page = tobii_experience::page::page(&controller);
+    check(visible_texts(&page).iter().any(|text| text == message), || "the banner is hidden".into())?;
+    setup.finish(1);
+    spin_until("the run to end", || !controller.page_busy())?;
+    service.change(|status| status.display_area = false);
+    spin_until("InvalidMonitorSetup", || controller.page_state() == PageState::InvalidMonitorSetup)?;
+    spin_for(Duration::from_millis(200));
+    check(setup.runs.borrow().len() == 1, || format!("started again: {:?}", setup.runs.borrow()))?;
+
+    let quiet = StubService::start(store.clone());
+    quiet.change(|status| status.profile = None);
+    let setup = Rc::new(FakeSetup::default());
+    let options = Options { service: quiet.addr, banner: false, ..Options::default() };
+    let controller = Controller::new(app, &options, deps(setup.clone(), store));
+    controller.set_settings(Settings { auto_setup: false, ..controller.settings() });
+    spin_until("NoCalibrationProfile", || controller.page_state() == PageState::NoCalibrationProfile)?;
+    spin_for(Duration::from_millis(200));
+    check(setup.runs.borrow().is_empty(), || format!("ran {:?} with auto_setup off", setup.runs.borrow()))?;
+    check(controller.page_banner().is_none(), || "--no-banner kept the banner".into())?;
+    let page = tobii_experience::page::page(&controller);
+    check(!visible_texts(&page).iter().any(|text| text == message), || "--no-banner shows the banner".into())
+}
+
 trait SwitchLabel {
     fn label_is_on(&self) -> bool;
 }
@@ -622,7 +660,8 @@ fn run(screenshot: Option<PathBuf>) -> Vec<(&'static str, Result<(), String>)> {
     }
     let service = StubService::start(store.clone());
     let setup = Rc::new(FakeSetup::default());
-    let options = Options { service: service.addr, ..Options::default() };
+    // The states below would start the setup by itself; nothing_set_up_starts_the_setup_once covers that.
+    let options = Options { service: service.addr, auto_setup: false, ..Options::default() };
     let deps = Deps { settings_path: Some(directory.join("experience.json")), ..deps(setup.clone(), &store) };
     let controller = Controller::new(&app, &options, deps);
     let fixture = Fixture { controller, service, setup, store };
@@ -639,6 +678,8 @@ fn run(screenshot: Option<PathBuf>) -> Vec<(&'static str, Result<(), String>)> {
         results.push(("deletions_commit_on_close", deletions_commit_on_close(&fixture)));
         results.push(("select_sends_switch_request", select_sends_switch_request(&fixture)));
         results.push(("unknown_state_keeps_the_switch_on", unknown_state_keeps_the_switch_on(&app, &fixture.store)));
+        results
+            .push(("nothing_set_up_starts_the_setup_once", nothing_set_up_starts_the_setup_once(&app, &fixture.store)));
     }
     if let Some(window) = fixture.controller.page_window() {
         window.close();

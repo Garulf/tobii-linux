@@ -801,6 +801,24 @@ warning icon, spinner or help centre link (`page::banner`, the `tobii-banner` an
 `tobii-action-button` CSS classes). It is insensitive while the page is busy, as the
 rest of the page is.
 
+The licence page (`VM:LicenseAgreementViewModel.cs:108-124,170-177`) starts the same
+`-R` by itself once the licence is accepted and the tracker reports
+`InvalidConfiguration`. Linux has no licence page (decision): the app starts `-R` the
+first time a status in a run reads `InvalidConfiguration`, that is with no display area
+or no profile, at start or when a tracker is plugged in later. It does this once per
+run, holds the page for the run like the buttons, and not while the page is busy or the
+app is quitting.
+
+Both are Linux options, not Tobii settings, and both are on by default:
+
+| Turns off | Setting in `experience.json` | Command line (the instance that starts the app) | NixOS module |
+| --- | --- | --- | --- |
+| the banner | `"show_banner": false` | `--no-banner` | `experience.banner = false` |
+| the setup that starts by itself | `"auto_setup": false` | `--no-auto-setup` | `experience.autoSetup = false` |
+
+The option is off when either the setting or the flag turns it off; the flags are not
+stored. With the banner off, the page's own buttons remain the way to set up.
+
 ## 5. Styles
 
 Fonts: `TobiiFontFamily` = `Segoe UI Light` (`BR:colorsfonts.xaml:115`),

@@ -1,6 +1,7 @@
 //! The command line of `tobii-linux-experience`. A second instance forwards it to the
 //! running one, which acts on `--guest` and `--page` and opens the page when neither is
-//! given; the service options only apply to the instance that starts the app.
+//! given; the service options, `--no-banner` and `--no-auto-setup` only apply to the instance
+//! that starts the app.
 
 use std::net::SocketAddr;
 
@@ -20,6 +21,8 @@ options:
   --guest              Start a temporary guest calibration (Tobii's Ctrl+Shift+F10); only
                        while the tracker is in use or needs setting up
   --page               Open the Eye tracking page
+  --no-banner          Hide the page's banner that asks to set up the display or calibrate
+  --no-auto-setup      Do not start the setup by itself when nothing is set up
   --service ADDR       Control address of tobii-linux serve (default 127.0.0.1:7760)
   --service-unit NAME  systemd user unit started with the app and stopped by Quit
                        (default tobii-head-pose.service)
@@ -30,13 +33,24 @@ options:
 pub struct Options {
     pub guest: bool,
     pub page: bool,
+    /// False with `--no-banner`.
+    pub banner: bool,
+    /// False with `--no-auto-setup`.
+    pub auto_setup: bool,
     pub service: SocketAddr,
     pub service_unit: String,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { guest: false, page: false, service: DEFAULT_ADDR, service_unit: DEFAULT_SERVICE_UNIT.into() }
+        Options {
+            guest: false,
+            page: false,
+            banner: true,
+            auto_setup: true,
+            service: DEFAULT_ADDR,
+            service_unit: DEFAULT_SERVICE_UNIT.into(),
+        }
     }
 }
 
@@ -60,9 +74,13 @@ pub fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Command, St
             || inline.clone().or_else(|| arguments.next()).ok_or_else(|| format!("{option}: missing value"));
         match option.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
-            "--guest" | "--page" if inline.is_some() => return Err(format!("{option} takes no value")),
+            "--guest" | "--page" | "--no-banner" | "--no-auto-setup" if inline.is_some() => {
+                return Err(format!("{option} takes no value"));
+            }
             "--guest" => options.guest = true,
             "--page" => options.page = true,
+            "--no-banner" => options.banner = false,
+            "--no-auto-setup" => options.auto_setup = false,
             "--service" => {
                 let text = value()?;
                 options.service = text.parse().map_err(|_| format!("--service: invalid address '{text}'"))?;
@@ -97,13 +115,26 @@ mod tests {
         assert_eq!(Options::default().service.to_string(), "127.0.0.1:7760");
         assert_eq!(Options::default().service_unit, "tobii-head-pose.service");
 
-        let options =
-            run(&["--guest", "--page", "--service", "127.0.0.1:5000", "--service-unit", "x.service"]).unwrap();
+        assert!(Options::default().banner && Options::default().auto_setup);
+
+        let options = run(&[
+            "--guest",
+            "--page",
+            "--no-banner",
+            "--no-auto-setup",
+            "--service",
+            "127.0.0.1:5000",
+            "--service-unit",
+            "x.service",
+        ])
+        .unwrap();
         assert_eq!(
             options,
             Options {
                 guest: true,
                 page: true,
+                banner: false,
+                auto_setup: false,
                 service: "127.0.0.1:5000".parse().unwrap(),
                 service_unit: "x.service".into()
             }
@@ -123,6 +154,8 @@ mod tests {
         assert!(run(&["--service", "nowhere"]).unwrap_err().contains("nowhere"));
         assert!(run(&["--service-unit", ""]).is_err());
         assert!(run(&["--guest=yes"]).unwrap_err().contains("--guest"));
+        assert!(run(&["--no-banner=1"]).unwrap_err().contains("--no-banner"));
+        assert!(run(&["--no-auto-setup=0"]).unwrap_err().contains("--no-auto-setup"));
         assert!(run(&["--frobnicate"]).unwrap_err().contains("--frobnicate"));
         assert!(run(&["extra"]).unwrap_err().contains("extra"));
     }

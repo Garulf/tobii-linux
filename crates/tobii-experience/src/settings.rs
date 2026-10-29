@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 const FILE_NAME: &str = "experience.json";
 
 /// The settings file's content; fields missing from the file take their defaults.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Tobii's `SkipConfirmQuitDialog` (default false: Quit asks first).
@@ -16,6 +16,23 @@ pub struct Settings {
     /// Tobii's `GazeTrackerHasBeenConnected`: a tracker was attached once, so the page keeps
     /// its gaze sections while it is unplugged or the service is down.
     pub gaze_tracker_has_been_connected: bool,
+    /// Whether the page shows Tobii's banner that asks to set up the display or calibrate
+    /// (default true). Not a Tobii setting.
+    pub show_banner: bool,
+    /// Whether the app starts the setup on its own the first time it sees nothing set up,
+    /// as Tobii's licence page does (default true). Not a Tobii setting.
+    pub auto_setup: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            skip_quit_confirmation: false,
+            gaze_tracker_has_been_connected: false,
+            show_banner: true,
+            auto_setup: true,
+        }
+    }
 }
 
 impl Settings {
@@ -78,16 +95,27 @@ mod tests {
     fn settings_round_trip_and_defaults() {
         assert!(!Settings::default().skip_quit_confirmation, "Tobii shows the quit dialog by default");
         assert!(!Settings::default().gaze_tracker_has_been_connected);
+        assert!(Settings::default().show_banner && Settings::default().auto_setup);
 
         let directory = scratch("settings");
         let path = directory.join("tobii-linux").join("experience.json");
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
 
-        let settings = Settings { skip_quit_confirmation: true, gaze_tracker_has_been_connected: true };
+        let settings = Settings {
+            skip_quit_confirmation: true,
+            gaze_tracker_has_been_connected: true,
+            show_banner: false,
+            auto_setup: false,
+        };
         settings.store(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), settings);
         let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let expected = serde_json::json!({ "skip_quit_confirmation": true, "gaze_tracker_has_been_connected": true });
+        let expected = serde_json::json!({
+            "skip_quit_confirmation": true,
+            "gaze_tracker_has_been_connected": true,
+            "show_banner": false,
+            "auto_setup": false,
+        });
         assert_eq!(json, expected);
         let leftovers: Vec<_> =
             std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
