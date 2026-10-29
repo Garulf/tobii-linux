@@ -14,10 +14,11 @@ use tobii_control::{Request, TrackedEyes};
 
 use super::style::{self, Icon, Paint, Segment};
 use super::{
-    Availability, BOTH_EYES, DISABLE_DELAY, EYES_BODY, EYES_TITLE, GazeCapability, IMPROVE_BODY, IMPROVE_BUTTON,
-    IMPROVE_TITLE, LEFT_EYE, NEW_PROFILE_BUTTON, OFF_TEXT, ON_TEXT, PREVIEW_BODY, PREVIEW_TITLE, PROFILE_BODY,
-    PROFILE_TITLE, PageAction, PageState, ProfileList, RIGHT_EYE, SCREEN_BODY, SCREEN_BUTTON, SCREEN_TITLE,
-    SWITCH_TITLE, SetupFlow, UNDO_TEXT, availability, gaze_capability, page_state, system_enabled, visibility,
+    Availability, BOTH_EYES, BannerAction, BannerKind, DISABLE_DELAY, EYES_BODY, EYES_TITLE, GazeCapability,
+    IMPROVE_BODY, IMPROVE_BUTTON, IMPROVE_TITLE, LEFT_EYE, NEW_PROFILE_BUTTON, OFF_TEXT, ON_TEXT, PREVIEW_BODY,
+    PREVIEW_TITLE, PROFILE_BODY, PROFILE_TITLE, PageAction, PageState, ProfileList, RIGHT_EYE, SCREEN_BODY,
+    SCREEN_BUTTON, SCREEN_TITLE, SWITCH_TITLE, SetupFlow, UNDO_TEXT, availability, banner, gaze_capability, page_state,
+    system_enabled, visibility,
 };
 use crate::app::{AppEvent, Controller, PAGE_HEIGHT, PAGE_TITLE, PAGE_WIDTH, WeakController};
 use crate::guest::{OnExit, SetupResult, setup_result};
@@ -362,7 +363,7 @@ pub(crate) fn open_window(controller: &Controller) -> gtk::Window {
 
 /// Builds the page's content, Tobii's sidebar, in its order: the on/off row, Improve my
 /// calibration, Preview my gaze, Select eyes to detect, Change screen and Change user
-/// profile with Create new profile and the list.
+/// profile with Create new profile and the list; below it, the Home page's banner.
 pub fn page(controller: &Controller) -> gtk::Widget {
     install_css();
     let view = Rc::new(PageView::build(controller));
@@ -522,6 +523,9 @@ impl Toggle {
 pub(crate) struct PageView {
     root: gtk::Box,
     header: RefCell<Option<gtk::Label>>,
+    banner: gtk::Box,
+    banner_message: gtk::Label,
+    banner_button: gtk::Button,
     switch: Toggle,
     profiles_section: gtk::Box,
     calibration: gtk::Box,
@@ -558,10 +562,24 @@ impl PageView {
             .vexpand(true)
             .child(&inner)
             .build();
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        margins(&sidebar, 40, 0, 0, 15);
+        sidebar.set_vexpand(true);
+        sidebar.append(&scrolled);
+
+        let banner_message = text("", "body");
+        banner_message.set_valign(gtk::Align::Center);
+        margins(&banner_message, 0, 4, 0, 7);
+        let banner_button =
+            gtk::Button::builder().css_classes(["tobii-action-button"]).valign(gtk::Align::Center).build();
+        margins(&banner_button, 15, 4, 0, 7);
+        let banner = horizontal(&[banner_message.upcast_ref(), banner_button.upcast_ref()]);
+        banner.set_halign(gtk::Align::Center);
+        let strip = gtk::Box::builder().css_classes(["tobii-banner"]).build();
+        strip.append(&banner);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        margins(&root, 40, 0, 0, 15);
-        root.set_vexpand(true);
-        root.append(&scrolled);
+        root.append(&sidebar);
+        root.append(&strip);
 
         let switch = Toggle::new();
         margins(&switch.button, 30, 0, 0, 0);
@@ -651,6 +669,9 @@ impl PageView {
         let view = PageView {
             root,
             header: RefCell::new(None),
+            banner: strip,
+            banner_message,
+            banner_button,
             switch,
             profiles_section,
             calibration,
@@ -699,6 +720,12 @@ impl PageView {
                 controller.set_preview_requested(button.is_active());
             }
         });
+        let fix = on(|controller| match banner(controller.page_state()).and_then(|banner| banner.button) {
+            Some((_, BannerAction::Enable)) => set_enabled(controller, true),
+            Some((_, BannerAction::Setup(flow))) => start_setup(controller, flow),
+            None => {}
+        });
+        self.banner_button.connect_clicked(move |_| fix());
         let improve = on(|controller| start_setup(controller, SetupFlow::Calibrate));
         self.improve.connect_clicked(move |_| improve());
         let display = on(|controller| start_setup(controller, SetupFlow::display(controller.page_state())));
@@ -733,6 +760,20 @@ impl PageView {
         if let Some(header) = self.header.borrow().as_ref() {
             header.set_label(current.as_deref().unwrap_or_default());
             header.set_visible(shown.profiles_section);
+        }
+        let shown_banner = banner(controller.page_state());
+        self.banner.set_visible(shown_banner.is_some());
+        if let Some(shown_banner) = shown_banner {
+            self.banner_message.set_label(shown_banner.message);
+            if shown_banner.kind == BannerKind::Error {
+                self.banner_message.add_css_class("warning");
+            } else {
+                self.banner_message.remove_css_class("warning");
+            }
+            self.banner_button.set_visible(shown_banner.button.is_some());
+            if let Some((label, _)) = shown_banner.button {
+                self.banner_button.set_label(label);
+            }
         }
         self.switch.button.set_active(model.pending_enabled.get().unwrap_or_else(|| controller.system_enabled()));
         self.switch.button.set_sensitive(flags.enable_disable);
