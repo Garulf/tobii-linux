@@ -739,6 +739,11 @@ How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
     only name in records written before `connector` existed and in Python setup records),
     else the one whose EDID manufacturer and model match (the EDID monitor name, or the
     product code when the EDID has no name). No match hides the bubble.
+  - A record is only as right as the setup that wrote it. Under Wayland, setup used to
+    list XWayland's outputs, or DRM connectors without positions, so it could record a
+    monitor other than the one it showed on; the bubble then follows that monitor.
+    Setup now lists GDK's outputs there (`monitors::placed_monitors`), and running
+    "Set up display" again rewrites the record.
   - The overlay is a click-through `wlr-layer-shell` surface (overlay layer, all edges,
     no keyboard). Without layer-shell (X11, or a Wayland compositor without it) the
     preview stays off: X11 offers GTK 4 no way to keep a window above the others on a
