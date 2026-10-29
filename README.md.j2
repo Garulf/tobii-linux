@@ -184,6 +184,12 @@ game is running and starts the app with the graphical session:
 hardware.tobii-eye-tracker-5.experience.enable = true;
 ```
 
+When nothing is set up, the app starts the display setup and calibration by
+itself once, as Tobii does after its licence page, and its page shows Tobii's
+banner asking to set up. `experience.autoSetup = false` and
+`experience.banner = false` turn these off
+([details](docs/experience-app.md#49-the-home-page-banner)).
+
 Sessions without `graphical-session.target` (Hyprland without uwsm) start it
 with `exec-once = tobii-linux-experience`; Tobii's guest shortcut becomes
 `bind = CTRL SHIFT, F10, exec, tobii-linux-experience --guest`
