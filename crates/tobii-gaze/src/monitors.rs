@@ -378,7 +378,8 @@ pub fn placed_monitors(placed: &[Placed], known: Vec<Monitor>, root: &Path) -> V
                 .find(|m| m.name == output.connector)
                 .and_then(|m| m.edid.clone())
                 .or_else(|| drm.map(|(_, edid)| edid.clone()));
-            let landscape_panel = edid.as_deref().and_then(|edid| edid_native_resolution(edid).ok()).map(|[w, h]| w > h);
+            let landscape_panel =
+                edid.as_deref().and_then(|edid| edid_native_resolution(edid).ok()).map(|[w, h]| w > h);
             let rotation = if landscape_panel == Some(height > width) { 90 } else { 0 };
             Monitor {
                 key: output.connector.clone(),
@@ -633,14 +634,16 @@ mod tests {
 
     #[test]
     fn placed_outputs_win_over_xwayland_names() {
-        let root = drm_root("placed", &[("card1-DP-1", &edid(), "connected"), ("card1-HDMI-A-1", &edid(), "connected")]);
+        let root =
+            drm_root("placed", &[("card1-DP-1", &edid(), "connected"), ("card1-HDMI-A-1", &edid(), "connected")]);
         let placed = [
             Placed { connector: "DP-1".into(), geometry: [1440, 0, 1280, 720], scale: 2.0 },
             Placed { connector: "HDMI-A-1".into(), geometry: [0, -400, 1440, 2560], scale: 1.0 },
         ];
         let xwayland = vec![monitor("XWAYLAND0", [0, 0, 2560, 1440]), monitor("XWAYLAND1", [2560, 0, 1440, 2560])];
         let found = placed_monitors(&placed, xwayland, &root);
-        let summary: Vec<_> = found.iter().map(|m| (m.key.as_str(), m.bounds, m.rotation, m.connector.as_deref())).collect();
+        let summary: Vec<_> =
+            found.iter().map(|m| (m.key.as_str(), m.bounds, m.rotation, m.connector.as_deref())).collect();
         assert_eq!(
             summary,
             [
