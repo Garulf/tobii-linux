@@ -134,7 +134,13 @@ The simulated user looks at the targets as scaled into the calibration area of t
 display area the device holds (the Python simulation looks at the unscaled points, so a
 display set up with a diagonal over 700 mm stalls its calibration). On a real desktop the window
 moves with `fullscreen_on_monitor` to the monitor whose GDK connector matches the
-xrandr output.
+monitor's name. The monitors come from xrandr when every GDK output names an xrandr
+output that has a position; otherwise (Wayland, where xrandr is missing or lists
+XWayland outputs, or the DRM fallback without positions) they are GDK's outputs, named
+by their connector, with GDK's position and size times the output scale, and the EDID
+of the DRM connector of that name (`monitors::placed_monitors`). So under Wayland the
+setup starts on the monitor of the last display setup, else the one at 0, 0, and the
+monitor switcher shows.
 
 ## Experience app
 

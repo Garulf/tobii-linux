@@ -318,12 +318,12 @@ pub fn choose_desktop(args: &Args, monitors: Vec<Monitor>, record: &Json) -> Des
     Desktop { monitors, current, movable }
 }
 
-/// The desktop of the run: simulated, or the Linux desktop's monitors.
-pub fn desktop(args: &Args, options: &SetupOptions) -> Desktop {
+/// The desktop of the run: simulated, or the Linux desktop's monitors as the toolkit places them.
+pub fn desktop(args: &Args, options: &SetupOptions, placed: &[monitors::Placed]) -> Desktop {
     let monitors = match args.simulate {
         Some(_) if args.simulate_monitors => simulated_monitors(),
         Some(_) => Vec::new(),
-        None => monitors::linux_monitors().unwrap_or_default(),
+        None => monitors::placed_linux_monitors(placed),
     };
     choose_desktop(args, monitors, &load_display_record(&options.display_record))
 }

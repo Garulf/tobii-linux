@@ -17,6 +17,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use serde_json::{Value as Json, json};
+use tobii_gaze::monitors::Placed;
 
 use crate::alignment::{self, Alignment, KeyOutcome, Rect};
 use crate::channel::{UiChannel, WindowEvent};
@@ -58,7 +59,6 @@ fn write_log(log: &SharedLog, kind: &str, values: Json) {
 struct Launch {
     args: Args,
     options: crate::flow::SetupOptions,
-    desktop: Desktop,
     log: SharedLog,
 }
 
@@ -114,8 +114,7 @@ pub fn main() -> std::process::ExitCode {
         },
         None => None,
     };
-    let desktop = cli::desktop(&args, &options);
-    let launch = Rc::new(RefCell::new(Some(Launch { args, options, desktop, log: Arc::new(Mutex::new(log)) })));
+    let launch = Rc::new(RefCell::new(Some(Launch { args, options, log: Arc::new(Mutex::new(log)) })));
     let exit = Rc::new(Cell::new(codes.status(Status::Running)));
     let app = gtk::Application::builder().flags(gio::ApplicationFlags::NON_UNIQUE).build();
     let keep: RefCell<Option<Rc<Ui>>> = RefCell::new(None);
@@ -210,6 +209,17 @@ fn gdk_monitors() -> Vec<gdk::Monitor> {
     (0..model.n_items()).filter_map(|i| model.item(i).and_downcast::<gdk::Monitor>()).collect()
 }
 
+/// The outputs as GDK places them, which under Wayland is the only source of their layout.
+fn placed_outputs() -> Vec<Placed> {
+    let placed = gdk_monitors().into_iter().filter_map(|monitor| {
+        let connector = monitor.connector()?.to_string();
+        let geometry = monitor.geometry();
+        let geometry = [geometry.x(), geometry.y(), geometry.width(), geometry.height()].map(i64::from);
+        Some(Placed { connector, geometry, scale: monitor.scale() })
+    });
+    placed.collect()
+}
+
 fn section(kind: &ScreenKind) -> &'static str {
     match kind {
         ScreenKind::Connecting | ScreenKind::Busy { .. } | ScreenKind::Moving { .. } => "busy",
@@ -238,7 +248,8 @@ fn key_of(keyval: gdk::Key) -> Key {
 
 impl Ui {
     fn start(app: &gtk::Application, launch: Launch, exit_codes: ExitCodes, exit: Rc<Cell<u8>>) -> Rc<Ui> {
-        let Launch { args, options, desktop, log } = launch;
+        let Launch { args, options, log } = launch;
+        let desktop = cli::desktop(&args, &options, &placed_outputs());
         let window = gtk::ApplicationWindow::builder().application(app).title("Eye tracker setup").build();
         window.set_decorated(false);
         let channel = UiChannel::new();
