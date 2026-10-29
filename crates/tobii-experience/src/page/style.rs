@@ -20,6 +20,7 @@ window.tobii-page {{ background-color: #151617; }}
 window.tobii-page label {{ font-family: {FONT_FAMILY}; font-weight: 300; font-size: 12pt; color: #BFD6E0; }}
 window.tobii-page label.h3 {{ font-size: 16pt; color: #FFFFFF; }}
 window.tobii-page label.body {{ font-size: 12pt; color: #D5D5D5; }}
+window.tobii-page label.warning {{ color: #FFB631; }}
 
 window.tobii-page button.tobii-toggle {{ padding: 0; margin: 0; min-width: 0; min-height: 0; border: none;
   border-radius: 0; background: none; box-shadow: none; outline: none; }}
@@ -55,6 +56,14 @@ window.tobii-page button.tobii-gaze-button:active {{ background-color: #00BEFF; 
   transform: scale(0.925); transition: color 100ms, transform 100ms; }}
 window.tobii-page button.tobii-gaze-button:disabled {{ background-color: #2B3940; color: #637279;
   transform: scale(0.95); }}
+
+window.tobii-page .tobii-banner {{ background-color: #000000; }}
+window.tobii-page button.tobii-action-button {{ min-width: 70px; min-height: 33px; padding: 0 25px; border: none;
+  border-radius: 9999px; box-shadow: none; outline: none; background-image: none; background-color: #008DBF;
+  color: #D9F4FF; transition: background-color 100ms, color 100ms; }}
+window.tobii-page button.tobii-action-button label {{ font-size: 10pt; color: inherit; }}
+window.tobii-page button.tobii-action-button:hover {{ background-color: #00ACE9; color: #FFFFFF; }}
+window.tobii-page button.tobii-action-button:active {{ background-color: #00BEFF; color: #FFFFFF; transition: none; }}
 
 window.tobii-page button.tobii-accent {{ padding: 0; min-width: 0; min-height: 0; border: 1px solid transparent;
   border-radius: 0; background: none; box-shadow: none; outline: none; color: #008DBF; }}

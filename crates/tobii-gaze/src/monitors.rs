@@ -346,6 +346,59 @@ pub fn linux_monitors() -> Result<Vec<Monitor>> {
     drm_fallback(drm)
 }
 
+/// One output as the desktop's toolkit places it: its connector name, logical x, y, width
+/// and height, and its scale. Under Wayland this is the only source of the layout: xrandr
+/// sees XWayland's outputs, under other names, and /sys/class/drm has no positions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placed {
+    pub connector: String,
+    pub geometry: [i64; 4],
+    pub scale: f64,
+}
+
+/// The monitors given the toolkit's placement: `known` (xrandr's or the DRM connectors)
+/// when it places every output under the same name, else one monitor per placed output
+/// with the EDID of the monitor or DRM connector of that name. Positions stay logical, so
+/// only their order counts; sizes are in device pixels. A panel placed across its native
+/// orientation is taken as turned 90 degrees.
+pub fn placed_monitors(placed: &[Placed], known: Vec<Monitor>, root: &Path) -> Vec<Monitor> {
+    let named = |name: &str| known.iter().any(|m| m.name == name && m.bounds.is_some());
+    if placed.is_empty() || placed.iter().all(|output| named(&output.connector)) {
+        return known;
+    }
+    let connectors = drm_connectors(root).unwrap_or_default();
+    placed
+        .iter()
+        .map(|output| {
+            let [x, y, width, height] = output.geometry;
+            let device = |length: i64| (length as f64 * output.scale).round() as i64;
+            let drm = connectors.iter().find(|(connector, _)| output_name(connector) == output.connector);
+            let edid = known
+                .iter()
+                .find(|m| m.name == output.connector)
+                .and_then(|m| m.edid.clone())
+                .or_else(|| drm.map(|(_, edid)| edid.clone()));
+            let landscape_panel =
+                edid.as_deref().and_then(|edid| edid_native_resolution(edid).ok()).map(|[w, h]| w > h);
+            let rotation = if landscape_panel == Some(height > width) { 90 } else { 0 };
+            Monitor {
+                key: output.connector.clone(),
+                name: output.connector.clone(),
+                bounds: Some([x, y, device(width), device(height)]),
+                rotation,
+                edid,
+                connector: drm.map(|(connector, _)| connector.clone()),
+                ..Monitor::default()
+            }
+        })
+        .collect()
+}
+
+/// The Linux desktop's monitors as the toolkit places `placed`; see [`placed_monitors`].
+pub fn placed_linux_monitors(placed: &[Placed]) -> Vec<Monitor> {
+    placed_monitors(placed, linux_monitors().unwrap_or_default(), Path::new("/sys/class/drm"))
+}
+
 /// `\\?\DISPLAY#GSM5B7F#5&5028a6b&0&UID41221#{guid}` -> `DISPLAY\GSM5B7F\5&5028A6B&0&UID41221`.
 pub fn instance_id_from_interface(interface: Option<&str>) -> Option<String> {
     let interface = interface.filter(|interface| !interface.is_empty())?;
@@ -577,6 +630,35 @@ mod tests {
         for root in [root, twins] {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn placed_outputs_win_over_xwayland_names() {
+        let root =
+            drm_root("placed", &[("card1-DP-1", &edid(), "connected"), ("card1-HDMI-A-1", &edid(), "connected")]);
+        let placed = [
+            Placed { connector: "DP-1".into(), geometry: [1440, 0, 1280, 720], scale: 2.0 },
+            Placed { connector: "HDMI-A-1".into(), geometry: [0, -400, 1440, 2560], scale: 1.0 },
+        ];
+        let xwayland = vec![monitor("XWAYLAND0", [0, 0, 2560, 1440]), monitor("XWAYLAND1", [2560, 0, 1440, 2560])];
+        let found = placed_monitors(&placed, xwayland, &root);
+        let summary: Vec<_> =
+            found.iter().map(|m| (m.key.as_str(), m.bounds, m.rotation, m.connector.as_deref())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("DP-1", Some([1440, 0, 2560, 1440]), 0, Some("card1-DP-1")),
+                ("HDMI-A-1", Some([0, -400, 1440, 2560]), 90, Some("card1-HDMI-A-1")),
+            ],
+            "logical positions, device-pixel sizes, a landscape panel placed in portrait turned"
+        );
+        assert_eq!(found[0].edid, Some(edid()));
+        assert_eq!(previous_monitor(&found, Some(&found[0])), Some(1), "the switcher can move between them");
+
+        let x11 = vec![monitor("DP-1", [0, 0, 2560, 1440]), monitor("HDMI-A-1", [2560, 0, 1440, 2560])];
+        assert_eq!(placed_monitors(&placed, x11.clone(), &root), x11, "xrandr naming every output is kept");
+        assert_eq!(placed_monitors(&[], x11.clone(), &root), x11, "nothing placed keeps the known monitors");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

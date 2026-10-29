@@ -217,6 +217,65 @@ pub fn availability(
     }
 }
 
+/// Whether the banner reports a problem (warning colour and icon) or a wait (plain text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerKind {
+    Error,
+    Waiting,
+}
+
+/// What the banner's button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerAction {
+    /// Tobii's `SetEyeTrackingEnabled(true)`.
+    Enable,
+    /// Tobii's `LaunchResolveConfigurationFlow`: display setup when no display is set up,
+    /// then a new profile with its calibration, or a recalibration.
+    Setup(SetupFlow),
+}
+
+/// The Home page's global banner (`HomePageViewModel.UpdateState`): a message per state and,
+/// for the states the user can fix, a button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Banner {
+    pub kind: BannerKind,
+    pub message: &'static str,
+    pub button: Option<(&'static str, BannerAction)>,
+}
+
+/// The banner for `state`, none while tracking. Error's "Troubleshoot" starts Tobii's
+/// Windows troubleshooter, which Linux does not have, so it shows no button.
+pub fn banner(state: PageState) -> Option<Banner> {
+    use PageState as S;
+    let error = |message| Some(Banner { kind: BannerKind::Error, message, button: None });
+    let waiting = |message| Some(Banner { kind: BannerKind::Waiting, message, button: None });
+    let resolve = |message, label| {
+        let button = Some((label, BannerAction::Setup(SetupFlow::ResolveConfiguration)));
+        Some(Banner { kind: BannerKind::Error, message, button })
+    };
+    match state {
+        S::Tracking => None,
+        S::TrackingDisabled => Some(Banner {
+            kind: BannerKind::Error,
+            message: "You have disabled Tobii Experience.",
+            button: Some(("Enable", BannerAction::Enable)),
+        }),
+        S::Disconnected => error("No Tobii sensor has been found."),
+        S::Initializing => waiting("Getting ready..."),
+        S::InvalidMonitorSetup => resolve("Eye tracker not set up for this display.", "Set up display"),
+        S::NoCalibrationProfile => resolve("Create a user profile to get started.", "Create profile"),
+        S::InvalidCalibration => resolve("This profile needs to be recalibrated.", "Recalibrate"),
+        S::TrackedMonitorNotAvailableForBuiltInTracker => error("The tracked monitor is unavailable."),
+        S::Configuring => waiting("Working on it..."),
+        S::Error => error("Something's not quite right..."),
+        S::ExclusiveMode => error("Tobii sensor is in use in another application."),
+        S::FirmwareUpdateInProgress => waiting("Updating eye tracker..."),
+        S::InvalidMonitorRotation => {
+            error("Sorry, this mode is not supported. The camera needs to be at the top of the screen.")
+        }
+    }
+}
+
 /// The configuration flows the page starts in `tobii-linux-setup`, by Tobii's arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupFlow {
@@ -391,6 +450,34 @@ mod tests {
                 };
                 assert_eq!(off, expected, "{state:?} with {unavailable:?}");
             }
+        }
+    }
+
+    #[test]
+    fn banner_asks_to_set_up_and_calibrate() {
+        use PageState as S;
+        let resolve = Some(BannerAction::Setup(SetupFlow::ResolveConfiguration));
+        let action = |state| banner(state).and_then(|banner| banner.button).map(|(_, action)| action);
+        for state in [S::InvalidMonitorSetup, S::NoCalibrationProfile, S::InvalidCalibration] {
+            assert_eq!(action(state), resolve, "{state:?} starts -R");
+            assert_eq!(banner(state).map(|banner| banner.kind), Some(BannerKind::Error));
+        }
+        let no_profile = banner(S::NoCalibrationProfile).unwrap();
+        assert_eq!(
+            (no_profile.message, no_profile.button.map(|(label, _)| label)),
+            ("Create a user profile to get started.", Some("Create profile"))
+        );
+        assert_eq!(action(S::TrackingDisabled), Some(BannerAction::Enable));
+        assert_eq!(banner(S::Tracking), None);
+        for state in [S::Initializing, S::Configuring, S::FirmwareUpdateInProgress] {
+            assert_eq!(banner(state).map(|banner| (banner.kind, banner.button)), Some((BannerKind::Waiting, None)));
+        }
+        for state in PageState::ALL {
+            let fixable = matches!(
+                state,
+                S::TrackingDisabled | S::InvalidMonitorSetup | S::NoCalibrationProfile | S::InvalidCalibration
+            );
+            assert_eq!(action(state).is_some(), fixable, "{state:?}");
         }
     }
 

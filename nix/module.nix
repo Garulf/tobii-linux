@@ -21,6 +21,23 @@ in {
       "Eye Tracker 5 USB access and the experimental head-pose command";
     experience.enable = lib.mkEnableOption
       "the Tobii Experience tray app and an always-running service";
+    experience.banner = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Show the page's banner that asks to set up the display or calibrate.
+        false starts the app with --no-banner.
+      '';
+    };
+    experience.autoSetup = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Start the display setup and calibration by itself the first time the
+        app sees nothing set up, as Tobii's licence page does. false starts the
+        app with --no-auto-setup.
+      '';
+    };
     headPoseService = {
       enable = lib.mkEnableOption
         "a systemd user service that serves head pose to Windows games through the Wine pipe bridge";
@@ -122,11 +139,12 @@ in {
       wants = [ serviceUnit ];
       after = [ "graphical-session.target" serviceUnit ];
       serviceConfig = {
-        ExecStart = lib.escapeShellArgs [
+        ExecStart = lib.escapeShellArgs ([
           "${package}/bin/tobii-linux-experience"
           "--service" "127.0.0.1:${toString cfg.headPoseService.port}"
           "--service-unit" serviceUnit
-        ];
+        ] ++ lib.optional (!cfg.experience.banner) "--no-banner"
+          ++ lib.optional (!cfg.experience.autoSetup) "--no-auto-setup");
         Restart = "on-failure";
         RestartSec = 2;
       };

@@ -674,7 +674,7 @@ Source lines: Improve `VM:SettingsPageViewModel.cs:428-437`, Create
 `:481-491`, Set up display `:493-512`, Guest command `:469-479`; XAML bindings
 `VIEW:SettingsPage.xaml:66-76,183-194,210-240`. Flows not started from the page:
 `-P` (`EyePosition`) and `-Q` (`QuickCalibration`) have no caller in the page
-or the tray; the Home page banner button and the licence page start `-R`
+or the tray; the Home page banner button (4.9) and the licence page start `-R`
 (`VM:HomePageViewModel.cs:704-712`, `VM:LicenseAgreementViewModel.cs:175`).
 Argument recognition: `Tobii.Configuration.exe` scans its arguments for an exact
 match in the order `-C`, `-N`, `-P`, `-G`, `-Q`, `-R`, `-S`; with no match it
@@ -739,11 +739,85 @@ How the launcher handles the process (`PROC:ConfigurationAppLauncher.cs`):
     only name in records written before `connector` existed and in Python setup records),
     else the one whose EDID manufacturer and model match (the EDID monitor name, or the
     product code when the EDID has no name). No match hides the bubble.
+  - A record is only as right as the setup that wrote it. Under Wayland, setup used to
+    list XWayland's outputs, or DRM connectors without positions, so it could record a
+    monitor other than the one it showed on; the bubble then follows that monitor.
+    Setup now lists GDK's outputs there (`monitors::placed_monitors`), and running
+    "Set up display" again rewrites the record.
   - The overlay is a click-through `wlr-layer-shell` surface (overlay layer, all edges,
     no keyboard). Without layer-shell (X11, or a Wayland compositor without it) the
     preview stays off: X11 offers GTK 4 no way to keep a window above the others on a
     given monitor.
   - Drawing: [gaze-preview.md](gaze-preview.md), "Linux port".
+
+### 4.9 The Home page banner
+
+Tobii shows the tracker problems in a banner along the bottom of the Home page, not
+on the Eye tracking page (`RefreshErrorMessages`, `VM:HomePageViewModel.cs:557-646`;
+`GlobalErrorArea`, `VIEW:HomePage.xaml:230-306`). It sets one message per state; the
+states the user can fix get a button.
+"Set up display", "Create profile" and "Recalibrate" all run
+`LaunchResolveConfigurationFlow`, `-R` (`VM:HomePageViewModel.cs:704-712`), which
+sets up the display when none is set up and then creates a profile with its
+calibration, or recalibrates. This banner is how Tobii asks a new user to
+calibrate: the page's own "Set up display" runs `-S` whenever a display is
+already set up, and `-S` does not calibrate.
+
+| State | Kind | Message (resx `TrackerError_MessageBody_*`) | Button (`TrackingErrorScreen_Button_*`) | Linux |
+| --- | --- | --- | --- | --- |
+| `Tracking` | none | (ambient light too low: `Unable to detect your presence due to poor camera positioning or low lighting.`) | none | no banner; the light check has no Linux producer |
+| `TrackingDisabled` | error | `You have disabled Tobii Experience.` | `Enable`: `SetEyeTrackingEnabled(true)` | same |
+| `Disconnected` | error | `No Tobii sensor has been found.` | none | same |
+| `Initializing` | waiting | `Getting ready...` | none | same, without the spinner |
+| `InvalidMonitorSetup` | error | `Eye tracker not set up for this display.` | `Set up display`: `-R` | same |
+| `NoCalibrationProfile` | error | `Create a user profile to get started.` | `Create profile`: `-R` | same |
+| `InvalidCalibration` | error | `This profile needs to be recalibrated.` | `Recalibrate`: `-R` | same (no Linux producer yet, 4.4) |
+| `TrackedMonitorNotAvailableForBuiltInTracker` | error | `The tracked monitor is unavailable.` | none | same |
+| `Configuring` | waiting | `Working on it...` | none | same, without the spinner |
+| `Error` | error | `Something's not quite right...` | `Troubleshoot`, plus a help centre link | the message only (why): the troubleshooter and help centre are Windows and web services |
+| `ExclusiveMode` | error | `Tobii sensor is in use in another application.` | none | same |
+| `FirmwareUpdateInProgress` | waiting | `Updating eye tracker...` | none | same |
+| `InvalidMonitorRotation` | error | `Sorry, this mode is not supported. The camera needs to be at the top of the screen.` | none | same |
+
+Before the state, when the device is disabled by default with `KillOnDisable` and
+the system configuration is disabled, the banner shows `General_Status_BatteryPowerMessage`
+with Enable (`:559-576`); Linux has no such driver account setting and skips it.
+
+Layout (`VIEW:HomePage.xaml:230-306`): a grid docked at the bottom of the window,
+background `TobiiStyleGuideBackgroundBrush` `#000000` (`BR:colorsfonts.xaml:132`),
+holding one centred horizontal row:
+
+| Part | Value |
+| --- | --- |
+| Error | warning icon (height 24, margin `0 3 0 0`) and the message in Body style, foreground `TobiiStyleGuideWarningBrush` `#FFB631`, margin `5 0 0 3`; row margin `0 4 0 7` |
+| Waiting | the message in Body style, max width 450, and a 40 px spinner; row margin `0 4 0 7` |
+| Help centre | Body text around a hyperlink button, margin `15 4 0 7`, only for `Error` |
+| Button | `ShowError`, style `ActionButton` (`TobiiActionButtonStyle` with padding `25 0` and 10 pt, `TH:buttons.xaml:12-25`; fills `#008DBF`, hover `#00ACE9`, pressed `#00BEFF`, 5.4), margin `15 4 0 7`, max width 200 |
+
+Linux (decision): the page window has no Home page, so the strip runs along the
+bottom of the page window, below the scrolled sidebar, with the same background,
+margins and button style; the message is Body text, `#FFB631` for errors, with no
+warning icon, spinner or help centre link (`page::banner`, the `tobii-banner` and
+`tobii-action-button` CSS classes). It is insensitive while the page is busy, as the
+rest of the page is.
+
+The licence page (`VM:LicenseAgreementViewModel.cs:108-124,170-177`) starts the same
+`-R` by itself once the licence is accepted and the tracker reports
+`InvalidConfiguration`. Linux has no licence page (decision): the app starts `-R` the
+first time a status in a run reads `InvalidConfiguration`, that is with no display area
+or no profile, at start or when a tracker is plugged in later. It does this once per
+run, holds the page for the run like the buttons, and not while the page is busy or the
+app is quitting.
+
+Both are Linux options, not Tobii settings, and both are on by default:
+
+| Turns off | Setting in `experience.json` | Command line (the instance that starts the app) | NixOS module |
+| --- | --- | --- | --- |
+| the banner | `"show_banner": false` | `--no-banner` | `experience.banner = false` |
+| the setup that starts by itself | `"auto_setup": false` | `--no-auto-setup` | `experience.autoSetup = false` |
+
+The option is off when either the setting or the flag turns it off; the flags are not
+stored. With the banner off, the page's own buttons remain the way to set up.
 
 ## 5. Styles
 
@@ -978,9 +1052,6 @@ Not read (where I looked is in brackets):
   numbering, which is not in the sources.
 - The shortcut parser (`SC_68`) and the key acquisition in the input engine
   (`GUEST:GuestCalibrationLauncher.cs:69-71`).
-- The Home page's error banner (messages and buttons per state:
-  `VM:HomePageViewModel.cs:159-194,640-680`, `VIEW:HomePage.xaml:252-266`); not
-  part of the Eye tracking page.
 - `ISystemLauncher` (the Windows Store launch for "Open") and the EULA flow.
 - The native gaze bubble drawing in `GazeNative.dll` (not decompiled).
 - Where `EyeTrackingHostState.FirmwareUpgrade` is produced.

@@ -181,6 +181,9 @@ struct Inner {
     setup: Rc<dyn SetupLauncher>,
     settings: RefCell<Settings>,
     settings_path: Option<PathBuf>,
+    /// `--no-banner` and `--no-auto-setup` turn these off for this run only.
+    banner: bool,
+    auto_setup: bool,
     state: RefCell<ServiceState>,
     quitting: Cell<bool>,
     /// The confirmation dialog, a stop in flight or the failure box is up.
@@ -242,6 +245,8 @@ impl Controller {
             setup: deps.setup,
             settings: RefCell::new(settings),
             settings_path: deps.settings_path,
+            banner: options.banner,
+            auto_setup: options.auto_setup,
             state: RefCell::new(ServiceState::Initializing),
             quitting: Cell::new(false),
             quit_busy: Cell::new(false),
@@ -323,6 +328,17 @@ impl Controller {
 
     pub fn settings(&self) -> Settings {
         self.0.settings.borrow().clone()
+    }
+
+    /// Whether the page shows its set-up banner: neither `--no-banner` nor the setting hides it.
+    pub fn shows_banner(&self) -> bool {
+        self.0.banner && self.0.settings.borrow().show_banner
+    }
+
+    /// Whether the app may start the setup by itself: neither `--no-auto-setup` nor the
+    /// setting turns it off.
+    pub fn auto_setup(&self) -> bool {
+        self.0.auto_setup && self.0.settings.borrow().auto_setup
     }
 
     /// Stores `settings` and keeps them; a failed write is logged and the change kept.

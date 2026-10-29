@@ -247,7 +247,8 @@ field. Records written by an older setup (or by the Python setup) have only `mon
 and `monitor.edid_id`; the app then finds the monitor by that output name, else by the
 EDID manufacturer and product code, which two identical monitors share. If `connector` is
 missing, rerun `Set up display` on the page so the record names the output and carries the
-full EDID.
+full EDID. Rerun it too if the record came from a setup older than the Wayland monitor fix
+(its `monitor.key` is an `XWAYLAND` name, or it has no `bounds`).
 
 Do: on the page, turn on `Preview my gaze` while the page window is focused. Look around
 the monitor the tracker is mounted on. Click on a window under the bubble. Move focus to
