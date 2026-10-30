@@ -11,7 +11,8 @@ usage: tobii-linux serve [-h] [--display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ]
                          [--host HOST] [--port PORT] [--name NAME]
                          [--display-id DISPLAY_ID]
                          [--wine-clock {auto,boottime,raw}] [--no-gaze]
-                         [--tet-tcp] [--sesp-positions {prp,windows}]
+                         [--route {both,prp,tet-tcp}]
+                         [--sesp-positions {prp,windows}]
 ";
 const HEADPOSE_USAGE: &str = "\
 usage: tobii-linux headpose [-h] --display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ
@@ -74,6 +75,21 @@ fn serve_parses_without_display() {
 }
 
 #[test]
+fn serve_offers_both_routes_unless_told_otherwise() {
+    let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let routes = |extra: &[&str]| {
+        let Ok(Parsed::Serve(serve)) = parse("tobii-linux", &args(&[&["serve"], extra].concat())) else {
+            panic!("serve did not parse")
+        };
+        (serve.options.prp, serve.options.tet_tcp)
+    };
+    assert_eq!(routes(&[]), (true, true));
+    assert_eq!(routes(&["--route", "both"]), (true, true));
+    assert_eq!(routes(&["--route", "prp"]), (true, false));
+    assert_eq!(routes(&["--route", "tet-tcp"]), (false, true));
+}
+
+#[test]
 fn headpose_still_requires_display() {
     assert_eq!(
         usage_error(&["headpose"]),
@@ -86,7 +102,7 @@ fn help_goes_to_stdout_and_exits_zero() {
     let (code, stdout, stderr) = run(&["serve", "--help"]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""));
     assert!(stdout.starts_with(SERVE_USAGE), "{stdout}");
-    assert!(stdout.contains("  --tet-tcp             Serve the route that needs no Wine patch"), "{stdout}");
+    assert!(stdout.contains("  --route {both,prp,tet-tcp}\n                        Routes games reach"), "{stdout}");
     let (code, stdout, _) = run(&["--help"]);
     assert_eq!(code, Some(0));
     assert!(stdout.starts_with(MAIN_USAGE) && stdout.contains("Native Eye Tracker 5 driver (experimental)"));

@@ -530,8 +530,8 @@ class BridgeLink:
 class PrpService:
     """Shared state: pipe names, subscription ids and the sample hub.
 
-    With `tet_tcp` the service serves the patch-free route instead of the PRP
-    pipes: gaze and presence on TCP 127.0.0.1:4455 (`tet_tcp_port`) and head
+    `prp` serves the PRP pipes. `tet_tcp` serves the route that needs no Wine
+    patch: gaze and presence on TCP 127.0.0.1:4455 (`tet_tcp_port`) and head
     pose over the `streamengineservices` pipe (docs/tet-tcp.md). Timestamps on
     that route are the game's QueryPerformanceCounter microseconds (`game_time`).
     """
@@ -539,9 +539,9 @@ class PrpService:
     def __init__(self, hub: HeadPoseHub, name: str = DEFAULT_NAME, serial: str | None = None,
                  clock=service_clock_us, display_area: DisplayArea | None = None,
                  display_id: str | None = None, gaze_hub: GazeHub | None = None,
-                 tet_tcp: bool = False, tet_tcp_port: int | None = None,
+                 prp: bool = True, tet_tcp: bool = False, tet_tcp_port: int | None = None,
                  compensate_sesp_position: bool = True):
-        self.hub, self.name, self.clock = hub, name, clock
+        self.hub, self.name, self.clock, self.prp = hub, name, clock, prp
         self.clock_follower = QpcClockFollower(clock) if isinstance(clock, ServiceClock) else None
         self.game_time = CounterMapping(clock) if isinstance(clock, ServiceClock) else (lambda us: us)
         self.tet_tcp = self.sesp = None
@@ -621,16 +621,15 @@ class PrpService:
 
     @property
     def pipe_names(self) -> list[str]:
-        """Pipes the bridge must serve: prefixed and bare command pipes, then the two internal ones.
+        """Pipes the bridge must serve: prefixed and bare command pipes, the two internal ones, SESP.
 
         The client opens TOBIIPRP-<name> when a pipe listing shows it and <name>
         otherwise (0x18004e8a0); prp-internal:// URLs name their pipe directly.
         The tet-tcp route needs only the fixed SESP pipe.
         """
-        if self.sesp is not None:
-            return [sesp.PIPE_NAME]
-        return [SERVER_PIPE_PREFIX + self.name, self.name, self.subscription_pipe,
-                self.timesync_pipe]
+        prp = [SERVER_PIPE_PREFIX + self.name, self.name, self.subscription_pipe,
+               self.timesync_pipe] if self.prp else []
+        return prp + ([sesp.PIPE_NAME] if self.sesp is not None else [])
 
     def legacy_display_area(self) -> DisplayArea | None:
         """The display area the game's legacy module got from the device, else the configured one."""

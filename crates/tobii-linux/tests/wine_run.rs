@@ -71,7 +71,10 @@ fn the_wrapper_starts_serve_for_the_game_and_stops_it_afterwards() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(7), "{stderr}");
-    assert!(stderr.contains(&format!("PRP service on 127.0.0.1:{port}, pipes ['TOBIIPRP-ET5-LINUX'")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("PRP and tet-tcp service on 127.0.0.1:{port}, pipes ['TOBIIPRP-ET5-LINUX'")),
+        "{stderr}"
+    );
     assert!(stderr.contains(" stopping\n") && stderr.contains(" stopped: 0 session(s), 0 lost\n"), "{stderr}");
     let log = std::fs::read_to_string(state.join("log")).unwrap();
     assert!(log.contains("game game.exe") && log.contains("bridge exit"), "{log}");

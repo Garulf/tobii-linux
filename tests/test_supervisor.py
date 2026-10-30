@@ -245,7 +245,7 @@ if __name__ == '__main__':
 
 
 class TetTcpReplugTests(unittest.IsolatedAsyncioTestCase):
-    """cli.service_link with --tet-tcp: the device's own replies, and port 4455 only while it streams."""
+    """cli.service_link with both routes: the device's own replies, and port 4455 only while it streams."""
     until = ReplugTests.until
     open_session = ReplugTests.open_session
     clock = staticmethod(ReplugTests.clock)
