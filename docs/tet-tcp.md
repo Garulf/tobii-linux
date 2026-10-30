@@ -5,7 +5,7 @@ Star Citizen's `tobii_gameintegration_x64.dll` 9.0.3.25 (SHA-256
 tracker by connecting to TCP port 4455 on `127.0.0.1`. TCP works in unmodified
 Wine and Proton, so a native Linux process on that port needs no pipe-listing
 Wine patch. This document records what the DLL does with such a tracker, how
-`cli serve --tet-tcp` serves it, and what reaches the game: gaze over TCP, and
+`cli serve` serves it, and what reaches the game: gaze over TCP, and
 head pose over the fixed-name pipe `streamengineservices`, which the unchanged
 `prp_bridge.exe` serves ([sesp.md](sesp.md)).
 
@@ -20,7 +20,7 @@ Evidence labels:
   (`evidence/private/calibration/probe/*-raw.jsonl`), plus synthetic replies for
   the commands never recorded (marked below). Logs:
   `evidence/private/tet-tcp/replay/`.
-- **emulated (Wine), service**: `cli serve --tet-tcp`'s service objects run by
+- **emulated (Wine), service**: the service objects of `cli serve --route tet-tcp` run by
   `tools/tet_tcp_emulation.py` with the real ET5's recorded getter replies
   (`evidence/private/gaze-capture/device-query.jsonl`), recorded `0x500`
   messages and synthetic head pose, `prp_bridge.exe`, and the unmodified DLL
@@ -49,10 +49,11 @@ Evidence labels:
 | Discovery | Default mask probes only `127.0.0.1:4455`; a 50 ms connect window; the integration layer rescans every 10 s | static, live (Wine) earlier |
 
 **Result.** The route carries head pose and gaze to the game layer under an
-unpatched Wine (emulated (Wine), service): `cli serve --tet-tcp` answers port
-4455 from its own tracker session and, through the unchanged bridge, the SESP
-pipe. It still needs `prp_bridge.exe` in the prefix, but no Wine patch. It is
-off by default until it has run live; see [Which route](#which-route).
+unpatched Wine (emulated (Wine), service): `cli serve` answers port 4455 from
+its own tracker session and, through the unchanged bridge, the SESP pipe. It
+still needs `prp_bridge.exe` in the prefix, but no Wine patch. The service
+offers it next to the PRP pipes by default, although it has not run live yet;
+see [Which route](#which-route).
 
 ## Discovery (static, live (Wine) earlier)
 
@@ -223,11 +224,13 @@ counter (`e1.client`). The mapping
 follows the most recent bridge, so two prefixes on different clocks at once
 are not supported (inference).
 
-## Service (`cli serve --tet-tcp`)
+## Service (`cli serve`)
 
-`src/tobii_linux/tet_tcp_service.py` with `sesp_service.py`, behind
-`cli serve --tet-tcp` (default off; NixOS `headPoseService.tetTcp`). With it the
-service serves this route instead of the PRP pipes:
+`crates/tobii-linux/src/service/tet_tcp.rs` with `sesp.rs` (Python:
+`src/tobii_linux/tet_tcp_service.py` with `sesp_service.py`). `cli serve`
+offers this route next to the PRP pipes; `--route prp` or `--route tet-tcp`
+(NixOS `headPoseService.route`) serves one of them alone. On this route the
+service works as follows:
 
 - **Port 4455 only while a tracker session runs.** The service closes it and
   every connection when the session ends and opens it again with the next
@@ -315,7 +318,8 @@ WINEPREFIX=... wine tettcp_test_client.exe 'Z:\path\tobii_gameintegration_x64.dl
 Applications built on Stream Engine 2.x, such as cyber-headtrack (NuGet
 `Tobii.StreamEngine.Native` 2.2.2.363, x64 `tobii_stream_engine.dll` SHA-256
 `b4b3bea18cf224d3804bb371af90e231d11769c525426ae2508d193f39893c63`), cannot
-use the PRP route and need `cli serve --tet-tcp`. Addresses in this section
+use the PRP route and need the tet-tcp route, which `cli serve` offers by
+default. Addresses in this section
 refer to that DLL.
 
 - **Device URLs.** `tobii_device_create(api, url, &device)` takes no
@@ -339,7 +343,7 @@ refer to that DLL.
   (`0x18003f9aa`); the service's cached reply selects `0x10008`, which is in
   that range.
 
-So `cli serve --tet-tcp` with the bridge in the prefix should serve a 2.x
+So `cli serve` with the bridge in the prefix should serve a 2.x
 application unchanged, with `tet-tcp://127.0.0.1` as its URL or found by
 enumeration (inference). Not run: whether 2.x's tracker start sequence asks
 for commands the service refuses, and which SESP channel numbers it passes.
@@ -356,7 +360,7 @@ Prepared, not run (albedo unreachable):
   `sesp-windows.cmd` probes the real Windows software's SESP pipe
   ([sesp.md](sesp.md#live-checks)). `sesp-live.cmd` (elevated) binds and attaches
   8-2, stops the three Tobii services and runs `sesp-live.sh` in WSL as root:
-  `cli serve --tet-tcp` on the tracker, then the bridge, `tettcp_test_client.exe`
+  `cli serve --route tet-tcp` on the tracker, then the bridge, `tettcp_test_client.exe`
   and `tgi_test_client.exe` under stock Wine 9.0 (`/home/garulf/.wine-tobii`)
   and GE-Proton 11-9; afterwards it detaches, unbinds, starts the services and
   records `usbipd list` in `sesp\out\usbipd-after.txt`. Nobody needs to sit in
@@ -368,17 +372,34 @@ Prepared, not run (albedo unreachable):
 
 | Situation | Route | Why |
 | --- | --- | --- |
-| Patched Wine or Proton (pipe listing) | PRP (`cli serve`, default) | Live end to end on albedo; window tracking works; the service's timesync keeps time |
-| Stock Wine, Proton or GE-Proton | tet-tcp (`cli serve --tet-tcp`) | No Wine patch; head pose and gaze reach the game layer (emulated (Wine), service). Not yet run live, and no monitor for window tracking |
-| Stream Engine 2.x application (cyber-headtrack) | tet-tcp (`cli serve --tet-tcp`) | 2.x accepts no `tobii-prp://` device URL ([Stream Engine 2.x](#stream-engine-2x-static)) |
+| Patched Wine or Proton (pipe listing) | PRP | Live end to end on albedo; window tracking works; the service's timesync keeps time |
+| Stock Wine, Proton or GE-Proton | tet-tcp | No Wine patch; head pose and gaze reach the game layer (emulated (Wine), service). Not yet run live, and no monitor for window tracking |
+| Stream Engine 2.x application (cyber-headtrack) | tet-tcp | 2.x accepts no `tobii-prp://` device URL ([Stream Engine 2.x](#stream-engine-2x-static)) |
 | Gaze only, no helper in the prefix | tet-tcp without the bridge | Port 4455 alone gives gaze; head pose needs the bridge's SESP pipe |
 
-Both routes need `prp_bridge.exe` in the prefix for head pose and run the same
-way through `tobii-linux-wine-run` ([game-launch.md](game-launch.md)). The
-service offers one route at a time: with `--tet-tcp` it lists only the SESP
-pipe to the bridge, so a patched Wine does not see a second tracker (if both
-were offered, the layer tracks the first one it scans unless the game picks
-by URL).
+`cli serve` offers both routes at once, so no flag depends on the runner or
+the application; `--route prp` or `--route tet-tcp` (NixOS
+`headPoseService.route`) serves one alone. Both need `prp_bridge.exe` in the
+prefix for head pose and run the same way through `tobii-linux-wine-run`
+([game-launch.md](game-launch.md)).
+
+With a patched Wine the game layer then finds two trackers. What decides
+between them:
+
+- **Scan order** (static): `tobii_enumerate_local_device_urls` reports the PRP
+  pipe from the pipe listing first and `tet-tcp://127.0.0.1` last
+  ([service-transport.md](service-transport.md#discovery)).
+- **Window tracking** (static, live (Wine)): `TrackWindow` and
+  `TrackRectangle` pick the tracker whose monitor overlaps the window most and
+  never one without a monitor ([game-integration-layer.md](game-integration-layer.md#tracker-scan)).
+  The tet-tcp tracker has no monitor, so they pick the PRP tracker.
+- **`TrackTracker(url)`** tracks the URL the game passes. Which URL Star
+  Citizen passes when it lists two trackers was not examined; if it takes the
+  first, that is the PRP tracker (inference).
+
+With a stock runner the pipe listing is empty, so only `tet-tcp://127.0.0.1`
+is found. Either way the layer's scan every 10 s also starts a device on port
+4455 and reads its information; the service answers it from cached replies.
 
 ## Gaps
 
@@ -389,7 +410,7 @@ by URL).
   this route.
 - With real device replies the module asked for 1460 and 3060, both refused
   by the ET5 too; commands that only a live run reveals are refused and logged.
-- How Star Citizen chooses between several trackers, and what it does with a
-  tracker whose rectangle is empty, was not examined.
+- Which tracker Star Citizen tracks when it finds both routes, and what it
+  does with a tracker whose rectangle is empty, was not examined.
 - Whether real Windows posts `FD_CONNECT` for a UDP connect, and so whether
   timesync ever worked on this route, was not checked.

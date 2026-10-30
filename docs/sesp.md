@@ -198,7 +198,7 @@ Staged in `evidence/private/sesp/live/` (copy to
   reports whether the pipe exists, its owner process, the initialize answers for
   `tet-tcp://127.0.0.1`, the empty URL and each listed `tobii-prp://` device,
   and 3 s of head-pose messages. It sends no request that changes the service.
-- `sesp-live.cmd` / `sesp-live.sh`: the tracker in WSL2, `cli serve --tet-tcp`,
+- `sesp-live.cmd` / `sesp-live.sh`: the tracker in WSL2, `cli serve --route tet-tcp`,
   and both test clients under stock Wine 9.0 and GE-Proton 11-9; restores
   Windows afterwards.
 

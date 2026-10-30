@@ -216,12 +216,12 @@ options, defaults, help texts, JSON output, log lines and exit codes are those o
 it unchanged:
 
 - `probe`, `headpose`: the descriptor probe and the head-pose JSON lines;
-- `serve` (with `--tet-tcp`, `--wine-clock`, `--no-gaze`, `--sesp-positions`): the
+- `serve` (with `--route`, `--wine-clock`, `--no-gaze`, `--sesp-positions`): the
   game service. Unlike the Python command, `serve` does not require `--display`: as
   Tobii's runtime does, each tracker session reads the display area the tracker holds
   (1430) and the service answers property 1 with it, notifying subscribers when it
   changes. `--display` (the NixOS module's `displayArea`) overrides it, and then the
-  session sends no 1430 of its own; with `--tet-tcp` the getter capture at session start
+  session sends no 1430 of its own; with the tet-tcp route the getter capture at session start
   (`CAPTURED_GETTERS`, `crates/tobii-service/src/tet_tcp.rs`) still sends 1430, but its
   reply only feeds TCP 4455. With neither, the session serves gaze and presence without
   head pose and property 1 stays refused. `headpose` still requires `--display`;
