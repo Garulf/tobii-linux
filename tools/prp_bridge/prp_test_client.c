@@ -8,6 +8,7 @@
  * <dll> is tobii_stream_engine.dll (named exports) or Star Citizen's
  * tobii_gameintegration_x64.dll 9.0.3.25, whose embedded Stream Engine entry points
  * are not exported and are called at their static addresses (docs/prp-bridge.md).
+ * Stream Engine 2.x takes no field_of_use: tobii_device_create(api, url, &device).
  * Output: one line per event; "head" and "gaze" lines carry the sample, the Stream
  * Engine system clock and the local QueryPerformanceCounter time in microseconds.
  */
@@ -43,6 +44,11 @@ typedef int (*ApiCreate)(void **api, void *allocator, const CustomLog *logger);
 typedef int (*ApiDestroy)(void *api);
 typedef int (*EnumerateUrls)(void *api, UrlCallback receiver, void *user);
 typedef int (*DeviceCreate)(void *api, const char *url, int field_of_use, void **device);
+typedef int (*DeviceCreateV2)(void *api, const char *url, void **device);
+typedef struct {
+    int major, minor, revision, build;
+} ApiVersion;
+typedef int (*GetApiVersion)(ApiVersion *version);
 typedef int (*DeviceDestroy)(void *device);
 typedef int (*HeadSubscribe)(void *device, HeadCallback callback, void *user);
 typedef int (*HeadUnsubscribe)(void *device);
@@ -179,6 +185,7 @@ int main(int argc, char **argv)
     ApiDestroy api_destroy;
     EnumerateUrls enumerate_urls;
     const char *url = argv[2];
+    ApiVersion version = {0, 0, 0, 0};
     DeviceCreate device_create;
     DeviceDestroy device_destroy;
     GetDeviceInfo get_device_info;
@@ -220,6 +227,9 @@ int main(int argc, char **argv)
     gaze_unsubscribe = need("tobii_gaze_point_unsubscribe");
     process_callbacks = need("tobii_device_process_callbacks");
 
+    if (GetProcAddress(module, "tobii_get_api_version"))
+        ((GetApiVersion)need("tobii_get_api_version"))(&version);
+    printf("api_version %d.%d.%d.%d\n", version.major, version.minor, version.revision, version.build);
     if (report("api_create", api_create(&api, NULL, &logger)))
         return 1;
     if (strcmp(url, "discover") == 0) {
@@ -231,8 +241,14 @@ int main(int argc, char **argv)
         }
         url = discovered_url;
     }
-    printf("url %s field_of_use=%d\n", url, field_of_use);
-    if (report("device_create", device_create(api, url, field_of_use, &device)) == 0) {
+    if (version.major >= 1 && version.major <= 2) {
+        printf("url %s\n", url);
+        code = ((DeviceCreateV2)(void *)device_create)(api, url, &device);
+    } else {
+        printf("url %s field_of_use=%d\n", url, field_of_use);
+        code = device_create(api, url, field_of_use, &device);
+    }
+    if (report("device_create", code) == 0) {
         if (report("get_device_info", get_device_info(device, info)) == 0)
             for (index = 0; index < DEVICE_INFO_STRINGS; index++)
                 printf("device_info[%d] %.255s\n", index, info + index * DEVICE_INFO_STRING);
