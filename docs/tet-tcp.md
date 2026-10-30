@@ -310,6 +310,43 @@ WINEPREFIX=... wine tettcp_test_client.exe 'Z:\path\tobii_gameintegration_x64.dl
 
 `evidence/private/tet-tcp/replay/go.sh` has the exact arguments.
 
+## Stream Engine 2.x (static)
+
+Applications built on Stream Engine 2.x, such as cyber-headtrack (NuGet
+`Tobii.StreamEngine.Native` 2.2.2.363, x64 `tobii_stream_engine.dll` SHA-256
+`b4b3bea18cf224d3804bb371af90e231d11769c525426ae2508d193f39893c63`), cannot
+use the PRP route and need `cli serve --tet-tcp`. Addresses in this section
+refer to that DLL.
+
+- **Device URLs.** `tobii_device_create(api, url, &device)` takes no
+  `field_of_use`. It hands the URL to the tracker factory `0x180033120`, whose
+  classifier `0x180033c50` accepts only `tobii-ttp://` and `tet-tcp://` (TTP
+  tracker) and `tobii-custom://`. Every other scheme, `tobii-prp://` included,
+  returns invalid parameter without a log line; `device_create`
+  (`0x18010ca70`) passes it on as `TOBII_ERROR_INVALID_PARAMETER`. No pipe
+  name can change this: 2.x has no PRP device at all.
+- **Discovery.** As in the 4.x legacy module: named pipes with the `TOBII`
+  prefix (`tobii-ttp://`), then `ETDefaultPIPE`, then the TCP probe
+  `0x18004d3b0` with mask `0xFFFFFFFC`, so only `127.0.0.1:4455`.
+- **Head pose.** `device_create` connects `tobii-sesp://streamengineservices`
+  (`0x180111410`, from `0x18010d60f`); a failure there does not fail the
+  device. The hello is the one in [sesp.md](sesp.md): a `u32` channel, the reply
+  pipe `client_%s_%08x_%016llx`, a NUL, then a `u32` read.
+  `tobii_head_pose_subscribe` (`0x180102d40`) needs license level 1, the level
+  `device_create` sets by default, and then sends the SESP head pose start
+  (`0x180110e60`).
+- **TTP.** The protocol upgrade offers versions `0x10000` to `0x10008`
+  (`0x18003f9aa`); the service's cached reply selects `0x10008`, which is in
+  that range.
+
+So `cli serve --tet-tcp` with the bridge in the prefix should serve a 2.x
+application unchanged, with `tet-tcp://127.0.0.1` as its URL or found by
+enumeration (inference). Not run: whether 2.x's tracker start sequence asks
+for commands the service refuses, and which SESP channel numbers it passes.
+`tettcp_test_client.exe` detects 2.x through `tobii_get_api_version` and uses
+the three-argument `device_create` and the shorter 2.x device info, so it can
+check this against a 2.x DLL.
+
 ## Live test
 
 Prepared, not run (albedo unreachable):
@@ -333,6 +370,7 @@ Prepared, not run (albedo unreachable):
 | --- | --- | --- |
 | Patched Wine or Proton (pipe listing) | PRP (`cli serve`, default) | Live end to end on albedo; window tracking works; the service's timesync keeps time |
 | Stock Wine, Proton or GE-Proton | tet-tcp (`cli serve --tet-tcp`) | No Wine patch; head pose and gaze reach the game layer (emulated (Wine), service). Not yet run live, and no monitor for window tracking |
+| Stream Engine 2.x application (cyber-headtrack) | tet-tcp (`cli serve --tet-tcp`) | 2.x accepts no `tobii-prp://` device URL ([Stream Engine 2.x](#stream-engine-2x-static)) |
 | Gaze only, no helper in the prefix | tet-tcp without the bridge | Port 4455 alone gives gaze; head pose needs the bridge's SESP pipe |
 
 Both routes need `prp_bridge.exe` in the prefix for head pose and run the same

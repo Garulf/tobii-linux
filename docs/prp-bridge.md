@@ -127,6 +127,10 @@ The service announces four pipes for `--name <name>` (default `ET5-LINUX`):
 | random UUID | subscription channel, URL `prp-internal://<uuid>` |
 | random UUID | timesync channel, URL `prp-internal://<uuid>` |
 
+Stream Engine 2.x clients never reach these pipes: 2.x accepts no
+`tobii-prp://` device URL and needs the tet-tcp route
+([tet-tcp.md](tet-tcp.md#stream-engine-2x-static)).
+
 The real service uses the same scheme: random UUID pipes advertised as
 `prp-internal://` URLs (live, Windows). For `prp-internal://` the client opens
 the name unchanged, so these two pipes need no discovery. Do not choose a name
