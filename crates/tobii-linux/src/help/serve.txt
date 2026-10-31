@@ -3,7 +3,8 @@ usage: tobii-linux serve [-h] [--display TLX TLY TLZ TRX TRY TRZ BLX BLY BLZ]
                          [--host HOST] [--port PORT] [--name NAME]
                          [--display-id DISPLAY_ID]
                          [--wine-clock {auto,boottime,raw}] [--no-gaze]
-                         [--tet-tcp] [--sesp-positions {prp,windows}]
+                         [--route {both,prp,tet-tcp}]
+                         [--sesp-positions {prp,windows}]
 
 options:
   -h, --help            show this help message and exit
@@ -28,11 +29,14 @@ options:
                         Wine and every Proton
   --no-gaze             Serve head pose only, without subscribing the gaze
                         stream
-  --tet-tcp             Serve the route that needs no Wine patch instead of
-                        the PRP pipes: gaze on TCP 127.0.0.1:4455, head pose
-                        over the bridge's streamengineservices pipe
-                        (experimental)
+  --route {both,prp,tet-tcp}
+                        Routes games reach the tracker by: both (default), the
+                        PRP pipes only (prp), or only the route that needs no
+                        Wine patch and that Stream Engine 2.x applications use
+                        (tet-tcp): gaze on TCP 127.0.0.1:4455, head pose over
+                        the bridge's streamengineservices pipe
   --sesp-positions {prp,windows}
-                        With --tet-tcp: send head positions the game layer
-                        turns into the PRP route's positions (prp, default),
-                        or unchanged as the Windows service does (windows)
+                        On the tet-tcp route: send head positions the game
+                        layer turns into the PRP route's positions (prp,
+                        default), or unchanged as the Windows service does
+                        (windows)

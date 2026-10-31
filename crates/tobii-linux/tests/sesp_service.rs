@@ -128,9 +128,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_prp(false).await
+    }
+
+    async fn with_prp(prp: bool) -> Self {
         let clock = wine_clock("raw", Clocks::Scripted(Arc::new(|_| 0))).unwrap();
         let options = Options {
             display_area: Some(ALBEDO_AREA),
+            prp,
             tet_tcp: true,
             tet_tcp_port: 0,
             ..common::options(DEFAULT_NAME)
@@ -160,6 +165,20 @@ fn bridge_serves_only_the_sesp_pipe() {
         bridge.write_all(&encode_frame(FRAME_BRIDGE_HELLO, &1u32.to_le_bytes()).unwrap()).await.unwrap();
         let (_, payload) = read_frame(&mut bridge).await.unwrap();
         assert_eq!(decode_names(&payload).unwrap(), [PIPE_NAME]);
+    });
+}
+
+#[test]
+fn both_routes_serve_the_prp_pipes_and_the_sesp_pipe() {
+    run(async {
+        let fixture = Fixture::with_prp(true).await;
+        let mut bridge = TcpStream::connect(("127.0.0.1", fixture.port)).await.unwrap();
+        bridge.write_all(&encode_frame(FRAME_BRIDGE_HELLO, &1u32.to_le_bytes()).unwrap()).await.unwrap();
+        let (_, payload) = read_frame(&mut bridge).await.unwrap();
+        let names = decode_names(&payload).unwrap();
+        assert_eq!(names, fixture.service.pipe_names());
+        assert_eq!(names[..2], [format!("TOBIIPRP-{DEFAULT_NAME}"), DEFAULT_NAME.to_string()]);
+        assert_eq!((names.len(), names[4].as_str()), (5, PIPE_NAME));
     });
 }
 

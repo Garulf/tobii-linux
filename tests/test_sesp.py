@@ -11,7 +11,7 @@ import unittest
 
 from tobii_linux import sesp
 from tobii_linux.head_pose_pipeline import DisplayArea, HeadPoseSample
-from tobii_linux.prp_service import (FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN,
+from tobii_linux.prp_service import (DEFAULT_NAME, FRAME_BRIDGE_HELLO, FRAME_MESSAGE, FRAME_PIPE_OPEN,
                                      FRAME_REPLY_PIPE, HeadPoseHub, PrpService, decode_names,
                                      encode_frame, encode_pipe_open, read_frame)
 from tobii_linux.qpc_clock import CounterMapping, QpcSample, ServiceClock
@@ -257,11 +257,13 @@ def game_request(sequence: int, kind: int, payload=(), strings=()) -> bytes:
 
 
 class SespServiceTests(unittest.IsolatedAsyncioTestCase):
+    prp = False
+
     async def asyncSetUp(self):
         self.hub = HeadPoseHub()
         self.clock = ServiceClock("raw", read_us=lambda name: 0)
         self.service = PrpService(self.hub, clock=self.clock, display_area=ALBEDO_AREA,
-                                  tet_tcp=True, tet_tcp_port=0)
+                                  prp=self.prp, tet_tcp=True, tet_tcp_port=0)
         self.service.attach_tracker()
         self.server = await self.service.serve("127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
@@ -293,6 +295,19 @@ class SespServiceTests(unittest.IsolatedAsyncioTestCase):
         _, payload = await read_frame(reader)
         writer.close()
         self.assertEqual(decode_names(payload), [sesp.PIPE_NAME])
+
+    async def test_both_routes_serve_the_prp_pipes_and_the_sesp_pipe(self):
+        self.prp = True
+        await self.asyncTearDown()
+        await self.asyncSetUp()
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(encode_frame(FRAME_BRIDGE_HELLO, struct.pack("<I", 1)))
+        _, payload = await read_frame(reader)
+        writer.close()
+        names = decode_names(payload)
+        self.assertEqual(names, self.service.pipe_names)
+        self.assertEqual(names[:2], [f"TOBIIPRP-{DEFAULT_NAME}", DEFAULT_NAME])
+        self.assertEqual(names[4:], [sesp.PIPE_NAME])
 
     async def test_initialize_advertises_head_pose(self):
         _, _, response = await self.connect()

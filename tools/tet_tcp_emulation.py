@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run the service's tet-tcp route (`cli serve --tet-tcp`) without a tracker.
+"""Run the service's tet-tcp route (`cli serve --route tet-tcp`) without a tracker.
 
-The PrpService of `cli serve --tet-tcp` listens for the Wine bridge (relay port,
+The PrpService of `cli serve --route tet-tcp` listens for the Wine bridge (relay port,
 default 7760) and on TCP 127.0.0.1:4455. Instead of a tracker session it gets:
 
 - device replies recorded from the real ET5 (`--device-query`, the getter replies
@@ -81,7 +81,7 @@ async def feed_streams(service, clock, gaze_messages):
 async def run(args):
     clock = wine_clock(args.wine_clock)
     hub = HeadPoseHub()
-    service = PrpService(hub, clock=clock, display_area=None, tet_tcp=True,
+    service = PrpService(hub, clock=clock, display_area=None, prp=False, tet_tcp=True,
                          compensate_sesp_position=args.sesp_positions == 'prp')
     device, gaze_messages = recorded(args.device_query, args.replay)
     server = await service.serve(args.host, args.port)

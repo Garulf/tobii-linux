@@ -120,7 +120,7 @@
           cargo test --release --workspace --offline --frozen --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
             -- --skip the_wrapper_starts_serve_for_the_game_and_stops_it_afterwards
           PYTHONPATH=$out/${pkgs.python3.sitePackages}:$PYTHONPATH python -m unittest discover -s tests
-          $out/bin/tobii-linux serve --help | grep -q -- --tet-tcp
+          $out/bin/tobii-linux serve --help | grep -q -- --route
           runHook postCheck
         '';
         pythonImportsCheck = [ "tobii_linux.usb" "tobii_linux._native" "tobii_linux.cli" ];

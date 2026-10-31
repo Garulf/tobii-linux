@@ -13,9 +13,17 @@ let
     "--name" cfg.headPoseService.deviceName
   ] ++ lib.optionals (cfg.headPoseService.displayId != null) [
     "--display-id" cfg.headPoseService.displayId
-  ] ++ lib.optionals cfg.headPoseService.tetTcp [ "--tet-tcp" ];
+  ] ++ [ "--route" cfg.headPoseService.route ];
   serviceUnit = "tobii-head-pose.service";
 in {
+  imports = [
+    (lib.mkRemovedOptionModule [ "hardware" "tobii-eye-tracker-5" "headPoseService" "tetTcp" ] ''
+      Both routes are now served by default. Set
+      hardware.tobii-eye-tracker-5.headPoseService.route = "tet-tcp" for the old
+      tetTcp = true, or "prp" for the old default.
+    '')
+  ];
+
   options.hardware.tobii-eye-tracker-5 = {
     enable = lib.mkEnableOption
       "Eye Tracker 5 USB access and the experimental head-pose command";
@@ -94,13 +102,16 @@ in {
         default = "ET5-LINUX";
         description = "Device name the game sees as tobii-prp://<name>.";
       };
-      tetTcp = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
+      route = lib.mkOption {
+        type = lib.types.enum [ "both" "prp" "tet-tcp" ];
+        default = "both";
         description = ''
-          Serve the route that works with an unpatched Wine or Proton instead
-          of the PRP pipes: gaze on TCP 127.0.0.1:4455 and head pose over the
-          bridge's streamengineservices pipe. Experimental; see docs/tet-tcp.md.
+          Routes games reach the tracker by. "prp" serves the PRP pipes, which a
+          Wine with the pipe-listing patch finds. "tet-tcp" works with an
+          unpatched Wine or Proton and is the only route of Stream Engine 2.x
+          applications: gaze on TCP 127.0.0.1:4455 and head pose over the
+          bridge's streamengineservices pipe; see docs/tet-tcp.md. "both" serves
+          both.
         '';
       };
     };

@@ -37,6 +37,13 @@ fn session_options(display: OptionSpec) -> Vec<OptionSpec> {
     vec![display, OptionSpec::text("--models"), OptionSpec::int("--channel"), OptionSpec::int("--index")]
 }
 
+/// `--route`: both routes (the default), only the PRP pipes, or only tet-tcp.
+const ROUTES: [&str; 3] = ["both", "prp", "tet-tcp"];
+
+fn route(values: &crate::args::Values) -> &str {
+    values.text("--route").unwrap_or(ROUTES[0])
+}
+
 fn serve_options() -> Vec<OptionSpec> {
     let mut options = session_options(display_option());
     options.extend([
@@ -46,7 +53,7 @@ fn serve_options() -> Vec<OptionSpec> {
         OptionSpec::text("--display-id"),
         OptionSpec::choice("--wine-clock", &WINE_CLOCKS),
         OptionSpec::flag("--no-gaze"),
-        OptionSpec::flag("--tet-tcp"),
+        OptionSpec::choice("--route", &ROUTES),
         OptionSpec::choice("--sesp-positions", &["prp", "windows"]),
     ]);
     options
@@ -187,7 +194,8 @@ impl Serve {
             display_area: session.corners,
             display_id: values.text("--display-id").map(String::from),
             gaze: !values.flag("--no-gaze"),
-            tet_tcp: values.flag("--tet-tcp"),
+            prp: route(values) != "tet-tcp",
+            tet_tcp: route(values) != "prp",
             compensate_sesp_position: values.text("--sesp-positions").unwrap_or("prp") == "prp",
             enabled_state: Some(EnabledState::default_path(
                 std::env::var("XDG_STATE_HOME").ok().as_deref(),
@@ -444,7 +452,11 @@ async fn run_service(
     let listener = listen(&arguments.host, port).await?;
     log::info!(
         "{} service on {}:{}, pipes {}",
-        if arguments.options.tet_tcp { "tet-tcp" } else { "PRP" },
+        match (arguments.options.prp, arguments.options.tet_tcp) {
+            (true, true) => "PRP and tet-tcp",
+            (false, true) => "tet-tcp",
+            _ => "PRP",
+        },
         arguments.host,
         arguments.port,
         list_repr(&service.pipe_names())

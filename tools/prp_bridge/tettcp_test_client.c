@@ -11,6 +11,9 @@
  * are not exported and are called at their static addresses (docs/prp-bridge.md).
  * Output: one line per event; "head" and "gaze" lines carry the sample, the Stream
  * Engine system clock and the local QueryPerformanceCounter time in microseconds.
+ * Stream Engine 2.x, which reaches a tracker only through tet-tcp:// or tobii-ttp://,
+ * takes no field_of_use, tobii_device_create(api, url, &device), and fills a shorter
+ * tobii_device_info_t (docs/tet-tcp.md).
  */
 #include <windows.h>
 #include <stdint.h>
@@ -44,6 +47,11 @@ typedef int (*ApiCreate)(void **api, void *allocator, const CustomLog *logger);
 typedef int (*ApiDestroy)(void *api);
 typedef int (*EnumerateUrls)(void *api, UrlCallback receiver, void *user);
 typedef int (*DeviceCreate)(void *api, const char *url, int field_of_use, void **device);
+typedef int (*DeviceCreateV2)(void *api, const char *url, void **device);
+typedef struct {
+    int major, minor, revision, build;
+} ApiVersion;
+typedef int (*GetApiVersion)(ApiVersion *version);
 typedef int (*DeviceDestroy)(void *device);
 typedef int (*HeadSubscribe)(void *device, HeadCallback callback, void *user);
 typedef int (*HeadUnsubscribe)(void *device);
@@ -58,6 +66,11 @@ typedef int (*StreamSupported)(void *device, int stream, int *supported);
 
 #define DEVICE_INFO_STRING 256
 #define DEVICE_INFO_STRINGS 6
+
+/* tobii_device_info_t of Stream Engine 2.x: serial, model, generation, firmware. */
+static const struct {
+    size_t offset, size;
+} device_info_v2[] = {{0, 128}, {128, 64}, {192, 64}, {256, 128}};
 
 static void *api;
 static SystemClock system_clock;
@@ -181,6 +194,8 @@ int main(int argc, char **argv)
     ApiDestroy api_destroy;
     EnumerateUrls enumerate_urls;
     const char *url = argv[2];
+    ApiVersion version = {0, 0, 0, 0};
+    int stream_engine_v2;
     DeviceCreate device_create;
     DeviceDestroy device_destroy;
     GetDeviceInfo get_device_info;
@@ -224,6 +239,10 @@ int main(int argc, char **argv)
     process_callbacks = need("tobii_device_process_callbacks");
     stream_supported = need("tobii_stream_supported");
 
+    if (GetProcAddress(module, "tobii_get_api_version"))
+        ((GetApiVersion)need("tobii_get_api_version"))(&version);
+    printf("api_version %d.%d.%d.%d\n", version.major, version.minor, version.revision, version.build);
+    stream_engine_v2 = version.major >= 1 && version.major <= 2;
     if (report("api_create", api_create(&api, NULL, &logger)))
         return 1;
     if (strcmp(url, "discover") == 0) {
@@ -235,11 +254,23 @@ int main(int argc, char **argv)
         }
         url = discovered_url;
     }
-    printf("url %s field_of_use=%d\n", url, field_of_use);
-    if (report("device_create", device_create(api, url, field_of_use, &device)) == 0) {
-        if (report("get_device_info", get_device_info(device, info)) == 0)
-            for (index = 0; index < DEVICE_INFO_STRINGS; index++)
-                printf("device_info[%d] %.255s\n", index, info + index * DEVICE_INFO_STRING);
+    if (stream_engine_v2) {
+        printf("url %s\n", url);
+        code = ((DeviceCreateV2)(void *)device_create)(api, url, &device);
+    } else {
+        printf("url %s field_of_use=%d\n", url, field_of_use);
+        code = device_create(api, url, field_of_use, &device);
+    }
+    if (report("device_create", code) == 0) {
+        if (report("get_device_info", get_device_info(device, info)) == 0) {
+            if (stream_engine_v2)
+                for (index = 0; index < (int)(sizeof device_info_v2 / sizeof device_info_v2[0]); index++)
+                    printf("device_info[%d] %.*s\n", index, (int)device_info_v2[index].size - 1,
+                           info + device_info_v2[index].offset);
+            else
+                for (index = 0; index < DEVICE_INFO_STRINGS; index++)
+                    printf("device_info[%d] %.255s\n", index, info + index * DEVICE_INFO_STRING);
+        }
         report("update_timesync", update_timesync(device));
         for (stream = 0; stream <= 12; stream++) {
             supported = -1;

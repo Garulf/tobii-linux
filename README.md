@@ -102,10 +102,14 @@ Three pieces are needed:
    ([details](docs/wine-pipe-enumeration.md)). The game's integration layer
    only tracks discovered trackers, so this is not optional; stock Proton
    lists pipes only partially and is not enough either. The exception is the
-   experimental `serve --tet-tcp` route, which the game DLL finds on TCP and
-   which gets head pose over a pipe opened by name, so it works with a stock
+   experimental tet-tcp route, which `serve` offers alongside the pipes by
+   default: the game DLL finds it on TCP and opens its head pose pipe by
+   name, so it works with a stock
    runner; it has run under an unpatched Wine with recorded tracker data, not
    yet with the real tracker ([tet-tcp route](docs/tet-tcp.md)).
+   Applications on Stream Engine 2.x, such as cyber-headtrack, can only
+   use this route: 2.x does not accept `tobii-prp://` device URLs
+   ([details](docs/tet-tcp.md#stream-engine-2x-static)).
 2. The service on Linux, with the same display area as above:
 
    ```sh

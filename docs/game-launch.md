@@ -313,17 +313,19 @@ replacing at least the wineserver
 ([wine-pipe-enumeration.md](wine-pipe-enumeration.md#without-a-wine-patch)).
 The same DLL also finds a tracker on TCP `127.0.0.1:4455` and then gets head
 pose from the fixed-name pipe `streamengineservices`, which needs no listing
-([tet-tcp.md](tet-tcp.md), [sesp.md](sesp.md)). Start the service with
-`--tet-tcp` and launch the game exactly as above, with the stock runner:
+([tet-tcp.md](tet-tcp.md), [sesp.md](sesp.md)). The service offers this route
+next to the PRP pipes by default, so start it as usual and launch the game
+exactly as above, with the stock runner:
 
 ```sh
-tobii-linux serve --tet-tcp --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
+tobii-linux serve --display -296.62 326 111.82 300.38 326 111.82 -296.62 10.27 -3.1
 tobii-linux-wine-run %command%          # Steam with stock Proton
 ```
 
-On NixOS set `headPoseService.tetTcp = true`. The bridge is the same program;
-the service tells it to serve only `streamengineservices` and itself listens on
-port 4455 while the tracker runs.
+The bridge is the same program; the service tells it to serve
+`streamengineservices` as well and itself listens on port 4455 while the
+tracker runs. `--route prp` or `--route tet-tcp` (NixOS
+`headPoseService.route`) serves one route alone.
 
 Status, by evidence:
 
@@ -339,6 +341,9 @@ Status, by evidence:
 | Star Citizen | not run | |
 
 Use the PRP route with a patched runner when one is available: it has run live
-end to end and supports window tracking. Use `--tet-tcp` when the runner
-cannot be patched (stock Proton through Steam, a distribution Wine), knowing
-it has not yet run with the real tracker.
+end to end and supports window tracking. The tet-tcp route is there when the
+runner cannot be patched (stock Proton through Steam, a distribution Wine),
+knowing it has not yet run with the real tracker. With a patched runner the
+game sees both trackers; window tracking picks the PRP one, which is listed
+first ([tet-tcp.md](tet-tcp.md#which-route)). If the game tracks the wrong
+one, serve `--route prp`.

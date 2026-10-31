@@ -1,4 +1,4 @@
-//! `serve --tet-tcp` without a tracker, as tools/tet_tcp_emulation.py runs the Python service:
+//! `serve --route tet-tcp` without a tracker, as tools/tet_tcp_emulation.py runs the Python service:
 //! the device's recorded getter, protocol upgrade and unlock_ppu replies, its recorded gaze
 //! messages looped at 30 Hz with a "present" record every second, and the synthetic head
 //! sweep. Prints the same JSON summary after `--seconds`. Offline only.
@@ -145,8 +145,12 @@ async fn feed_streams(service: PrpService, gaze: Vec<Message>) {
 
 async fn run(arguments: Arguments) -> Result<(), Failure> {
     let clock = wine_clock(&arguments.wine_clock, Clocks::Host).ok_or("unknown --wine-clock")?;
-    let options =
-        Options { tet_tcp: true, compensate_sesp_position: arguments.compensate_sesp_position, ..Options::default() };
+    let options = Options {
+        prp: false,
+        tet_tcp: true,
+        compensate_sesp_position: arguments.compensate_sesp_position,
+        ..Options::default()
+    };
     let service = PrpService::new(options, Arc::clone(&clock));
     let (device, gaze) = recorded(&arguments.device_query, &arguments.replay)?;
     let accept = service.serve(listen(&arguments.host, arguments.port).await?);

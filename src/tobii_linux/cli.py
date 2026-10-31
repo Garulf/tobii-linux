@@ -10,6 +10,7 @@ from .usb import USBContext, USBError
 
 REPO_MODELS = Path(__file__).resolve().parents[2]/'models/tobii-et5'
 DEFAULT_MODELS = Path(os.environ.get('TOBII_LINUX_MODELS') or (REPO_MODELS if REPO_MODELS.is_dir() else default_models_dir()))
+ROUTE_NAMES = {'both': 'PRP and tet-tcp', 'prp': 'PRP', 'tet-tcp': 'tet-tcp'}
 
 
 def probe(_):
@@ -101,10 +102,11 @@ service process and the bridge's control connection stay up.
         hub = HeadPoseHub()
         gaze_hub = None if args.no_gaze else GazeHub()
         service = PrpService(hub, args.name, clock=clock, display_area=display_area(args),
-                             display_id=args.display_id, gaze_hub=gaze_hub, tet_tcp=args.tet_tcp,
+                             display_id=args.display_id, gaze_hub=gaze_hub,
+                             prp=args.route != 'tet-tcp', tet_tcp=args.route != 'prp',
                              compensate_sesp_position=args.sesp_positions == 'prp')
         server = await service.serve(args.host, args.port)
-        logging.info('%s service on %s:%d, pipes %s', 'tet-tcp' if args.tet_tcp else 'PRP',
+        logging.info('%s service on %s:%d, pipes %s', ROUTE_NAMES[args.route],
                      args.host, args.port, service.pipe_names)
 
         link = service_link(service, loop, processor, clock,
@@ -161,12 +163,14 @@ def main():
                                    'and later, raw older Wine and every Proton')
     serve_parser.add_argument('--no-gaze', action='store_true',
                               help='Serve head pose only, without subscribing the gaze stream')
-    serve_parser.add_argument('--tet-tcp', action='store_true',
-                              help='Serve the route that needs no Wine patch instead of the PRP pipes: '
-                                   'gaze on TCP 127.0.0.1:4455, head pose over the bridge\'s '
-                                   'streamengineservices pipe (experimental)')
+    serve_parser.add_argument('--route', choices=tuple(ROUTE_NAMES), default='both',
+                              help='Routes games reach the tracker by: both (default), the PRP '
+                                   'pipes only (prp), or only the route that needs no Wine patch '
+                                   'and that Stream Engine 2.x applications use (tet-tcp): gaze '
+                                   'on TCP 127.0.0.1:4455, head pose over the bridge\'s '
+                                   'streamengineservices pipe')
     serve_parser.add_argument('--sesp-positions', choices=('prp', 'windows'), default='prp',
-                              help='With --tet-tcp: send head positions the game layer turns into '
+                              help='On the tet-tcp route: send head positions the game layer turns into '
                                    'the PRP route\'s positions (prp, default), or unchanged as '
                                    'the Windows service does (windows)')
     args = parser.parse_args()

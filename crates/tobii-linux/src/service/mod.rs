@@ -90,6 +90,7 @@ pub struct Options {
     pub display_area: Option<Corners>,
     pub display_id: Option<String>,
     pub gaze: bool,
+    pub prp: bool,
     pub tet_tcp: bool,
     pub tet_tcp_host: String,
     pub tet_tcp_port: u16,
@@ -111,6 +112,7 @@ impl Default for Options {
             display_area: None,
             display_id: None,
             gaze: false,
+            prp: true,
             tet_tcp: false,
             tet_tcp_host: "127.0.0.1".into(),
             tet_tcp_port: tobii_service::tet_tcp::COMMAND_PORT,
@@ -244,6 +246,7 @@ pub struct Counters {
 #[derive(Debug)]
 struct Inner {
     name: String,
+    prp: bool,
     serial: String,
     display_override: bool,
     display_area: Cell<Option<Corners>>,
@@ -285,7 +288,7 @@ struct Inner {
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
 ///
-/// With `tet_tcp` the service serves the patch-free route instead of the PRP pipes: gaze
+/// `prp` serves the PRP pipes. `tet_tcp` serves the route that needs no Wine patch: gaze
 /// and presence on TCP 127.0.0.1:4455 and head pose over the `streamengineservices` pipe
 /// (docs/tet-tcp.md). Timestamps on that route are the game's QueryPerformanceCounter
 /// microseconds.
@@ -364,6 +367,7 @@ impl PrpService {
         Self(Rc::new(Inner {
             serial: options.serial.clone().unwrap_or_else(|| options.name.clone()),
             name: options.name,
+            prp: options.prp,
             display_override: options.display_area.is_some(),
             display_area: Cell::new(options.display_area),
             display_id: options.display_id,
@@ -487,21 +491,25 @@ impl PrpService {
         id
     }
 
-    /// Pipes the bridge must serve: prefixed and bare command pipes, then the two internal ones.
+    /// Pipes the bridge must serve: prefixed and bare command pipes, the two internal ones, SESP.
     ///
     /// The client opens TOBIIPRP-<name> when a pipe listing shows it and <name> otherwise
     /// (0x18004e8a0); prp-internal:// URLs name their pipe directly. The tet-tcp route
     /// needs only the fixed SESP pipe.
     pub fn pipe_names(&self) -> Vec<String> {
-        if self.0.sesp.is_some() {
-            return vec![tobii_service::sesp::PIPE_NAME.into()];
+        let mut names = Vec::new();
+        if self.0.prp {
+            names.extend([
+                format!("{SERVER_PIPE_PREFIX}{}", self.0.name),
+                self.0.name.clone(),
+                self.0.subscription_pipe.clone(),
+                self.0.timesync_pipe.clone(),
+            ]);
         }
-        vec![
-            format!("{SERVER_PIPE_PREFIX}{}", self.0.name),
-            self.0.name.clone(),
-            self.0.subscription_pipe.clone(),
-            self.0.timesync_pipe.clone(),
-        ]
+        if self.0.sesp.is_some() {
+            names.push(tobii_service::sesp::PIPE_NAME.into());
+        }
+        names
     }
 
     /// Applies one event of the tracker session.

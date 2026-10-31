@@ -338,7 +338,7 @@ the game process. Under that constraint:
   in-process platform module instead of PRP
   ([service-transport.md](service-transport.md#discovery)). That module gets
   head pose from the fixed-name pipe `streamengineservices`, which needs no
-  listing; `cli serve --tet-tcp` serves the route with the unchanged bridge
+  listing; `cli serve` serves the route with the unchanged bridge
   (emulated under unpatched Wine 8.0, not yet live: [tet-tcp.md](tet-tcp.md),
   [sesp.md](sesp.md)).
 - **`\\.\pipe\ETDefaultPIPE`**: the default enumeration never called it
