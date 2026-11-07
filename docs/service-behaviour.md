@@ -205,6 +205,20 @@ its engine subscribes presence, gaze and head pose only while the setting is on
 and `AtLeastOneClientConnected` is true, and unsubscribes them on leaving
 `Tracking` (`ENG:EyeTrackingEnabler.cs:41-50,171-175`,
 `ENG:EyeTrackingEngine.cs:466-478`, `CORE:InteractionEngine.cs:161-167`).
+Locking the Windows session also drops Experience's interest:
+`EyeTrackingSessionHandler` listens for `SessionSwitch` lock (7) and unlock (8)
+and calls `SetSessionUnlocked`, which disables Experience's gaze stream, and
+its presence stream unless a presence feature has subscribers; head pose is
+left alone, and unlock enables them again
+(`ENG:EyeTrackingSessionHandler.cs:8-37`, `ENG:EyeTrackingEnabler.cs:177-201`).
+This only releases Experience's own subscriptions, so with no game running the
+device ends up with no streams while locked, and a running game keeps its
+streams (static). The runtime itself does not look at the lock. Its power
+monitor (`power_monitor_win.cpp`, window procedure `0x1402d5be0`) handles
+`WM_POWERBROADCAST`: suspend (4) runs the sleep path that removes every device
+and closes every client, resume (7, 0x12) re-adds them, and the
+`GUID_MONITOR_POWER_ON` setting (`0x14111ac60`) only sets a flag when the
+display turns off, then runs the resume path when it turns on (static).
 Power save (`TOBII_INTERNAL_CAPABILITY_POWER_SAVE`) and wake on gaze
 (`tobii_remote_wake_activate`) are only probed or used for integrated `DAW`
 models; nothing in Experience sends power save. Whether the ET5 turns its
