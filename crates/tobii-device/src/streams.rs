@@ -155,16 +155,50 @@ impl StreamReader {
     }
 
     pub fn subscribe<C: Channel>(&mut self, session: &mut TrackerSession<C>) -> Result<()> {
-        for &stream in &self.streams {
-            match session.subscribe(stream) {
-                Ok(_) => self.subscribed.push(stream),
-                Err(error) if error.is_device_error() && self.optional.contains(&stream) => {
-                    self.refused.push((stream, error.to_string()));
-                }
-                Err(error) => return Err(error),
-            }
+        for stream in self.streams.clone() {
+            self.subscribe_one(session, stream)?;
         }
         Ok(())
+    }
+
+    /// Subscribes one of the reader's streams unless it is subscribed already. Returns
+    /// false when an optional stream refuses; a refused stream is not asked again.
+    pub fn subscribe_one<C: Channel>(&mut self, session: &mut TrackerSession<C>, stream: Stream) -> Result<bool> {
+        if self.subscribed.contains(&stream) {
+            return Ok(true);
+        }
+        if self.is_refused(stream) {
+            return Ok(false);
+        }
+        match session.subscribe(stream) {
+            Ok(_) => {
+                self.subscribed.push(stream);
+                Ok(true)
+            }
+            Err(error) if error.is_device_error() && self.optional.contains(&stream) => {
+                self.refused.push((stream, error.to_string()));
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_refused(&self, stream: Stream) -> bool {
+        self.refused.iter().any(|(refused, _)| *refused == stream)
+    }
+
+    /// Unsubscribes one stream; false when it was not subscribed. The stream counts as
+    /// unsubscribed even when the request fails, whose error is returned.
+    pub fn unsubscribe_one<C: Channel>(&mut self, session: &mut TrackerSession<C>, stream: Stream) -> Result<bool> {
+        let Some(position) = self.subscribed.iter().position(|subscribed| *subscribed == stream) else {
+            return Ok(false);
+        };
+        self.subscribed.remove(position);
+        if session.is_dead() {
+            return Ok(false);
+        }
+        session.try_call(|id| unsubscribe_stream(id, stream.index()))?;
+        Ok(true)
     }
 
     /// Unsubscribes every subscribed stream, newest first. Device and channel errors are
@@ -248,6 +282,7 @@ pub struct ItemPump {
     silence: Duration,
     last_data: Instant,
     paused: Arc<AtomicBool>,
+    idle: bool,
 }
 
 impl ItemPump {
@@ -259,7 +294,7 @@ impl ItemPump {
     /// Like [`ItemPump::new`], but while `paused` is set the silence clock is held at zero,
     /// so a tracker that was paused on purpose is not taken for a dead one.
     pub fn with_pause(pending: Vec<Message>, silence: Duration, paused: Arc<AtomicBool>) -> Self {
-        Self { pending: pending.into(), silence, last_data: Instant::now(), paused }
+        Self { pending: pending.into(), silence, last_data: Instant::now(), paused, idle: false }
     }
 
     /// The next item among messages already received; `Stopped` when `stop` is set first.
@@ -284,6 +319,15 @@ impl ItemPump {
         }
     }
 
+    /// While idle no continuous stream is subscribed, so silence is expected; leaving idle
+    /// starts the silence clock afresh.
+    pub fn set_idle(&mut self, idle: bool) {
+        if self.idle && !idle {
+            self.last_data = Instant::now();
+        }
+        self.idle = idle;
+    }
+
     /// Restarts the silence clock: the device answered a request, so the session is alive.
     pub fn alive(&mut self) {
         self.last_data = Instant::now();
@@ -291,14 +335,14 @@ impl ItemPump {
 
     /// Bytes from one read of [`READ_SLICE_MS`]. Fails, marking the session dead, when the
     /// host was suspended (`resumed`) or no stream data arrived for the silence timeout
-    /// while not paused.
+    /// while neither paused nor idle.
     pub fn received<C: Channel>(&mut self, session: &mut TrackerSession<C>, data: &[u8], resumed: bool) -> Result<()> {
         self.pending = if data.is_empty() { VecDeque::new() } else { session.decode(data)?.into() };
         if resumed {
             session.set_dead(true);
             return Err(DeviceError::Suspended);
         }
-        if !self.pending.is_empty() || self.paused.load(Ordering::Relaxed) {
+        if !self.pending.is_empty() || self.idle || self.paused.load(Ordering::Relaxed) {
             self.last_data = Instant::now();
         } else if self.last_data.elapsed() > self.silence {
             session.set_dead(true);

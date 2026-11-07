@@ -265,6 +265,40 @@ fn streams_are_demultiplexed_in_arrival_order() {
 }
 
 #[test]
+fn single_streams_come_and_go_without_touching_the_others() {
+    let (tracker, mut session) = started(Duration::from_secs(10));
+    tracker.device.lock().unwrap().refuse.push(Stream::Presence.wire_id());
+    let mut reader = StreamReader::new(&[Stream::Gaze, Stream::Image, Stream::Presence], &[Stream::Presence]);
+    assert!(reader.subscribe_one(&mut session, Stream::Image).unwrap());
+    assert!(reader.subscribe_one(&mut session, Stream::Image).unwrap(), "already subscribed");
+    assert!(!reader.subscribe_one(&mut session, Stream::Presence).unwrap());
+    assert!(!reader.subscribe_one(&mut session, Stream::Presence).unwrap(), "refused once, not asked again");
+    assert!(reader.is_refused(Stream::Presence));
+    assert!(reader.subscribe_one(&mut session, Stream::Gaze).unwrap());
+    assert_eq!(reader.subscribed, [Stream::Image, Stream::Gaze]);
+    assert!(reader.unsubscribe_one(&mut session, Stream::Image).unwrap());
+    assert!(!reader.unsubscribe_one(&mut session, Stream::Image).unwrap(), "not subscribed");
+    assert_eq!(reader.subscribed, [Stream::Gaze]);
+    assert_eq!(tracker.device.lock().unwrap().subscribed, [Stream::Gaze.wire_id()]);
+    let subscribes = tracker.commands().iter().filter(|c| **c == command::SUBSCRIBE_STREAM).count();
+    assert_eq!(subscribes, 3);
+}
+
+#[test]
+fn an_idle_pump_waits_through_silence_and_counts_it_again_once_busy() {
+    let paused = Arc::new(AtomicBool::new(false));
+    let (mut session, mut pump) = stalled_pump(&paused);
+    pump.set_idle(true);
+    read_for(&mut session, &mut pump, PUMP_SILENCE * 2).unwrap();
+    assert!(!session.is_dead());
+    pump.set_idle(false);
+    let busy_at = Instant::now();
+    let error = read_for(&mut session, &mut pump, PUMP_SILENCE * 3).unwrap_err();
+    assert!(matches!(error, DeviceError::Silent { .. }), "{error}");
+    assert!(busy_at.elapsed() >= PUMP_SILENCE, "silence counted from the first stream subscribed");
+}
+
+#[test]
 fn a_dropped_gaze_message_and_a_malformed_image_are_counted_not_yielded() {
     let (_, mut session) = started(Duration::from_secs(10));
     let mut reader = StreamReader::new(&[Stream::Gaze, Stream::Image], &[]);
