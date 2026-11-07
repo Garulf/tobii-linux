@@ -95,8 +95,10 @@ or configuration is involved.
   stores each record and pushes `UserPresence.notification()` to every
   subscription that subscribed 0xB with command 5. Command 6 stops it. The
   head-pose-validity fallback is gone.
-- `cli serve` subscribes `0x504` beside gaze and images in every session. The
-  demo's status shows the game-side value, the device value, its time and how
+- `cli serve` subscribes `0x504` while a subscription watches 0xB or a tet-tcp
+  connection takes `0x504`, and starts it with the unknown record each time
+  (see Linux below). A tracker that refuses `0x504` is not asked again in that
+  session. The demo's status shows the game-side value, the device value, its time and how
   many changes would have been pushed.
 
 | Check | Result | Evidence |
@@ -238,8 +240,21 @@ connection up, and mirrors the server shutdown towards clients:
 - While no session streams, `PrpService.detach_tracker` closes every client
   connection and refuses new pipe connections; `attach_tracker` accepts them
   again. Presence restarts with the unknown record.
+- Each device stream is subscribed only while a client wants it, as the
+  runtime's reference counts do (Power saving above): images while the head pose
+  hub has a subscriber (PRP head pose, SESP), gaze while a PRP gaze stream, the
+  control channel's gaze bubble or a tet-tcp connection takes it, presence while
+  a subscription watches 0xB or a tet-tcp connection takes `0x504`.
+  `PrpService::update_demand` recomputes the set on every subscribe, stop and
+  close and writes it to a shared `tracker::StreamDemand`; the reading thread
+  sends 1220 or 1230 for the difference between reads, so a stream nobody wants
+  is released within one read (about 100 ms) and without a linger. With no
+  client the session holds no stream. The service does not watch the session
+  lock or the display, as the runtime does not. The supervisor, the demo and
+  the one-shot commands still subscribe every stream (`demand: None`).
 - A session ends on USB errors, a request without reply (3 s), no stream data
-  for 3 s, a device clock jumping back by more than 1 s (tracker restart),
+  for 3 s while gaze or images are subscribed (presence alone only reports
+  changes, so it is never counted as silence), a device clock jumping back by more than 1 s (tracker restart),
   or a host suspend (`CLOCK_BOOTTIME` running more than 2 s ahead of
   `CLOCK_MONOTONIC` since the last read, `streams.SuspendWatch`). Such a
   session is marked dead and not asked to unsubscribe.
@@ -248,7 +263,7 @@ connection up, and mirrors the server shutdown towards clients:
   are subscribed (live (WSL), `evidence/private/calibration/probe/host-pattern-raw.jsonl`). `driver.head_pose_samples` now
   always reads on a thread, `streams.drained` decouples the demo's consumer,
   and `cli serve` hands results to the event loop without blocking.
-- SIGINT and SIGTERM stop the link, unsubscribe the three streams, close USB,
+- SIGINT and SIGTERM stop the link, unsubscribe the streams it holds, close USB,
   disconnect clients and the bridge, and exit 0.
 - When `--wine-clock auto` moves the service clock to another Linux clock
   while game clients are connected, the service closes them, so that they
