@@ -192,6 +192,24 @@ service sends 3100 only when eye tracking is turned off or on, and to a tracker
 that connects while it is off, as Tobii Experience does
 ([Tobii Experience](experience-app.md), section 2); property 4 answers 1 while it is off.
 
+What keeps an idle tracker quiet on Windows is the stream reference count, not
+a power command. The acquire `0x1402784a0` runs the stream synchroniser
+`0x140278150` with the stream's start set and, when it succeeds, increments the
+stream's subscriber count (`param_2[4]`) and the device total (`+0x1158c`). The
+release `0x1402785f0` decrements both and, only when the stream's count reaches
+0, builds its stop set and runs the synchroniser, which sends 1230 for that
+stream (static, `gd-sync-focused.c`). Presence follows the same rule through
+command 5 on the first subscriber (above). So with no client subscribed the
+device has no stream subscribed. Tobii Experience adds its own gate on top:
+its engine subscribes presence, gaze and head pose only while the setting is on
+and `AtLeastOneClientConnected` is true, and unsubscribes them on leaving
+`Tracking` (`ENG:EyeTrackingEnabler.cs:41-50,171-175`,
+`ENG:EyeTrackingEngine.cs:466-478`, `CORE:InteractionEngine.cs:161-167`).
+Power save (`TOBII_INTERNAL_CAPABILITY_POWER_SAVE`) and wake on gaze
+(`tobii_remote_wake_activate`) are only probed or used for integrated `DAW`
+models; nothing in Experience sends power save. Whether the ET5 turns its
+illuminators or camera off when no stream is subscribed is not observed.
+
 ### Linux
 
 `cli serve` keeps its process, the PRP listener and the bridge's control
