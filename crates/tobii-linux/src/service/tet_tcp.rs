@@ -6,9 +6,9 @@
 //!
 //! - the startup replies (protocol upgrade, unlock_ppu) and the getters the module asks for
 //!   are the device's own replies, read once per tracker session before its streams start;
-//! - subscribe and unsubscribe of gaze (0x500) and presence (0x504) only change which
-//!   connections receive the service's stream, which every connection gets from the one
-//!   device subscription the service holds;
+//! - subscribe and unsubscribe of gaze (0x500) and presence (0x504) change which
+//!   connections receive the service's stream; the service holds one device subscription
+//!   per stream while any client wants it;
 //! - everything else, including every write, is refused with the device's
 //!   unsupported-operation status.
 //!
@@ -39,6 +39,16 @@ struct Connection {
     streams: RefCell<BTreeSet<u32>>,
 }
 
+/// Runs when the streams the connections take change.
+#[derive(Clone)]
+struct Watch(Rc<dyn Fn()>);
+
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Watch")
+    }
+}
+
 #[derive(Debug)]
 struct Listening {
     accept: tokio::task::JoinHandle<()>,
@@ -57,6 +67,7 @@ struct Inner {
     sent: Cell<u64>,
     dropped: Cell<u64>,
     attaching: Cell<u64>,
+    watch: RefCell<Option<Watch>>,
 }
 
 /// Listens on 127.0.0.1:4455 while a tracker session runs; all calls on the event loop.
@@ -81,6 +92,7 @@ impl TetTcpService {
             sent: Cell::new(0),
             dropped: Cell::new(0),
             attaching: Cell::new(0),
+            watch: RefCell::new(None),
         }))
     }
 
@@ -94,6 +106,23 @@ impl TetTcpService {
 
     pub fn connections(&self) -> usize {
         self.0.connections.borrow().len()
+    }
+
+    /// Whether a connection is subscribed to the device stream `stream` (wire id).
+    pub fn wants(&self, stream: u32) -> bool {
+        self.0.connections.borrow().iter().any(|connection| connection.streams.borrow().contains(&stream))
+    }
+
+    /// Runs `watch` whenever the streams some connection subscribes change.
+    pub fn set_watch(&self, watch: impl Fn() + 'static) {
+        *self.0.watch.borrow_mut() = Some(Watch(Rc::new(watch)));
+    }
+
+    fn changed(&self) {
+        let watch = self.0.watch.borrow().clone();
+        if let Some(Watch(watch)) = watch {
+            watch();
+        }
     }
 
     pub fn sent(&self) -> u64 {
@@ -188,6 +217,9 @@ impl TetTcpService {
         }
         self.0.connections.borrow_mut().retain(|other| !Rc::ptr_eq(other, &connection));
         link.close();
+        if !connection.streams.borrow().is_empty() {
+            self.changed();
+        }
     }
 
     fn handle(&self, connection: &Connection, message: &Message) {
@@ -208,6 +240,7 @@ impl TetTcpService {
                     "unsubscribe"
                 };
                 log::info!("tet-tcp connection {number}: {action} {stream:#x}");
+                self.changed();
                 Some(reply)
             }
             Answer::Refuse { reply, stream, subscription: true } => {

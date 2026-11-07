@@ -7,7 +7,7 @@
 //! that falls silent, a restarted tracker or a host resume ends the session.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -103,7 +103,7 @@ pub fn device_calibration_id<C: Channel>(session: &mut TrackerSession<C>) -> Res
     tobii_gaze::device::device_calibration_id(&values).map_err(|error| Error::Value(error.to_string()))
 }
 
-/// Device replies by command, and the wire streams the service has subscribed.
+/// Device replies by command, and the wire streams the session serves.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceReplies {
     pub replies: HashMap<u32, Message>,
@@ -269,6 +269,37 @@ fn reported(error: &DeviceError) -> DeviceError {
     }
 }
 
+/// The device streams the service's clients want right now.
+///
+/// The service sets it whenever a client starts or stops a stream; the session reading
+/// thread subscribes and unsubscribes to match between reads, as the runtime keeps one
+/// subscription per stream while its reference count is above zero (0x1402784a0,
+/// 0x1402785f0) and unsubscribes as soon as it drops to zero.
+#[derive(Debug, Default)]
+pub struct StreamDemand(AtomicU32);
+
+impl StreamDemand {
+    fn bit(stream: Stream) -> u32 {
+        1 << stream.index()
+    }
+
+    pub fn set(&self, stream: Stream, wanted: bool) {
+        if wanted {
+            self.0.fetch_or(Self::bit(stream), Ordering::SeqCst);
+        } else {
+            self.0.fetch_and(!Self::bit(stream), Ordering::SeqCst);
+        }
+    }
+
+    pub fn wants(&self, stream: Stream) -> bool {
+        self.0.load(Ordering::SeqCst) & Self::bit(stream) != 0
+    }
+
+    pub fn wanted(&self) -> Vec<Stream> {
+        Stream::ALL.into_iter().filter(|stream| self.wants(*stream)).collect()
+    }
+}
+
 type GazeCallback<'a> = &'a (dyn Fn(GazeFrame) + Sync);
 type PresenceCallback<'a> = &'a (dyn Fn(i64, i64) + Sync);
 type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
@@ -288,7 +319,9 @@ type DeviceStreamCallback<'a> = &'a (dyn Fn(&Message, i64) + Sync);
 /// `requests` are answered on the reading thread between reads, also while no stream data
 /// arrives. Between reads the tracker is also paused or resumed whenever `paused` differs
 /// from `device_paused`, what it was last told; while `paused` is set the session is not
-/// taken for dead when it falls silent.
+/// taken for dead when it falls silent. With `demand` only the streams it wants are
+/// subscribed, from the start and then between reads as it changes; without it every
+/// stream is. Silence only counts while gaze or images are subscribed.
 pub struct LiveStreams<'a> {
     pub clock: HostTime,
     pub gaze: GazeCallback<'a>,
@@ -300,6 +333,7 @@ pub struct LiveStreams<'a> {
     pub requests: Option<DeviceRequests>,
     pub paused: Arc<AtomicBool>,
     pub device_paused: bool,
+    pub demand: Option<Arc<StreamDemand>>,
 }
 
 impl std::fmt::Debug for LiveStreams<'_> {
@@ -324,6 +358,7 @@ impl<'a> LiveStreams<'a> {
             requests: None,
             paused: Arc::default(),
             device_paused: false,
+            demand: None,
         }
     }
 
@@ -341,12 +376,9 @@ impl<'a> LiveStreams<'a> {
             streams.push(Stream::Presence);
         }
         let mut reader = StreamReader::new(&streams, &[Stream::Presence]);
-        reader.subscribe(session)?;
-        if reader.subscribed.contains(&Stream::Presence)
-            && let Some(presence) = self.presence
-        {
-            presence(presence_subscribe_time(self.clock.now_us()), i64::from(PLATMOD_UNKNOWN));
-        }
+        let wanted = |stream: Stream| self.demand.as_ref().is_none_or(|demand| demand.wants(stream));
+        let subscriber = Subscriber { clock: &self.clock, presence: self.presence };
+        subscriber.reconcile(&mut reader, session, wanted)?;
         started(&reader);
         let image_time = Mutex::new(ClockMapper::new(self.clock.clone()));
         let frames = Newest::default();
@@ -365,6 +397,8 @@ impl<'a> LiveStreams<'a> {
                 requests: self.requests,
                 paused: self.paused,
                 device_paused: self.device_paused,
+                clock: self.clock.clone(),
+                demand: self.demand,
             };
             let mut suspend = self.suspend;
             let silence = self.silence;
@@ -417,6 +451,52 @@ struct Reading<'a, 's> {
     requests: Option<DeviceRequests>,
     paused: Arc<AtomicBool>,
     device_paused: bool,
+    clock: HostTime,
+    demand: Option<Arc<StreamDemand>>,
+}
+
+/// Subscribes and unsubscribes a reader's streams to match what is wanted.
+struct Subscriber<'c, 'a> {
+    clock: &'c HostTime,
+    presence: Option<PresenceCallback<'a>>,
+}
+
+impl Subscriber<'_, '_> {
+    /// Subscribes each wanted stream not yet subscribed and unsubscribes each subscribed
+    /// stream no longer wanted; whether the device was asked anything. A presence
+    /// subscription starts with the unknown record the runtime emits (0x140276dd0).
+    fn reconcile<C: Channel>(
+        &self,
+        reader: &mut StreamReader,
+        session: &mut TrackerSession<C>,
+        wanted: impl Fn(Stream) -> bool,
+    ) -> std::result::Result<bool, DeviceError> {
+        let mut asked = false;
+        for stream in reader.streams().to_vec() {
+            let subscribed = reader.subscribed.contains(&stream);
+            if wanted(stream) && !subscribed && !reader.is_refused(stream) {
+                asked = true;
+                if reader.subscribe_one(session, stream)? {
+                    log::debug!("subscribed {}", stream.name());
+                    if stream == Stream::Presence
+                        && let Some(presence) = self.presence
+                    {
+                        presence(presence_subscribe_time(self.clock.now_us()), i64::from(PLATMOD_UNKNOWN));
+                    }
+                }
+            } else if !wanted(stream) && subscribed {
+                asked = true;
+                reader.unsubscribe_one(session, stream)?;
+                log::debug!("unsubscribed {}", stream.name());
+            }
+        }
+        Ok(asked)
+    }
+}
+
+/// Whether nothing the tracker sends continuously is subscribed, so silence is expected.
+fn idle(reader: &StreamReader) -> bool {
+    !reader.subscribed.iter().any(|stream| matches!(stream, Stream::Gaze | Stream::Image))
 }
 
 impl Reading<'_, '_> {
@@ -429,6 +509,7 @@ impl Reading<'_, '_> {
         stop: &dyn StopSignal,
     ) -> Result<()> {
         let mut pump = ItemPump::with_pause(session.take_pending_streams(), silence, Arc::clone(&self.paused));
+        pump.set_idle(idle(reader));
         let failed = |session: &mut TrackerSession<C>, error: DeviceError| {
             if error.is_device_error() {
                 session.set_dead(true);
@@ -455,6 +536,9 @@ impl Reading<'_, '_> {
                 Err(error) => return Err(failed(session, error)),
             }
             if let Err(error) = self.apply_pause(session, &mut pump) {
+                return Err(failed(session, error));
+            }
+            if let Err(error) = self.apply_demand(reader, session, &mut pump) {
                 return Err(failed(session, error));
             }
             if !session.pending_streams.is_empty() {
@@ -515,6 +599,23 @@ impl Reading<'_, '_> {
         Ok(())
     }
 
+    /// Subscribes and unsubscribes streams as the demand changed since the last read.
+    fn apply_demand<C: Channel>(
+        &self,
+        reader: &mut StreamReader,
+        session: &mut TrackerSession<C>,
+        pump: &mut ItemPump,
+    ) -> std::result::Result<(), DeviceError> {
+        let Some(demand) = &self.demand else { return Ok(()) };
+        let subscriber = Subscriber { clock: &self.clock, presence: self.presence };
+        if subscriber.reconcile(reader, session, |stream| demand.wants(stream))? {
+            pump.set_idle(idle(reader));
+            pump.alive();
+            log::info!("tracker streams: {}", stream_names(&reader.subscribed));
+        }
+        Ok(())
+    }
+
     fn device_time(&mut self, device_us: i64) -> i64 {
         self.gaze_time.observe(device_us);
         self.gaze_time.map(device_us)
@@ -550,6 +651,13 @@ impl Reading<'_, '_> {
         }
         Ok(())
     }
+}
+
+fn stream_names(streams: &[Stream]) -> String {
+    if streams.is_empty() {
+        return "none".to_string();
+    }
+    streams.iter().map(|stream| stream.name()).collect::<Vec<_>>().join(", ")
 }
 
 /// Where one service session delivers its output; every callback must be thread safe.
@@ -590,7 +698,8 @@ fn pause_connected<C: Channel>(session: &mut TrackerSession<C>) -> Result<()> {
 /// One service session on a started tracker: calibration, streams, then samples until it ends.
 ///
 /// While `paused` is set the tracker is paused first; the session then pauses or resumes it
-/// whenever `paused` changes, and does not take its silence for a lost tracker. `requests`
+/// whenever `paused` changes, and does not take its silence for a lost tracker. With
+/// `demand` only the streams it wants are subscribed (see [`LiveStreams`]). `requests`
 /// wait until the streams run and are then answered between reads. Head pose is computed
 /// in `display_area`, or without it in the display area the tracker holds (1430); with
 /// neither the session produces no head pose and still serves gaze and presence.
@@ -605,6 +714,7 @@ pub fn serve_tracker<C: Channel>(
     suspend: Option<Box<dyn SuspendWatch>>,
     requests: Option<DeviceRequests>,
     paused: Arc<AtomicBool>,
+    demand: Option<Arc<StreamDemand>>,
     display_area: Option<Corners>,
 ) -> Result<()> {
     let device_paused = paused.load(Ordering::SeqCst);
@@ -638,12 +748,18 @@ pub fn serve_tracker<C: Channel>(
     streams.requests = requests;
     streams.paused = paused;
     streams.device_paused = device_paused;
+    streams.demand = demand;
     streams.run(
         session,
         stop,
         |reader| {
             if let (Some(device), Some(mut replies)) = (&feed.device, replies) {
-                replies.streams = reader.subscribed.iter().map(|stream| stream.wire_id()).collect();
+                replies.streams = reader
+                    .streams()
+                    .iter()
+                    .filter(|stream| !reader.is_refused(**stream))
+                    .map(|stream| stream.wire_id())
+                    .collect();
                 device(replies);
             }
             if let Some(started) = &feed.started {

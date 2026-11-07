@@ -81,6 +81,9 @@ pub async fn serve(
     connection.show(&service.control_status());
     let outcome = requests(service, &connection, frames).await;
     service.0.controls.borrow_mut().retain(|other| !Rc::ptr_eq(other, &connection));
+    if connection.gaze.get() {
+        service.update_demand();
+    }
     if service.0.release_holder.get() == Some(key) {
         log::info!("control client {} closed while holding the tracker; reacquiring", connection.client);
         service.reacquire_tracker();
@@ -118,7 +121,10 @@ async fn answer(service: &PrpService, connection: &ControlConnection, request: R
             Some(_) => service.reacquire_tracker(),
             None => {}
         },
-        Request::SubscribeGaze(on) => connection.gaze.set(on),
+        Request::SubscribeGaze(on) => {
+            connection.gaze.set(on);
+            service.update_demand();
+        }
     }
     Ok(service.control_status())
 }
@@ -266,6 +272,11 @@ impl PrpService {
                 connection.link.frame(FRAME_CONTROL_GAZE, &sample.encode());
             }
         }
+    }
+
+    /// Whether a control client streams gaze for its bubble.
+    pub(super) fn controls_want_gaze(&self) -> bool {
+        self.0.controls.borrow().iter().any(|connection| connection.gaze.get())
     }
 
     pub(super) fn close_controls(&self) {

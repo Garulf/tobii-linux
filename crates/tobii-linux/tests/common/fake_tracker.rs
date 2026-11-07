@@ -158,6 +158,8 @@ struct Device {
     display_area: Option<[[f64; 3]; 3]>,
     gaze: bool,
     calibration_id: Option<u32>,
+    selective: bool,
+    live: Vec<u32>,
 }
 
 /// A scripted tracker behind a session; clones share the device.
@@ -189,6 +191,8 @@ impl FakeTracker {
             display_area: Some(DEVICE_AREA),
             gaze: false,
             calibration_id: None,
+            selective: false,
+            live: Vec::new(),
         })))
     }
 
@@ -205,6 +209,19 @@ impl FakeTracker {
         let tracker = Self::streaming();
         tracker.device().pausable = true;
         tracker
+    }
+
+    /// Streams like [`Self::streaming`], but only what is subscribed now: images while 0x501
+    /// is, gaze points while 0x500 is.
+    pub fn selective() -> Self {
+        let tracker = Self::streaming();
+        tracker.device().selective = true;
+        tracker
+    }
+
+    /// The wire ids subscribed and not unsubscribed since, in subscription order.
+    pub fn subscribed_streams(&self) -> Vec<u32> {
+        self.device().live.clone()
     }
 
     pub fn stalling(after: usize) -> Self {
@@ -302,9 +319,16 @@ impl Device {
                 hardware_info_response(&info, request.request_id, (0, 0)).unwrap()
             }
             command::SUBSCRIBE_STREAM => {
-                reply(&request, status(self.refuse.contains(&requested_stream(&request))), &[])
+                let refused = self.refuse.contains(&requested_stream(&request));
+                if !refused {
+                    self.live.push(requested_stream(&request));
+                }
+                reply(&request, status(refused), &[])
             }
-            command::UNSUBSCRIBE_STREAM => reply(&request, status(self.failing_request == Some(self.log.len())), &[]),
+            command::UNSUBSCRIBE_STREAM => {
+                self.live.retain(|stream| *stream != requested_stream(&request));
+                reply(&request, status(self.failing_request == Some(self.log.len())), &[])
+            }
             command::GET_DISPLAY_AREA => match self.display_area {
                 Some(area) => reply(&request, 0, &display_area_fields(area)),
                 None => reply(&request, REFUSED_STATUS, &[]),
@@ -363,6 +387,19 @@ impl Device {
 
     fn next_stream_message(&mut self) -> Option<Message> {
         match self.behaviour {
+            Behaviour::Streaming if self.selective => {
+                let image = self.live.contains(&Stream::Image.wire_id());
+                let gaze = self.live.contains(&Stream::Gaze.wire_id());
+                self.sent += 1;
+                if !image && !gaze {
+                    return None;
+                }
+                if gaze && (!image || self.sent.is_multiple_of(2)) {
+                    return Some(gaze_point_message(self.timestamp));
+                }
+                self.timestamp += STREAMING_PERIOD_US;
+                Some(image_message_at(self.timestamp))
+            }
             Behaviour::Streaming => {
                 self.sent += 1;
                 if self.gaze && self.sent.is_multiple_of(2) {

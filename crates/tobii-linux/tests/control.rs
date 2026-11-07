@@ -16,7 +16,7 @@ use tobii_gaze::device::{LocalCalibration, gaze_command};
 use tobii_gaze::profiles::{GUEST, ProfileStore};
 use tobii_linux::service::clock::{Clocks, wine_clock};
 use tobii_linux::service::{Options, PrpService};
-use tobii_protocol::commands::command;
+use tobii_protocol::commands::{Stream, command};
 use tobii_protocol::fields::{Value, values};
 use tobii_setup::cli::{self, Command};
 use tobii_setup::device::{Session, session_on};
@@ -363,6 +363,32 @@ fn gaze_subscription_streams_samples() {
         while client.next(Duration::from_millis(300)).await.is_some() {
             assert!(Instant::now() < deadline, "gaze kept coming after unsubscribing");
         }
+        assert!(link.stop().await);
+        service.close();
+        accept.abort();
+    });
+}
+
+#[test]
+fn the_gaze_bubble_alone_subscribes_device_gaze_while_it_is_on() {
+    run(async {
+        let (service, port, accept) = service(options("ET5-TEST")).await;
+        let device = FakeTracker::selective().gazing();
+        let slot = Plugged::new(Mutex::new(Some(device.clone())));
+        let mut link = Link::on_demand(&service, false, &slot);
+        let mut client = Client::connect(port, "experience").await;
+        client.status("attached", |status| status.attached).await;
+        assert_eq!(device.subscribed_streams(), Vec::<u32>::new());
+
+        client.request(Request::SubscribeGaze(true)).await.unwrap();
+        assert_eq!(service.stream_demand().wanted(), [Stream::Gaze]);
+        let sample = client.gaze().await;
+        assert_eq!(([sample.x, sample.y], sample.valid), (GAZE_POINT, true));
+        assert_eq!(device.subscribed_streams(), [Stream::Gaze.wire_id()]);
+
+        client.request(Request::SubscribeGaze(false)).await.unwrap();
+        assert!(service.stream_demand().wanted().is_empty());
+        until("gaze unsubscribed", || device.subscribed_streams().is_empty()).await;
         assert!(link.stop().await);
         service.close();
         accept.abort();

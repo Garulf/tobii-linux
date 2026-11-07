@@ -19,7 +19,7 @@ use crate::pyjson::{self, Json, object};
 use crate::service::clock::{Clocks, ServiceTime, WINE_CLOCKS, wine_clock};
 use crate::service::enabled::EnabledState;
 use crate::service::{Corners, Event, Options, PrpService, list_repr, listen};
-use crate::tracker::{FrameProcessor, HostTime, ModelProcessor, ServiceFeed, serve_tracker};
+use crate::tracker::{FrameProcessor, HostTime, ModelProcessor, ServiceFeed, StreamDemand, serve_tracker};
 
 const MAIN_HELP: &str = include_str!("help/main.txt");
 const PROBE_HELP: &str = include_str!("help/probe.txt");
@@ -342,6 +342,8 @@ pub struct ServiceLink<'a, C> {
     pub paused: Arc<AtomicBool>,
     /// The service's release gate; sessions open the tracker only while it is open.
     pub gate: Arc<ReleaseGate>,
+    /// The streams the service's clients want; every stream is subscribed when `None`.
+    pub demand: Option<Arc<StreamDemand>>,
     /// The configured display area; each session reads the tracker's when `None`.
     pub display_area: Option<Corners>,
 }
@@ -380,6 +382,7 @@ impl<C: Channel> LinkHost for ServiceLink<'_, C> {
             Some(suspend),
             Some(inbox),
             paused,
+            self.demand.clone(),
             self.display_area,
         )
     }
@@ -468,7 +471,7 @@ async fn run_service(
         tokio::task::spawn_local(async move { service.follow(received).await })
     };
     let feed = service_feed(&events, arguments.options.tet_tcp);
-    let (paused, gate) = (service.pause_flag(), service.release_gate());
+    let (paused, gate, demand) = (service.pause_flag(), service.release_gate(), service.stream_demand());
     let stop = StopFlag::new();
     let (finished, done) = tokio::sync::oneshot::channel::<(u64, u64)>();
     let link_thread = {
@@ -487,6 +490,7 @@ async fn run_service(
                 events,
                 paused,
                 gate,
+                demand: Some(demand),
                 display_area: session.corners,
             };
             link.run(&mut host, &stop);
