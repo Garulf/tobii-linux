@@ -15,6 +15,7 @@ use tobii_linux::service::enabled::{EnabledState, not_supported};
 use tobii_linux::service::{
     DeviceCallError, Options, PrpService, gaze_package, stream_package, synthetic::synthetic_gaze_frame,
 };
+use tobii_protocol::commands::Stream;
 use tobii_protocol::gaze::{PLATMOD_AWAY, PLATMOD_PRESENT};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, decode_envelope, decode_gaze_body, decode_head_body};
 use tobii_service::prp_service::{
@@ -837,6 +838,31 @@ fn head_pose_and_gaze_streams_are_independent() {
         fixture.service.gaze_hub().unwrap().publish(&frame);
         assert_eq!(session.subscription.packet().await, gaze_package(&frame, PRP_GAZE_POINT).unwrap());
         assert_eq!(session.subscription.packet_within(Duration::from_millis(200)).await, None);
+    });
+}
+
+#[test]
+fn clients_set_the_tracker_streams_the_service_wants() {
+    run(async {
+        let fixture = gaze_fixture().await;
+        let demand = fixture.service.stream_demand();
+        assert_eq!(demand.wanted(), []);
+        let mut session = fixture.session().await;
+        session.stream_request(COMMAND_STREAM_START, HEAD_POSE).await;
+        assert_eq!(demand.wanted(), [Stream::Image]);
+        session.stream_request(COMMAND_STREAM_START, PRP_GAZE_POINT).await;
+        assert_eq!(demand.wanted(), [Stream::Gaze, Stream::Image]);
+        let tag = session.next_tag();
+        session
+            .command
+            .send_packet(&encode_property_subscribe_request(tag, 0xB, COMMAND_PROPERTY_SUBSCRIBE).unwrap())
+            .await;
+        session.command.packet().await;
+        assert_eq!(demand.wanted(), [Stream::Gaze, Stream::Image, Stream::Presence]);
+        session.stream_request(COMMAND_STREAM_STOP, HEAD_POSE).await;
+        assert_eq!(demand.wanted(), [Stream::Gaze, Stream::Presence]);
+        drop(session);
+        assert!(eventually(|| demand.wanted().is_empty()).await);
     });
 }
 

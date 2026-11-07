@@ -246,8 +246,13 @@ service works as follows:
   status `0x20000501` and a log line; nothing a client sends reaches the
   tracker (unit: `test_replies_come_from_the_session_and_the_port_follows_the_tracker`).
 - **One device subscription, fanned out.** Subscribe and unsubscribe of `0x500`
-  and `0x504` change only which connections receive the session's messages
-  and are answered as the device answers them (word 2 = 1, no payload). Other
+  and `0x504` change which connections receive the session's messages and are
+  answered as the device answers them (word 2 = 1, no payload). The service
+  holds the device subscription of a stream while any connection, or another
+  client of the service, wants it, and releases it when the last one leaves
+  ([service behaviour](service-behaviour.md#linux)). A tracker that refuses
+  `0x504` is only found out on its first subscription, so the port accepts
+  `0x504` subscriptions for that session and they carry no data. Other
   streams are refused. A connection whose socket buffer holds more than 64 KiB
   skips messages instead of delaying the others.
 - **Timestamps** as above.

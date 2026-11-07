@@ -14,7 +14,7 @@ use tobii_linux::cli::{ServiceLink, service_feed};
 use tobii_linux::error::Result;
 use tobii_linux::service::clock::ServiceTime;
 use tobii_linux::service::{Corners, PrpService};
-use tobii_linux::tracker::{FrameProcessor, HostTime};
+use tobii_linux::tracker::{FrameProcessor, HostTime, StreamDemand};
 
 use super::fake_tracker::FakeTracker;
 
@@ -79,6 +79,22 @@ impl Link {
 
     /// A link whose sessions use `display_area` instead of the tracker's.
     pub fn with_display(service: &PrpService, tet_tcp: bool, slot: &Plugged, display_area: Option<Corners>) -> Self {
+        Self::launch(service, tet_tcp, slot, display_area, None)
+    }
+
+    /// A link whose sessions subscribe only the streams the service's clients want, as
+    /// `cli serve` runs them; the other links subscribe every stream.
+    pub fn on_demand(service: &PrpService, tet_tcp: bool, slot: &Plugged) -> Self {
+        Self::launch(service, tet_tcp, slot, None, Some(service.stream_demand()))
+    }
+
+    fn launch(
+        service: &PrpService,
+        tet_tcp: bool,
+        slot: &Plugged,
+        display_area: Option<Corners>,
+        demand: Option<Arc<StreamDemand>>,
+    ) -> Self {
         let (events, received) = tokio::sync::mpsc::unbounded_channel();
         {
             let service = service.clone();
@@ -112,6 +128,7 @@ impl Link {
                     events,
                     paused,
                     gate,
+                    demand,
                     display_area,
                 };
                 link.run(&mut host, &stop);

@@ -4,8 +4,9 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::fake_tracker::*;
 use tobii_device::streams::{
@@ -14,7 +15,9 @@ use tobii_device::streams::{
 use tobii_device::{CameraCalibration, DeviceError, StopFlag, TrackerSession};
 use tobii_headpose::pipeline::HeadPoseSample;
 use tobii_linux::error::{Error, Result};
-use tobii_linux::tracker::{DeviceRequest, FrameProcessor, LiveStreams, SharedStats, drained_items, head_pose_samples};
+use tobii_linux::tracker::{
+    DeviceRequest, FrameProcessor, LiveStreams, SharedStats, StreamDemand, drained_items, head_pose_samples,
+};
 use tobii_protocol::Message;
 use tobii_protocol::commands::{Stream, command, header_only_request, subscribe_stream, unsubscribe_stream};
 use tobii_protocol::frames::ImageFrame;
@@ -129,6 +132,83 @@ fn stopping_unsubscribes_every_stream() {
     )
     .unwrap();
     assert_eq!(device.commands(), [SUBSCRIBE, SUBSCRIBE, SUBSCRIBE, UNSUBSCRIBE, UNSUBSCRIBE, UNSUBSCRIBE]);
+}
+
+fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition not reached: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn streams_follow_demand_and_presence_alone_outlives_the_silence_timeout() {
+    let device = FakeTracker::selective();
+    let demand = Arc::new(StreamDemand::default());
+    demand.set(Stream::Presence, true);
+    let presences = Mutex::new(Vec::new());
+    let presence = |_: i64, value: i64| presences.lock().unwrap().push(value);
+    let mut live = LiveStreams::new(ticking_clock(), &ignore_gaze);
+    live.presence = Some(&presence);
+    live.silence = Duration::from_millis(200);
+    live.demand = Some(demand.clone());
+    let (stop, frames) = (StopFlag::new(), AtomicUsize::new(0));
+    let mut started = Vec::new();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            demand.set(Stream::Image, true);
+            wait_until("images", || frames.load(Ordering::SeqCst) >= 3);
+            demand.set(Stream::Image, false);
+            wait_until("image unsubscribed", || device.subscribed_streams() == [Stream::Presence.wire_id()]);
+            std::thread::sleep(Duration::from_millis(400));
+            stop.set();
+        });
+        live.run(
+            &mut unstarted(&device),
+            &stop,
+            |reader| started = reader.subscribed.clone(),
+            |_, _| {
+                frames.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+    });
+    assert_eq!(started, [Stream::Presence]);
+    let requests: Vec<(u32, u32)> =
+        device.log().iter().map(|request| (request.command, requested_stream(request))).collect();
+    assert_eq!(requests, [(SUBSCRIBE, 0x504), (SUBSCRIBE, 0x501), (UNSUBSCRIBE, 0x501), (UNSUBSCRIBE, 0x504)]);
+    let values = presences.into_inner().unwrap();
+    assert_eq!(values, [i64::from(PLATMOD_UNKNOWN), i64::from(PLATMOD_PRESENT)]);
+}
+
+#[test]
+fn a_session_nobody_wants_subscribes_nothing_until_asked() {
+    let device = FakeTracker::selective().gazing();
+    let demand = Arc::new(StreamDemand::default());
+    let gazes = AtomicUsize::new(0);
+    let gaze = |_: GazeFrame| {
+        gazes.fetch_add(1, Ordering::SeqCst);
+    };
+    let mut live = LiveStreams::new(ticking_clock(), &gaze);
+    live.presence = Some(&ignore_presence);
+    live.silence = Duration::from_millis(200);
+    live.demand = Some(demand.clone());
+    let stop = StopFlag::new();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(device.log().is_empty(), "nothing is subscribed without demand");
+            demand.set(Stream::Gaze, true);
+            wait_until("gaze", || gazes.load(Ordering::SeqCst) >= 3);
+            stop.set();
+        });
+        live.run(&mut unstarted(&device), &stop, |_| {}, |_, _| Ok(())).unwrap();
+    });
+    assert_eq!(device.commands(), [SUBSCRIBE, UNSUBSCRIBE]);
+    assert_eq!(requested_stream(&device.log()[0]), 0x500);
 }
 
 #[test]

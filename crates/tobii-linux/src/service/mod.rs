@@ -38,6 +38,7 @@ use tobii_gaze::operation::{
 };
 use tobii_gaze::profiles::{ProfileStore, default_display_record};
 use tobii_headpose::pipeline::HeadPoseSample;
+use tobii_protocol::commands::Stream;
 use tobii_protocol::gaze::{GazeFrame, PROPERTY_USER_PRESENCE};
 use tobii_protocol::{Message, ProtocolError};
 use tobii_service::prp::{DEFAULT_MAX_PAYLOAD, HEAD_POSE, HeadPose, StreamSample, encode_stream_packet};
@@ -64,7 +65,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::cli::ReleaseGate;
-use crate::tracker::{DeviceReplies, DeviceRequest};
+use crate::tracker::{DeviceReplies, DeviceRequest, StreamDemand};
 use clock::{Clock, now_us, readings};
 use enabled::EnabledState;
 use hub::Hub;
@@ -284,6 +285,7 @@ struct Inner {
     control_keys: Cell<u64>,
     release_gate: Arc<ReleaseGate>,
     release_holder: Cell<Option<u64>>,
+    demand: Arc<StreamDemand>,
 }
 
 /// Shared state of the service: pipe names, subscription ids, the hubs and the routes.
@@ -364,7 +366,7 @@ impl PrpService {
         };
         let enabled_state = options.enabled_state.clone().map(EnabledState::new);
         let enabled = enabled_state.as_ref().is_none_or(EnabledState::load);
-        Self(Rc::new(Inner {
+        let service = Self(Rc::new(Inner {
             serial: options.serial.clone().unwrap_or_else(|| options.name.clone()),
             name: options.name,
             prp: options.prp,
@@ -405,7 +407,65 @@ impl PrpService {
             control_keys: Cell::new(0),
             release_gate: Arc::new(ReleaseGate::default()),
             release_holder: Cell::new(None),
-        }))
+            demand: Arc::default(),
+        }));
+        service.watch_demand();
+        service
+    }
+
+    /// Recomputes the stream demand whenever a hub or tet-tcp subscriber comes or goes.
+    fn watch_demand(&self) {
+        let service = Rc::downgrade(&self.0);
+        let update = Rc::new(move || {
+            if let Some(inner) = service.upgrade() {
+                PrpService(inner).update_demand();
+            }
+        });
+        let watch = |update: &Rc<dyn Fn()>| {
+            let update = Rc::clone(update);
+            move || update()
+        };
+        let update: Rc<dyn Fn()> = update;
+        self.0.hub.set_watch(watch(&update));
+        if let Some(hub) = &self.0.gaze_hub {
+            hub.set_watch(watch(&update));
+        }
+        if let Some(tet_tcp) = &self.0.tet_tcp {
+            tet_tcp.set_watch(watch(&update));
+        }
+    }
+
+    /// The device streams clients want, which tracker sessions follow.
+    pub fn stream_demand(&self) -> Arc<StreamDemand> {
+        Arc::clone(&self.0.demand)
+    }
+
+    /// Sets the stream demand from every client: images while head pose is streamed, gaze
+    /// while a gaze stream, the bubble or a tet-tcp client takes it, presence while a
+    /// subscription watches it or a tet-tcp client takes it. Like the runtime's stream
+    /// reference counts, a stream nobody wants is dropped at once.
+    pub(super) fn update_demand(&self) {
+        let inner = &self.0;
+        let tet_tcp = |stream: Stream| inner.tet_tcp.as_ref().is_some_and(|tet_tcp| tet_tcp.wants(stream.wire_id()));
+        let image = inner.hub.subscribers() > 0;
+        let gaze = inner.gaze_hub.as_ref().is_some_and(|hub| hub.subscribers() > 0)
+            || self.controls_want_gaze()
+            || tet_tcp(Stream::Gaze);
+        let presence = inner
+            .subscriptions
+            .borrow()
+            .values()
+            .any(|subscription| subscription.properties.borrow().contains(&PROPERTY_USER_PRESENCE))
+            || tet_tcp(Stream::Presence);
+        let wanted = [(Stream::Gaze, gaze), (Stream::Image, image), (Stream::Presence, presence)];
+        if wanted.iter().all(|(stream, wanted)| inner.demand.wants(*stream) == *wanted) {
+            return;
+        }
+        for (stream, wanted) in wanted {
+            inner.demand.set(stream, wanted);
+        }
+        let names: Vec<&str> = inner.demand.wanted().iter().map(|stream| stream.name()).collect();
+        log::info!("clients want {}", if names.is_empty() { "no stream".to_string() } else { names.join(", ") });
     }
 
     pub fn clock(&self) -> &Arc<Clock> {
@@ -734,7 +794,11 @@ impl PrpService {
         for stream in streams {
             self.stop_stream(subscription, stream);
         }
+        let watched = !subscription.properties.borrow().is_empty();
         subscription.properties.borrow_mut().clear();
+        if watched {
+            self.update_demand();
+        }
     }
 
     fn close_subscription(&self, subscription: &Subscription) {
@@ -931,6 +995,7 @@ impl PrpService {
             };
             if let Some(subscription) = &subscription {
                 subscription.properties.borrow_mut().remove(&property_id);
+                self.update_demand();
             }
             log::info!("property {property_id:#x} unsubscribe tag {tag} status {status}");
             let response = word_response(tag, command, status, property_id as i32);
@@ -941,6 +1006,7 @@ impl PrpService {
             && let Some(subscription) = &subscription
         {
             subscription.properties.borrow_mut().insert(property_id);
+            self.update_demand();
         }
         log::info!("property {property_id:#x} subscribe tag {tag} status {}", response.status);
         Ok(encode_property_subscribe_response(&response))

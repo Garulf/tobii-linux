@@ -5,7 +5,9 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -208,6 +210,25 @@ fn subscribed_connections_get_restamped_streams() {
         fixture.ask(unsubscribe_stream(14, Stream::Gaze.index()).unwrap()).await;
         fixture.service.publish(&gaze_message(908279389021), 5_030_000);
         assert_eq!(fixture.receive_within(Duration::from_millis(200)).await, None);
+    });
+}
+
+#[test]
+fn subscriptions_are_wanted_until_released_or_closed() {
+    run(async {
+        let mut fixture = Fixture::new().await;
+        let changes = Rc::new(Cell::new(0));
+        let counted = Rc::clone(&changes);
+        fixture.service.set_watch(move || counted.set(counted.get() + 1));
+        fixture.ask(subscribe_stream(12, Stream::Gaze.index(), &[]).unwrap()).await;
+        fixture.ask(subscribe_stream(13, Stream::Presence.index(), &[]).unwrap()).await;
+        assert!(fixture.service.wants(GAZE_STREAM) && fixture.service.wants(PRESENCE_STREAM));
+        fixture.ask(unsubscribe_stream(14, Stream::Gaze.index()).unwrap()).await;
+        assert!(!fixture.service.wants(GAZE_STREAM) && fixture.service.wants(PRESENCE_STREAM));
+        assert_eq!(changes.get(), 3);
+        drop(fixture.stream);
+        assert!(eventually(|| !fixture.service.wants(PRESENCE_STREAM)).await);
+        assert_eq!(changes.get(), 4);
     });
 }
 
